@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  odin-voice:
+    build: .
+    container_name: odin-voice
+    restart: unless-stopped
+    ports:
+      - "7431:3001"
+    environment:
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ODIN_APP_URL=${ODIN_APP_URL}
+      - PORT=3001
+      - VOICE_SERVER_URL=${VOICE_SERVER_URL}
+    networks:
+      - odin-network
+
+networks:
+  odin-network:
+    driver: bridge
