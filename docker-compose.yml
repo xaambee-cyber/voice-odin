@@ -16,9 +16,15 @@ services:
       - ODIN_APP_URL=${ODIN_APP_URL}
       - PORT=3001
       - VOICE_SERVER_URL=${VOICE_SERVER_URL}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.odin-voice.rule=Host(`voice-odin.duckdns.org`)"
+      - "traefik.http.routers.odin-voice.entrypoints=websecure"
+      - "traefik.http.routers.odin-voice.tls.certresolver=letsencrypt"
+      - "traefik.http.services.odin-voice.loadbalancer.server.port=3001"
     networks:
-      - odin-network
+      - dokploy-network
 
 networks:
-  odin-network:
-    driver: bridge
+  dokploy-network:
+    external: true
