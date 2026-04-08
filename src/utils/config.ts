@@ -13,6 +13,9 @@ export const config = {
   // Claude
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
 
+  // OpenAI (GPT-4o-mini → baja latencia)
+  openaiApiKey: process.env.OPENAI_API_KEY || "",
+
   // Odin
   odinAppUrl: process.env.ODIN_APP_URL || "https://odin-two-indol.vercel.app",
 
