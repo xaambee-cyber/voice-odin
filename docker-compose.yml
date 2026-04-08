@@ -16,6 +16,7 @@ services:
       - ODIN_APP_URL=${ODIN_APP_URL}
       - PORT=3001
       - VOICE_SERVER_URL=${VOICE_SERVER_URL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     labels:
       - "traefik.enable=true"
 
