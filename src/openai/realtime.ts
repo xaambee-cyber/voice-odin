@@ -4,7 +4,8 @@ import { config } from "../utils/config";
 export class OpenAIRealtime {
   private ws: WebSocket | null = null;
   private onAudioDelta: ((base64Audio: string) => void) | null = null;
-  private onTranscript: ((texto: string, role: "user" | "assistant") => void) | null = null;
+  private onTranscript: ((texto: string, role: "user" | "assistant", itemId?: string) => void) | null = null;
+  private onItemCreated: ((itemId: string) => void) | null = null;
   private onInterrupcion: (() => void) | null = null;
   private conectado: boolean = false;
   private systemPrompt: string;
@@ -49,7 +50,7 @@ export class OpenAIRealtime {
               silence_duration_ms: 800,
             },
             temperature: 0.7,
-            max_response_output_tokens: 120,
+            max_response_output_tokens: 150,
           },
         }));
 
@@ -97,6 +98,14 @@ export class OpenAIRealtime {
         }
         break;
 
+      // conversation.item.created fires when a user turn is committed (BEFORE Whisper transcribes)
+      // Use this to reserve the user's slot in conversation order
+      case "conversation.item.created":
+        if (msg.item?.role === "user" && msg.item?.id && this.onItemCreated) {
+          this.onItemCreated(msg.item.id);
+        }
+        break;
+
       case "response.audio.delta":
         if (msg.delta && this.onAudioDelta) {
           this.onAudioDelta(msg.delta);
@@ -111,7 +120,8 @@ export class OpenAIRealtime {
 
       case "conversation.item.input_audio_transcription.completed":
         if (msg.transcript && this.onTranscript) {
-          this.onTranscript(msg.transcript, "user");
+          // Pass itemId so llamada.ts can find the placeholder and fill it in
+          this.onTranscript(msg.transcript, "user", msg.item_id);
           console.log(`[REALTIME] Usuario: "${msg.transcript}"`);
         }
         break;
@@ -178,8 +188,12 @@ export class OpenAIRealtime {
     this.onAudioDelta = callback;
   }
 
-  setOnTranscript(callback: (texto: string, role: "user" | "assistant") => void) {
+  setOnTranscript(callback: (texto: string, role: "user" | "assistant", itemId?: string) => void) {
     this.onTranscript = callback;
+  }
+
+  setOnItemCreated(callback: (itemId: string) => void) {
+    this.onItemCreated = callback;
   }
 
   setOnInterrupcion(callback: () => void) {
