@@ -43,9 +43,9 @@ export class OpenAIRealtime {
             },
             turn_detection: {
               type: "server_vad",
-              threshold: 0.5,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 600,
+              threshold: 0.7,
+              prefix_padding_ms: 400,
+              silence_duration_ms: 800,
             },
             temperature: 0.7,
             max_response_output_tokens: 300,
@@ -115,9 +115,11 @@ export class OpenAIRealtime {
 
       case "input_audio_buffer.speech_started":
         console.log("[REALTIME] Usuario empezó a hablar");
-        if (this.respondiendo) {
+        // Solo interrumpir si hay una respuesta activa
+        if (this.respondiendo && this.ws && this.conectado) {
           console.log("[REALTIME] INTERRUPCIÓN detectada → cancelando respuesta");
-          this.cancelarRespuesta();
+          this.ws.send(JSON.stringify({ type: "response.cancel" }));
+          this.respondiendo = false;
           if (this.onInterrupcion) {
             this.onInterrupcion();
           }
@@ -165,6 +167,7 @@ export class OpenAIRealtime {
   cancelarRespuesta() {
     if (this.ws && this.conectado && this.respondiendo) {
       this.ws.send(JSON.stringify({ type: "response.cancel" }));
+      this.respondiendo = false;
     }
   }
 
