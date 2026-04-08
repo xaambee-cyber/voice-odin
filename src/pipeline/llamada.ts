@@ -110,37 +110,9 @@ export class PipelineLlamada {
   }
 
   async iniciar() {
-    // Conectar a OpenAI y obtener config fresca en PARALELO para minimizar delay del saludo.
-    // Si config tarda más de 800ms, usamos la config que ya tenemos (del constructor).
-    const configPromise = (async () => {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 800);
-        const resp = await fetch(
-          `${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}`,
-          { signal: controller.signal }
-        );
-        clearTimeout(timer);
-        if (resp.ok) return await resp.json() as ConfigNegocio;
-      } catch {
-        console.warn("[PIPELINE] Config no disponible a tiempo, usando cache");
-      }
-      return null;
-    })();
-
-    // Conectar a OpenAI inmediatamente (con config actual como fallback)
-    await this.realtime.conectar();
-
-    // Si llegó config fresca, actualizar instrucciones (sin reenviar saludo)
-    const configData = await configPromise;
-    if (configData) {
-      this.configNegocio = configData;
-      const prompt = buildSystemPrompt(configData);
-      this.realtime.actualizarInstrucciones(prompt);
-      console.log(`[PIPELINE] Config actualizada desde Odin para negocioId: ${this.negocioId}`);
-    }
-
-    // Callbacks
+    // IMPORTANTE: registrar callbacks ANTES de conectar a OpenAI.
+    // Si los registramos después, el audio del saludo y las transcripciones
+    // pueden llegar mientras los listeners son null y perderse.
     this.realtime.setOnAudioDelta((base64Audio) => {
       this.enviarAudioTwilio(base64Audio);
     });
@@ -178,6 +150,34 @@ export class PipelineLlamada {
         console.log(`[AGENTE] "${texto}"`);
       }
     });
+
+    // Fetch config fresca y conexión OpenAI en paralelo (max 800ms de espera para config)
+    const configPromise = (async () => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 800);
+        const resp = await fetch(
+          `${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}`,
+          { signal: controller.signal }
+        );
+        clearTimeout(timer);
+        if (resp.ok) return await resp.json() as ConfigNegocio;
+      } catch {
+        console.warn("[PIPELINE] Config no disponible a tiempo, usando cache");
+      }
+      return null;
+    })();
+
+    await this.realtime.conectar();
+
+    // Si llegó config fresca, actualizar instrucciones (sin reenviar saludo)
+    const configData = await configPromise;
+    if (configData) {
+      this.configNegocio = configData;
+      const prompt = buildSystemPrompt(configData);
+      this.realtime.actualizarInstrucciones(prompt);
+      console.log(`[PIPELINE] Config actualizada desde Odin para negocioId: ${this.negocioId}`);
+    }
 
     console.log(`[PIPELINE] Llamada iniciada — negocioId: ${this.negocioId}, caller: ${this.callerNumber || "desconocido"}`);
   }
