@@ -109,29 +109,20 @@ export class PipelineLlamada {
     return true;
   }
 
-  async iniciar() {
-    // IMPORTANTE: registrar callbacks ANTES de conectar a OpenAI.
-    // Si los registramos después, el audio del saludo y las transcripciones
-    // pueden llegar mientras los listeners son null y perderse.
-    this.realtime.setOnAudioDelta((base64Audio) => {
-      this.enviarAudioTwilio(base64Audio);
-    });
-
-    this.realtime.setOnInterrupcion(() => {
-      this.limpiarAudioTwilio();
-    });
-
+  // Registra todos los callbacks en el objeto realtime actual.
+  // Se llama después de crear/recrear this.realtime.
+  private registrarCallbacks() {
+    this.realtime.setOnAudioDelta((b) => this.enviarAudioTwilio(b));
+    this.realtime.setOnInterrupcion(() => this.limpiarAudioTwilio());
     this.realtime.setOnItemCreated((itemId) => {
       this.historialOrdenado.push({ role: "user", content: "", itemId, pending: true });
       console.log(`[PIPELINE] Slot reservado usuario itemId=${itemId}`);
     });
-
     this.realtime.setOnTranscript((texto, role, itemId) => {
       if (role === "user") {
         const idx = itemId
           ? this.historialOrdenado.findIndex(t => t.itemId === itemId && t.pending)
           : this.historialOrdenado.findLastIndex(t => t.role === "user" && t.pending);
-
         if (!this.esTranscripcionValida(texto)) {
           if (idx !== -1) this.historialOrdenado.splice(idx, 1);
           console.log(`[STT] Descartado (ruido): "${texto}"`);
@@ -150,34 +141,37 @@ export class PipelineLlamada {
         console.log(`[AGENTE] "${texto}"`);
       }
     });
+  }
 
-    // Fetch config fresca y conexión OpenAI en paralelo (max 800ms de espera para config)
-    const configPromise = (async () => {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 800);
-        const resp = await fetch(
-          `${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}`,
-          { signal: controller.signal }
-        );
-        clearTimeout(timer);
-        if (resp.ok) return await resp.json() as ConfigNegocio;
-      } catch {
-        console.warn("[PIPELINE] Config no disponible a tiempo, usando cache");
+  async iniciar() {
+    // 1. Obtener config fresca de Odin ANTES de conectar a OpenAI.
+    //    Timeout de 4s para tolerar cold starts de Vercel.
+    //    Si falla/timeout, usamos la config que llegó del constructor (cache local).
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4000);
+      const resp = await fetch(
+        `${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}`,
+        { signal: controller.signal }
+      );
+      clearTimeout(timer);
+      if (resp.ok) {
+        const data = await resp.json() as ConfigNegocio;
+        this.configNegocio = data;
+        this.realtime = new OpenAIRealtime(buildSystemPrompt(data));
+        console.log(`[PIPELINE] Config cargada: ${data.nombreNegocio}`);
+      } else {
+        console.warn(`[PIPELINE] config-llamada → ${resp.status}, usando cache local`);
       }
-      return null;
-    })();
-
-    await this.realtime.conectar();
-
-    // Si llegó config fresca, actualizar instrucciones (sin reenviar saludo)
-    const configData = await configPromise;
-    if (configData) {
-      this.configNegocio = configData;
-      const prompt = buildSystemPrompt(configData);
-      this.realtime.actualizarInstrucciones(prompt);
-      console.log(`[PIPELINE] Config actualizada desde Odin para negocioId: ${this.negocioId}`);
+    } catch {
+      console.warn("[PIPELINE] Config timeout/error, usando cache local");
     }
+
+    // 2. Registrar callbacks en el objeto realtime definitivo (antes de conectar)
+    this.registrarCallbacks();
+
+    // 3. Conectar a OpenAI — el saludo se envía automáticamente al recibir session.updated
+    await this.realtime.conectar();
 
     console.log(`[PIPELINE] Llamada iniciada — negocioId: ${this.negocioId}, caller: ${this.callerNumber || "desconocido"}`);
   }
