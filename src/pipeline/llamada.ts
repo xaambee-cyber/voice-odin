@@ -58,6 +58,21 @@ export class PipelineLlamada {
     this.realtime = new OpenAIRealtime(prompt);
   }
 
+  // Detecta si la transcripción de Whisper es real o ruido de teléfono
+  private esTranscripcionValida(texto: string): boolean {
+    const t = texto.trim().toLowerCase();
+    // Muy corta
+    if (t.length < 4) return false;
+    // Contiene URLs (hallucination frecuente)
+    if (t.includes("www.") || t.includes("http") || t.includes(".com") || t.includes(".org")) return false;
+    // Palabras sueltas que Whisper genera con silencio/ruido
+    const ruido = ["gracias.", "gracias", "un saludo.", "un saludo", "subs", "subtítulos", "suscríbete", "chau.", "chau", "ok.", "ok"];
+    if (ruido.includes(t)) return false;
+    // Solo signos de puntuación o números
+    if (/^[\s.,!?0-9]+$/.test(t)) return false;
+    return true;
+  }
+
   async iniciar() {
     // Pedir config a Odin al inicio de la llamada (cache como fallback)
     try {
@@ -89,8 +104,13 @@ export class PipelineLlamada {
     // Transcripciones para logging e historial
     this.realtime.setOnTranscript((texto, role) => {
       if (role === "user") {
-        this.transcripcionCompleta.push(`Cliente: ${texto}`);
-        this.turnos++;
+        // Filtrar hallucinations de Whisper con audio de teléfono
+        if (this.esTranscripcionValida(texto)) {
+          this.transcripcionCompleta.push(`Cliente: ${texto}`);
+          this.turnos++;
+        } else {
+          console.log(`[STT] Transcripción descartada (ruido): "${texto}"`);
+        }
       } else {
         this.transcripcionCompleta.push(`Agente: ${texto}`);
         console.log(`[AGENTE] "${texto}"`);
