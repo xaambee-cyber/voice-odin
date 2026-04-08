@@ -144,34 +144,40 @@ export class PipelineLlamada {
   }
 
   async iniciar() {
-    // 1. Obtener config fresca de Odin ANTES de conectar a OpenAI.
-    //    Timeout de 4s para tolerar cold starts de Vercel.
-    //    Si falla/timeout, usamos la config que llegó del constructor (cache local).
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 4000);
-      const resp = await fetch(
-        `${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}`,
-        { signal: controller.signal }
-      );
-      clearTimeout(timer);
-      if (resp.ok) {
-        const data = await resp.json() as ConfigNegocio;
-        this.configNegocio = data;
-        this.realtime = new OpenAIRealtime(buildSystemPrompt(data));
-        console.log(`[PIPELINE] Config cargada: ${data.nombreNegocio}`);
-      } else {
-        console.warn(`[PIPELINE] config-llamada → ${resp.status}, usando cache local`);
-      }
-    } catch {
-      console.warn("[PIPELINE] Config timeout/error, usando cache local");
-    }
+    // Arrancar config fetch y conexión OpenAI EN PARALELO para mínima latencia.
+    // El saludo sale en cuanto OpenAI conecta (~300ms).
+    // La config de Odin llega mientras el saludo se reproduce y actualiza el prompt
+    // antes de que el usuario hable — invisible para el usuario.
+    const configPromise = (async () => {
+      try {
+        const resp = await fetch(
+          `${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}`
+        );
+        if (resp.ok) return await resp.json() as ConfigNegocio;
+      } catch {}
+      return null;
+    })();
 
-    // 2. Registrar callbacks en el objeto realtime definitivo (antes de conectar)
+    // Registrar callbacks antes de conectar para no perder ningún evento
     this.registrarCallbacks();
 
-    // 3. Conectar a OpenAI — el saludo se envía automáticamente al recibir session.updated
+    // Conectar a OpenAI — saludo sale aquí
     await this.realtime.conectar();
+
+    // Esperar config con timeout de 4s (tolera cold starts de Vercel).
+    // Llega normalmente antes de que el usuario termine de escuchar el saludo.
+    const configData = await Promise.race([
+      configPromise,
+      new Promise<null>(r => setTimeout(() => r(null), 4000)),
+    ]);
+
+    if (configData) {
+      this.configNegocio = configData;
+      this.realtime.actualizarInstrucciones(buildSystemPrompt(configData));
+      console.log(`[PIPELINE] Config cargada: ${configData.nombreNegocio}`);
+    } else {
+      console.warn("[PIPELINE] Config no disponible, usando cache local");
+    }
 
     console.log(`[PIPELINE] Llamada iniciada — negocioId: ${this.negocioId}, caller: ${this.callerNumber || "desconocido"}`);
   }

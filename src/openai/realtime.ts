@@ -53,8 +53,7 @@ export class OpenAIRealtime {
               silence_duration_ms: 1000,
             },
             temperature: 0.7,
-            // Subido de 150 a 300: evita cortes a media oración
-            max_response_output_tokens: 300,
+            max_response_output_tokens: "inf",
           },
         }));
 
