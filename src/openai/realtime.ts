@@ -9,6 +9,7 @@ export class OpenAIRealtime {
   private conectado: boolean = false;
   private systemPrompt: string;
   private respondiendo: boolean = false;
+  private graceUntil: number = 0; // ms — no interrumpir durante el saludo inicial
 
   constructor(systemPrompt: string) {
     this.systemPrompt = systemPrompt;
@@ -48,7 +49,7 @@ export class OpenAIRealtime {
               silence_duration_ms: 800,
             },
             temperature: 0.7,
-            max_response_output_tokens: 300,
+            max_response_output_tokens: 120,
           },
         }));
 
@@ -83,6 +84,8 @@ export class OpenAIRealtime {
 
       case "session.updated":
         console.log("[REALTIME] Sesión configurada → enviando saludo");
+        // Grace period: no cancelar el saludo por ruido de la línea (4 segundos)
+        this.graceUntil = Date.now() + 4000;
         if (this.ws && this.conectado) {
           this.ws.send(JSON.stringify({
             type: "response.create",
@@ -115,8 +118,8 @@ export class OpenAIRealtime {
 
       case "input_audio_buffer.speech_started":
         console.log("[REALTIME] Usuario empezó a hablar");
-        // Solo interrumpir si hay una respuesta activa
-        if (this.respondiendo && this.ws && this.conectado) {
+        // No interrumpir durante el grace period del saludo
+        if (this.respondiendo && this.ws && this.conectado && Date.now() > this.graceUntil) {
           console.log("[REALTIME] INTERRUPCIÓN detectada → cancelando respuesta");
           this.ws.send(JSON.stringify({ type: "response.cancel" }));
           this.respondiendo = false;
