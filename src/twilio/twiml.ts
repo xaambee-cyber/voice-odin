@@ -6,6 +6,7 @@ import { config } from "../utils/config";
 // 2. El WebSocket va al voice server en el VPS
 export function handleIncomingCall(req: Request, res: Response) {
   const negocioId = req.query.negocioId as string || "default";
+  const callerNumber = ((req.body?.From || req.body?.Caller || "") as string).replace("+", "");
   const wsUrl = config.voiceServerUrl.replace("wss://", "").replace("ws://", "");
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -13,6 +14,7 @@ export function handleIncomingCall(req: Request, res: Response) {
   <Connect>
     <Stream url="wss://${wsUrl}/ws">
       <Parameter name="negocioId" value="${negocioId}" />
+      <Parameter name="callerNumber" value="${callerNumber}" />
     </Stream>
   </Connect>
 </Response>`;
@@ -20,7 +22,7 @@ export function handleIncomingCall(req: Request, res: Response) {
   res.type("text/xml");
   res.send(twiml);
 
-  console.log(`[TWILIO] Llamada entrante → negocioId: ${negocioId}`);
+  console.log(`[TWILIO] Llamada entrante → negocioId: ${negocioId}, caller: ${callerNumber || "desconocido"}`);
 }
 
 // TwiML de fallback cuando el server no está disponible

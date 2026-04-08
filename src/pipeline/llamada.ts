@@ -34,16 +34,30 @@ export class PipelineLlamada {
   private costoTotal: number = 0;
   private inicioLlamada: number;
   private negocioId: string;
+  private callerNumber: string;
 
-  constructor(ws: WebSocket, negocioId: string, configNegocio: ConfigNegocio) {
+  constructor(ws: WebSocket, negocioId: string, configNegocio: ConfigNegocio, callerNumber: string = "") {
     this.ws = ws;
     this.negocioId = negocioId;
     this.configNegocio = configNegocio;
+    this.callerNumber = callerNumber;
     this.stt = new DeepgramSTT();
     this.inicioLlamada = Date.now();
   }
 
   async iniciar() {
+    // Pedir config a Odin al inicio de la llamada (Map como fallback)
+    try {
+      const resp = await fetch(`${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}`);
+      if (resp.ok) {
+        const data = await resp.json() as ConfigNegocio;
+        this.configNegocio = data;
+        console.log(`[PIPELINE] Config cargada desde Odin para negocioId: ${this.negocioId}`);
+      }
+    } catch (err) {
+      console.warn(`[PIPELINE] No se pudo cargar config de Odin, usando cache: ${err}`);
+    }
+
     await this.stt.iniciar();
 
     // Cuando Deepgram transcribe texto parcial o final
@@ -72,7 +86,7 @@ export class PipelineLlamada {
       console.error("[PIPELINE] Error STT:", err);
     });
 
-    console.log(`[PIPELINE] Llamada iniciada — negocioId: ${this.negocioId}`);
+    console.log(`[PIPELINE] Llamada iniciada — negocioId: ${this.negocioId}, caller: ${this.callerNumber || "desconocido"}`);
   }
 
   // Recibe mensaje de Twilio Media Stream
@@ -183,6 +197,8 @@ export class PipelineLlamada {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           negocioId: this.negocioId,
+          telefonoCliente: this.callerNumber || "desconocido",
+          nombreCliente: "Llamada entrante",
           transcripcion: this.transcripcionCompleta.join("\n"),
           duracionSegundos,
           turnos,

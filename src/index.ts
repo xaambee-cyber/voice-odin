@@ -59,11 +59,12 @@ wss.on("connection", (ws: WebSocket) => {
       if (mensaje.event === "start") {
         callSid = mensaje.start?.callSid || "";
         const negocioId = mensaje.start?.customParameters?.negocioId || "default";
+        const callerNumber = mensaje.start?.customParameters?.callerNumber || "";
         const configNegocio = obtenerConfig(negocioId);
 
-        console.log(`[WS] Llamada ${callSid} → negocioId: ${negocioId}`);
+        console.log(`[WS] Llamada ${callSid} → negocioId: ${negocioId}, caller: ${callerNumber || "desconocido"}`);
 
-        pipeline = new PipelineLlamada(ws, negocioId, configNegocio);
+        pipeline = new PipelineLlamada(ws, negocioId, configNegocio, callerNumber);
         await pipeline.iniciar();
         llamadasActivas.set(callSid, pipeline);
 
