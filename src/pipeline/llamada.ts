@@ -89,12 +89,45 @@ export class PipelineLlamada {
     console.log(`[PIPELINE] Llamada iniciada — negocioId: ${this.negocioId}, caller: ${this.callerNumber || "desconocido"}`);
   }
 
+  // Saludo inicial cuando el stream está listo
+  private async saludar() {
+    const saludo = `Hola, gracias por llamar a ${this.configNegocio.nombreNegocio}. Soy ${this.configNegocio.nombreAgente}. ¿En qué te puedo ayudar?`;
+    console.log(`[PIPELINE] Enviando saludo: "${saludo}"`);
+
+    this.transcripcionCompleta.push(`Agente: ${saludo}`);
+    this.historial.push({ role: "assistant", content: saludo });
+
+    try {
+      await textoAVozStreaming(saludo, (base64Audio) => {
+        if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
+          this.ws.send(JSON.stringify({
+            event: "media",
+            streamSid: this.streamSid,
+            media: { payload: base64Audio },
+          }));
+        }
+      });
+
+      if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
+        this.ws.send(JSON.stringify({
+          event: "mark",
+          streamSid: this.streamSid,
+          mark: { name: "saludo_completo" },
+        }));
+      }
+    } catch (err) {
+      console.error("[PIPELINE] Error enviando saludo:", err);
+    }
+  }
+
   // Recibe mensaje de Twilio Media Stream
   recibirMensajeTwilio(mensaje: any) {
     switch (mensaje.event) {
       case "start":
         this.streamSid = mensaje.start?.streamSid || "";
         console.log(`[TWILIO] Stream iniciado: ${this.streamSid}`);
+        // Enviar saludo inicial una vez que el stream está listo
+        this.saludar();
         break;
 
       case "media":
@@ -192,7 +225,7 @@ export class PipelineLlamada {
 
     // Notificar a Odin
     try {
-      await fetch(`${config.odinAppUrl}/api/webhooks/voice`, {
+      const resp = await fetch(`${config.odinAppUrl}/api/webhooks/voice`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -206,6 +239,8 @@ export class PipelineLlamada {
           historial: this.historial,
         }),
       });
+      const data = await resp.json();
+      console.log(`[PIPELINE] Webhook Odin → ${resp.status}:`, data);
     } catch (err) {
       console.error("[PIPELINE] Error notificando a Odin:", err);
     }
