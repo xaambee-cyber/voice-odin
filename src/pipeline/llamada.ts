@@ -21,8 +21,8 @@ interface ConfigNegocio {
 interface TurnoHistorial {
   role: "user" | "assistant";
   content: string;
-  itemId?: string;   // solo para turnos de usuario (para actualizar después)
-  pending: boolean;  // true = Whisper aún no llegó
+  itemId?: string;
+  pending: boolean;
 }
 
 function buildSystemPrompt(configNegocio: ConfigNegocio): string {
@@ -33,21 +33,21 @@ Dirección: ${configNegocio.direccion || "no especificada"}.
 ${configNegocio.conocimiento}
 ${configNegocio.habilidades || ""}
 
-REGLAS CRÍTICAS:
-- SIEMPRE habla en ESPAÑOL MEXICANO. NUNCA respondas en inglés ni otro idioma.
-- Estás en una llamada telefónica. El audio puede sonar distorsionado, pero el usuario SIEMPRE habla español.
-- Si la transcripción parece inglés o sin sentido, IGNÓRALA y responde naturalmente en español como si entendieras.
-- Respuestas cortas: 1-3 oraciones máximo. No des discursos.
-- Habla natural, como una persona real mexicana por teléfono.
-- Sin URLs, emojis, ni formato de texto.
+REGLAS CRÍTICAS — LÉELAS CON ATENCIÓN:
+- SIEMPRE habla en ESPAÑOL MEXICANO. NUNCA en inglés ni otro idioma.
+- Estás en una LLAMADA TELEFÓNICA con audio comprimido. La transcripción a veces llega distorsionada.
+- Si la transcripción no tiene sentido o parece ruido, di EXACTAMENTE: "Perdón, no te escuché bien, ¿me lo puedes repetir?"
+- NUNCA inventes ni respondas a algo que no entendiste claramente.
+- Respuestas de 1-2 oraciones máximo. Sin rodeos.
+- Habla como una persona real mexicana por teléfono. Natural y directo.
+- Sin URLs, emojis, listas, ni formato de texto.
 - No inventes datos que no tengas.
-- Si te interrumpen, detente y escucha.
-- Cuando el usuario te salude, salúdalo de vuelta brevemente y pregunta en qué le ayudas.
-- NO repitas la misma respuesta si te vuelven a preguntar algo similar. Varía tus respuestas.`;
+- Si te preguntan quién eres: di tu nombre y el negocio. Nada más.
+- Si te interrumpen, calla y escucha.`;
 }
 
-// Palabras que solo aparecen en inglés y nunca en español conversacional por teléfono.
-// Si 2+ de estas aparecen en una transcripción, es alucinación de Whisper.
+// Palabras exclusivamente en inglés que nunca aparecen en español conversacional.
+// 2+ hits = alucinación de Whisper.
 const ENGLISH_STOPWORDS = new Set([
   "the", "this", "that", "there", "their", "they", "these", "those",
   "have", "has", "had", "was", "were", "would", "could", "should",
@@ -62,7 +62,6 @@ export class PipelineLlamada {
   private realtime: OpenAIRealtime;
   private streamSid: string = "";
   private configNegocio: ConfigNegocio;
-  // historialOrdenado mantiene el orden correcto usando placeholders para turnos de usuario
   private historialOrdenado: TurnoHistorial[] = [];
   private inicioLlamada: number;
   private negocioId: string;
@@ -80,21 +79,14 @@ export class PipelineLlamada {
     this.realtime = new OpenAIRealtime(prompt);
   }
 
-  // Detecta si la transcripción de Whisper es real o ruido / alucinación de teléfono
   private esTranscripcionValida(texto: string): boolean {
     const t = texto.trim();
     const tLower = t.toLowerCase();
 
-    // Muy corta
     if (t.length < 4) return false;
-
-    // Contiene URLs (alucinación frecuente de Whisper)
     if (tLower.includes("www.") || tLower.includes("http") || tLower.includes(".com") || tLower.includes(".org")) return false;
-
-    // Solo signos de puntuación o números
     if (/^[\s.,!?¿¡0-9\-]+$/.test(t)) return false;
 
-    // Frases concretas de ruido que Whisper genera con silencio
     const ruidoExacto = [
       "gracias.", "gracias", "un saludo.", "un saludo",
       "subs", "subtítulos", "suscríbete", "chau.", "chau",
@@ -102,17 +94,15 @@ export class PipelineLlamada {
     ];
     if (ruidoExacto.includes(tLower)) return false;
 
-    // Detectar inglés: si 2+ palabras son stopwords en inglés, es alucinación
     const palabras = tLower.split(/\s+/);
     const inglesCount = palabras.filter(p => ENGLISH_STOPWORDS.has(p.replace(/[^a-z']/g, ""))).length;
     if (inglesCount >= 2) {
-      console.log(`[STT] Descartado por inglés (${inglesCount} palabras en inglés): "${t}"`);
+      console.log(`[STT] Descartado (inglés, ${inglesCount} palabras): "${t}"`);
       return false;
     }
 
-    // Texto sospechosamente largo para audio de teléfono (más de 30 palabras = probable alucinación)
     if (palabras.length > 30) {
-      console.log(`[STT] Descartado por largo excesivo (${palabras.length} palabras): "${t}"`);
+      console.log(`[STT] Descartado (muy largo, ${palabras.length} palabras): "${t}"`);
       return false;
     }
 
@@ -120,71 +110,76 @@ export class PipelineLlamada {
   }
 
   async iniciar() {
-    // Pedir config a Odin al inicio de la llamada (cache como fallback)
-    try {
-      const resp = await fetch(`${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}`);
-      if (resp.ok) {
-        const data = await resp.json() as ConfigNegocio;
-        this.configNegocio = data;
-        const prompt = buildSystemPrompt(data);
-        this.realtime = new OpenAIRealtime(prompt);
-        console.log(`[PIPELINE] Config cargada desde Odin para negocioId: ${this.negocioId}`);
+    // Conectar a OpenAI y obtener config fresca en PARALELO para minimizar delay del saludo.
+    // Si config tarda más de 800ms, usamos la config que ya tenemos (del constructor).
+    const configPromise = (async () => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 800);
+        const resp = await fetch(
+          `${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}`,
+          { signal: controller.signal }
+        );
+        clearTimeout(timer);
+        if (resp.ok) return await resp.json() as ConfigNegocio;
+      } catch {
+        console.warn("[PIPELINE] Config no disponible a tiempo, usando cache");
       }
-    } catch (err) {
-      console.warn(`[PIPELINE] No se pudo cargar config de Odin, usando cache: ${err}`);
-    }
+      return null;
+    })();
 
+    // Conectar a OpenAI inmediatamente (con config actual como fallback)
     await this.realtime.conectar();
 
-    // Audio de OpenAI → Twilio
+    // Si llegó config fresca, actualizar instrucciones (sin reenviar saludo)
+    const configData = await configPromise;
+    if (configData) {
+      this.configNegocio = configData;
+      const prompt = buildSystemPrompt(configData);
+      this.realtime.actualizarInstrucciones(prompt);
+      console.log(`[PIPELINE] Config actualizada desde Odin para negocioId: ${this.negocioId}`);
+    }
+
+    // Callbacks
     this.realtime.setOnAudioDelta((base64Audio) => {
       this.enviarAudioTwilio(base64Audio);
     });
 
-    // Cuando el usuario interrumpe → limpiar buffer de audio de Twilio
     this.realtime.setOnInterrupcion(() => {
       this.limpiarAudioTwilio();
     });
 
-    // conversation.item.created: el turno del usuario fue detectado (ANTES de que Whisper transcriba).
-    // Reservamos su slot en el historial en el orden correcto.
     this.realtime.setOnItemCreated((itemId) => {
       this.historialOrdenado.push({ role: "user", content: "", itemId, pending: true });
-      console.log(`[PIPELINE] Slot reservado para usuario itemId=${itemId}`);
+      console.log(`[PIPELINE] Slot reservado usuario itemId=${itemId}`);
     });
 
-    // Transcripciones
     this.realtime.setOnTranscript((texto, role, itemId) => {
       if (role === "user") {
-        // Buscar el placeholder reservado por setOnItemCreated
         const idx = itemId
           ? this.historialOrdenado.findIndex(t => t.itemId === itemId && t.pending)
           : this.historialOrdenado.findLastIndex(t => t.role === "user" && t.pending);
 
         if (!this.esTranscripcionValida(texto)) {
-          // Alucinación/ruido → eliminar el placeholder
           if (idx !== -1) this.historialOrdenado.splice(idx, 1);
-          console.log(`[STT] Transcripción descartada (ruido): "${texto}"`);
+          console.log(`[STT] Descartado (ruido): "${texto}"`);
         } else {
-          // Llenar el placeholder con el texto real
           if (idx !== -1) {
             this.historialOrdenado[idx].content = texto;
             this.historialOrdenado[idx].pending = false;
           } else {
-            // Sin placeholder (edge case): insertar al final
             this.historialOrdenado.push({ role: "user", content: texto, pending: false });
           }
           this.turnos++;
           console.log(`[USUARIO] "${texto}"`);
         }
       } else {
-        // El agente siempre llega después del turno del usuario → orden correcto
         this.historialOrdenado.push({ role: "assistant", content: texto, pending: false });
         console.log(`[AGENTE] "${texto}"`);
       }
     });
 
-    console.log(`[PIPELINE] Llamada iniciada — negocioId: ${this.negocioId}, caller: ${this.callerNumber || "desconocido"} — modo: REALTIME`);
+    console.log(`[PIPELINE] Llamada iniciada — negocioId: ${this.negocioId}, caller: ${this.callerNumber || "desconocido"}`);
   }
 
   recibirMensajeTwilio(mensaje: any) {
@@ -193,13 +188,9 @@ export class PipelineLlamada {
         this.streamSid = mensaje.start?.streamSid || "";
         console.log(`[TWILIO] Stream iniciado: ${this.streamSid}`);
         break;
-
       case "media":
-        if (mensaje.media?.payload) {
-          this.realtime.enviarAudio(mensaje.media.payload);
-        }
+        if (mensaje.media?.payload) this.realtime.enviarAudio(mensaje.media.payload);
         break;
-
       case "stop":
         console.log("[TWILIO] Stream detenido");
         this.finalizarLlamada();
@@ -219,11 +210,8 @@ export class PipelineLlamada {
 
   private limpiarAudioTwilio() {
     if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
-      this.ws.send(JSON.stringify({
-        event: "clear",
-        streamSid: this.streamSid,
-      }));
-      console.log("[TWILIO] Buffer de audio limpiado (interrupción)");
+      this.ws.send(JSON.stringify({ event: "clear", streamSid: this.streamSid }));
+      console.log("[TWILIO] Buffer limpiado (interrupción)");
     }
   }
 
@@ -237,21 +225,17 @@ export class PipelineLlamada {
 
     const duracionSegundos = Math.round((Date.now() - this.inicioLlamada) / 1000);
 
-    // Filtrar placeholders que nunca recibieron transcripción (Whisper tardó o llamada cortada)
     const historial = this.historialOrdenado
       .filter(t => !t.pending && t.content.trim().length > 0)
       .map(t => ({ role: t.role === "user" ? "user" as const : "assistant" as const, content: t.content }));
 
-    // Transcripción legible para el campo transcripcion
     const transcripcion = historial
       .map(t => `${t.role === "user" ? "Cliente" : "Agente"}: ${t.content}`)
       .join("\n");
 
     console.log(`[PIPELINE] Llamada finalizada — ${duracionSegundos}s, ${this.turnos} turnos`);
     console.log(`[PIPELINE] Enviando ${historial.length} mensajes a Odin`);
-    if (historial.length > 0) {
-      console.log("[PIPELINE] Historial final:\n" + transcripcion);
-    }
+    if (historial.length > 0) console.log("[PIPELINE] Historial:\n" + transcripcion);
 
     try {
       const resp = await fetch(`${config.odinAppUrl}/api/webhooks/voice`, {

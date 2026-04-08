@@ -10,7 +10,8 @@ export class OpenAIRealtime {
   private conectado: boolean = false;
   private systemPrompt: string;
   private respondiendo: boolean = false;
-  private graceUntil: number = 0; // ms — no interrumpir durante el saludo inicial
+  private graceUntil: number = 0;
+  private saludoEnviado: boolean = false; // evita doble saludo si actualizamos instrucciones
 
   constructor(systemPrompt: string) {
     this.systemPrompt = systemPrompt;
@@ -45,12 +46,15 @@ export class OpenAIRealtime {
             },
             turn_detection: {
               type: "server_vad",
-              threshold: 0.7,
-              prefix_padding_ms: 400,
-              silence_duration_ms: 800,
+              // Subido de 0.7 a 0.85: reduce falsas interrupciones por ruido de línea
+              threshold: 0.85,
+              prefix_padding_ms: 300,
+              // Subido de 800 a 1000: espera más antes de asumir que el usuario terminó
+              silence_duration_ms: 1000,
             },
             temperature: 0.7,
-            max_response_output_tokens: 150,
+            // Subido de 150 a 300: evita cortes a media oración
+            max_response_output_tokens: 300,
           },
         }));
 
@@ -77,6 +81,18 @@ export class OpenAIRealtime {
     });
   }
 
+  // Actualiza instrucciones sin reenviar el saludo (para cuando config de Odin llega tarde)
+  actualizarInstrucciones(prompt: string) {
+    this.systemPrompt = prompt;
+    if (this.ws && this.conectado) {
+      this.ws.send(JSON.stringify({
+        type: "session.update",
+        session: { instructions: prompt },
+      }));
+      console.log("[REALTIME] Instrucciones actualizadas");
+    }
+  }
+
   private handleMessage(msg: any) {
     switch (msg.type) {
       case "session.created":
@@ -84,22 +100,28 @@ export class OpenAIRealtime {
         break;
 
       case "session.updated":
-        console.log("[REALTIME] Sesión configurada → enviando saludo");
-        // Grace period: no cancelar el saludo por ruido de la línea (4 segundos)
-        this.graceUntil = Date.now() + 4000;
-        if (this.ws && this.conectado) {
-          this.ws.send(JSON.stringify({
-            type: "response.create",
-            response: {
-              modalities: ["text", "audio"],
-              instructions: "Saluda brevemente al usuario en español mexicano. Di algo como 'Hola, buenas tardes, ¿en qué te puedo ayudar?' de forma natural y corta.",
-            },
-          }));
+        // Solo mandar saludo UNA vez (al inicio), no en actualizaciones posteriores
+        if (!this.saludoEnviado) {
+          this.saludoEnviado = true;
+          console.log("[REALTIME] Sesión configurada → enviando saludo");
+          // Grace period: 5 segundos para que el saludo no sea interrumpido por ruido de conexión
+          this.graceUntil = Date.now() + 5000;
+          if (this.ws && this.conectado) {
+            this.ws.send(JSON.stringify({
+              type: "response.create",
+              response: {
+                modalities: ["text", "audio"],
+                instructions: "Saluda brevemente al usuario en español mexicano. Una sola oración corta como: 'Hola, ¿en qué te puedo ayudar?' Nada más.",
+              },
+            }));
+          }
+        } else {
+          console.log("[REALTIME] Instrucciones actualizadas (sesión ya activa)");
         }
         break;
 
-      // conversation.item.created fires when a user turn is committed (BEFORE Whisper transcribes)
-      // Use this to reserve the user's slot in conversation order
+      // conversation.item.created fires cuando el turno del usuario se confirma,
+      // ANTES de que Whisper transcriba. Reservamos su slot en el historial.
       case "conversation.item.created":
         if (msg.item?.role === "user" && msg.item?.id && this.onItemCreated) {
           this.onItemCreated(msg.item.id);
@@ -120,7 +142,6 @@ export class OpenAIRealtime {
 
       case "conversation.item.input_audio_transcription.completed":
         if (msg.transcript && this.onTranscript) {
-          // Pass itemId so llamada.ts can find the placeholder and fill it in
           this.onTranscript(msg.transcript, "user", msg.item_id);
           console.log(`[REALTIME] Usuario: "${msg.transcript}"`);
         }
@@ -128,14 +149,11 @@ export class OpenAIRealtime {
 
       case "input_audio_buffer.speech_started":
         console.log("[REALTIME] Usuario empezó a hablar");
-        // No interrumpir durante el grace period del saludo
         if (this.respondiendo && this.ws && this.conectado && Date.now() > this.graceUntil) {
-          console.log("[REALTIME] INTERRUPCIÓN detectada → cancelando respuesta");
+          console.log("[REALTIME] INTERRUPCIÓN → cancelando respuesta");
           this.ws.send(JSON.stringify({ type: "response.cancel" }));
           this.respondiendo = false;
-          if (this.onInterrupcion) {
-            this.onInterrupcion();
-          }
+          if (this.onInterrupcion) this.onInterrupcion();
         }
         break;
 
@@ -150,8 +168,7 @@ export class OpenAIRealtime {
 
       case "response.done":
         this.respondiendo = false;
-        const status = msg.response?.status;
-        if (status === "cancelled") {
+        if (msg.response?.status === "cancelled") {
           console.log("[REALTIME] Respuesta cancelada (interrupción)");
         } else {
           console.log("[REALTIME] Respuesta completa");
@@ -163,7 +180,6 @@ export class OpenAIRealtime {
         break;
 
       case "rate_limits.updated":
-        // Ignorar silenciosamente
         break;
     }
   }
@@ -184,21 +200,10 @@ export class OpenAIRealtime {
     }
   }
 
-  setOnAudioDelta(callback: (base64Audio: string) => void) {
-    this.onAudioDelta = callback;
-  }
-
-  setOnTranscript(callback: (texto: string, role: "user" | "assistant", itemId?: string) => void) {
-    this.onTranscript = callback;
-  }
-
-  setOnItemCreated(callback: (itemId: string) => void) {
-    this.onItemCreated = callback;
-  }
-
-  setOnInterrupcion(callback: () => void) {
-    this.onInterrupcion = callback;
-  }
+  setOnAudioDelta(callback: (base64Audio: string) => void) { this.onAudioDelta = callback; }
+  setOnTranscript(callback: (texto: string, role: "user" | "assistant", itemId?: string) => void) { this.onTranscript = callback; }
+  setOnItemCreated(callback: (itemId: string) => void) { this.onItemCreated = callback; }
+  setOnInterrupcion(callback: () => void) { this.onInterrupcion = callback; }
 
   cerrar() {
     if (this.ws) {
