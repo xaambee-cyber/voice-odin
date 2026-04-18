@@ -30,7 +30,8 @@ export class OpenAIRealtime {
     this.tools = tools;
   }
 
-  async conectar(): Promise<void> {
+  // Paso 1: abre la conexión WebSocket pero NO envía session.update todavía
+  async abrirConexion(): Promise<void> {
     return new Promise((resolve, reject) => {
       const url = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview";
 
@@ -44,34 +45,7 @@ export class OpenAIRealtime {
       this.ws.on("open", () => {
         this.conectado = true;
         console.log("[REALTIME] Conectado a OpenAI");
-
-        const sessionConfig: any = {
-          modalities: ["text", "audio"],
-          instructions: this.systemPrompt,
-          voice: "shimmer",
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          input_audio_transcription: {
-            model: "whisper-1",
-            language: "es",
-          },
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.85,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 1000,
-          },
-          temperature: 0.7,
-          max_response_output_tokens: "inf",
-        };
-
-        if (this.tools.length > 0) {
-          sessionConfig.tools = this.tools;
-          sessionConfig.tool_choice = "auto";
-        }
-
-        this.ws!.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
-        resolve();
+        resolve(); // resuelve sin enviar session.update
       });
 
       this.ws.on("message", (data: Buffer) => {
@@ -94,18 +68,47 @@ export class OpenAIRealtime {
     });
   }
 
-  actualizarInstrucciones(prompt: string, tools: HerramientaVoz[] = []) {
+  // Paso 2: configura la sesión con el prompt/tools definitivos y dispara el saludo
+  // Se llama UNA SOLA VEZ, cuando ya se tiene la config real del negocio
+  configurarSesion(prompt: string, tools: HerramientaVoz[] = []) {
     this.systemPrompt = prompt;
     this.tools = tools;
-    if (this.ws && this.conectado) {
-      const sessionUpdate: any = { instructions: prompt };
-      if (tools.length > 0) {
-        sessionUpdate.tools = tools;
-        sessionUpdate.tool_choice = "auto";
-      }
-      this.ws.send(JSON.stringify({ type: "session.update", session: sessionUpdate }));
-      console.log("[REALTIME] Instrucciones actualizadas");
+
+    if (!this.ws || !this.conectado) return;
+
+    const sessionConfig: any = {
+      modalities: ["text", "audio"],
+      instructions: prompt,
+      voice: "shimmer",
+      input_audio_format: "g711_ulaw",
+      output_audio_format: "g711_ulaw",
+      input_audio_transcription: {
+        model: "whisper-1",
+        language: "es",
+      },
+      turn_detection: {
+        type: "server_vad",
+        threshold: 0.85,
+        prefix_padding_ms: 300,
+        silence_duration_ms: 1000,
+      },
+      temperature: 0.7,
+      max_response_output_tokens: "inf",
+    };
+
+    if (tools.length > 0) {
+      sessionConfig.tools = tools;
+      sessionConfig.tool_choice = "auto";
     }
+
+    this.ws.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
+    // El saludo se dispara en handleMessage cuando llega session.updated
+  }
+
+  // Mantener por compatibilidad — ya no se usa en el flujo normal
+  async conectar(): Promise<void> {
+    await this.abrirConexion();
+    this.configurarSesion(this.systemPrompt, this.tools);
   }
 
   private handleMessage(msg: any) {

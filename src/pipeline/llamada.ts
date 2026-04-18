@@ -506,34 +506,37 @@ export class PipelineLlamada {
   }
 
   async iniciar() {
-    const configPromise = (async () => {
-      try {
-        const callerParam = this.callerNumber ? `&callerNumber=${encodeURIComponent(this.callerNumber)}` : "";
-        const resp = await fetch(
-          `${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}${callerParam}`
-        );
-        if (resp.ok) return await resp.json() as ConfigNegocio;
-      } catch {}
-      return null;
-    })();
-
     this.registrarCallbacks();
-    await this.realtime.conectar();
 
-    const configData = await Promise.race([
-      configPromise,
-      new Promise<null>((r) => setTimeout(() => r(null), 4000)),
+    // Abrir WebSocket con OpenAI Y cargar config del negocio en paralelo.
+    // Solo cuando ambos estén listos se envía el session.update (una sola vez).
+    // Esto elimina el segundo session.update que antes interrumpía el saludo.
+    const callerParam = this.callerNumber ? `&callerNumber=${encodeURIComponent(this.callerNumber)}` : "";
+    const [, configData] = await Promise.all([
+      this.realtime.abrirConexion(),
+      (async (): Promise<ConfigNegocio | null> => {
+        try {
+          const resp = await fetch(
+            `${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}${callerParam}`,
+            { signal: AbortSignal.timeout(4000) }
+          );
+          if (resp.ok) return await resp.json() as ConfigNegocio;
+        } catch {}
+        return null;
+      })(),
     ]);
 
     if (configData) {
       this.configNegocio = configData;
-      const prompt = buildSystemPrompt(configData);
-      const herramientas = construirHerramientas(configData);
-      this.realtime.actualizarInstrucciones(prompt, herramientas);
       console.log(`[PIPELINE] Config cargada: ${configData.nombreNegocio}`);
     } else {
-      console.warn("[PIPELINE] Config no disponible, usando cache local");
+      console.warn("[PIPELINE] Config no disponible, usando defaults");
     }
+
+    // UN SOLO session.update con la config definitiva → saludo sin interrupciones
+    const prompt = buildSystemPrompt(this.configNegocio);
+    const herramientas = construirHerramientas(this.configNegocio);
+    this.realtime.configurarSesion(prompt, herramientas);
 
     console.log(`[PIPELINE] Llamada iniciada — negocioId: ${this.negocioId}, caller: ${this.callerNumber || "desconocido"}`);
   }
