@@ -33,7 +33,7 @@ export class OpenAIRealtime {
   // Paso 1: abre la conexión WebSocket pero NO envía session.update todavía
   async abrirConexion(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const url = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview";
+      const url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
       this.ws = new WebSocket(url, {
         headers: {
