@@ -79,7 +79,7 @@ export class OpenAIRealtime {
     const sessionConfig: any = {
       modalities: ["text", "audio"],
       instructions: prompt,
-      voice: "shimmer",
+      voice: "coral",
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
       input_audio_transcription: {
