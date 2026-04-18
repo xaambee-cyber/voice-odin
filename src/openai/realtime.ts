@@ -1,20 +1,33 @@
 import WebSocket from "ws";
 import { config } from "../utils/config";
 
+export interface HerramientaVoz {
+  type: "function";
+  name: string;
+  description: string;
+  parameters: any;
+}
+
 export class OpenAIRealtime {
   private ws: WebSocket | null = null;
   private onAudioDelta: ((base64Audio: string) => void) | null = null;
   private onTranscript: ((texto: string, role: "user" | "assistant", itemId?: string) => void) | null = null;
   private onItemCreated: ((itemId: string) => void) | null = null;
   private onInterrupcion: (() => void) | null = null;
+  private onFunctionCall: ((name: string, args: any, callId: string) => Promise<any>) | null = null;
   private conectado: boolean = false;
   private systemPrompt: string;
+  private tools: HerramientaVoz[];
   private respondiendo: boolean = false;
   private graceUntil: number = 0;
-  private saludoEnviado: boolean = false; // evita doble saludo si actualizamos instrucciones
+  private saludoEnviado: boolean = false;
 
-  constructor(systemPrompt: string) {
+  // Acumulador de argumentos de la función en curso
+  private funcionActual: { callId: string; name: string; args: string } | null = null;
+
+  constructor(systemPrompt: string, tools: HerramientaVoz[] = []) {
     this.systemPrompt = systemPrompt;
+    this.tools = tools;
   }
 
   async conectar(): Promise<void> {
@@ -32,31 +45,32 @@ export class OpenAIRealtime {
         this.conectado = true;
         console.log("[REALTIME] Conectado a OpenAI");
 
-        this.ws!.send(JSON.stringify({
-          type: "session.update",
-          session: {
-            modalities: ["text", "audio"],
-            instructions: this.systemPrompt,
-            voice: "shimmer",
-            input_audio_format: "g711_ulaw",
-            output_audio_format: "g711_ulaw",
-            input_audio_transcription: {
-              model: "whisper-1",
-              language: "es",
-            },
-            turn_detection: {
-              type: "server_vad",
-              // Subido de 0.7 a 0.85: reduce falsas interrupciones por ruido de línea
-              threshold: 0.85,
-              prefix_padding_ms: 300,
-              // Subido de 800 a 1000: espera más antes de asumir que el usuario terminó
-              silence_duration_ms: 1000,
-            },
-            temperature: 0.7,
-            max_response_output_tokens: "inf",
+        const sessionConfig: any = {
+          modalities: ["text", "audio"],
+          instructions: this.systemPrompt,
+          voice: "shimmer",
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          input_audio_transcription: {
+            model: "whisper-1",
+            language: "es",
           },
-        }));
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.85,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 1000,
+          },
+          temperature: 0.7,
+          max_response_output_tokens: "inf",
+        };
 
+        if (this.tools.length > 0) {
+          sessionConfig.tools = this.tools;
+          sessionConfig.tool_choice = "auto";
+        }
+
+        this.ws!.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
         resolve();
       });
 
@@ -80,14 +94,16 @@ export class OpenAIRealtime {
     });
   }
 
-  // Actualiza instrucciones sin reenviar el saludo (para cuando config de Odin llega tarde)
-  actualizarInstrucciones(prompt: string) {
+  actualizarInstrucciones(prompt: string, tools: HerramientaVoz[] = []) {
     this.systemPrompt = prompt;
+    this.tools = tools;
     if (this.ws && this.conectado) {
-      this.ws.send(JSON.stringify({
-        type: "session.update",
-        session: { instructions: prompt },
-      }));
+      const sessionUpdate: any = { instructions: prompt };
+      if (tools.length > 0) {
+        sessionUpdate.tools = tools;
+        sessionUpdate.tool_choice = "auto";
+      }
+      this.ws.send(JSON.stringify({ type: "session.update", session: sessionUpdate }));
       console.log("[REALTIME] Instrucciones actualizadas");
     }
   }
@@ -99,11 +115,9 @@ export class OpenAIRealtime {
         break;
 
       case "session.updated":
-        // Solo mandar saludo UNA vez (al inicio), no en actualizaciones posteriores
         if (!this.saludoEnviado) {
           this.saludoEnviado = true;
           console.log("[REALTIME] Sesión configurada → enviando saludo");
-          // Grace period: 5 segundos para que el saludo no sea interrumpido por ruido de conexión
           this.graceUntil = Date.now() + 5000;
           if (this.ws && this.conectado) {
             this.ws.send(JSON.stringify({
@@ -119,8 +133,6 @@ export class OpenAIRealtime {
         }
         break;
 
-      // conversation.item.created fires cuando el turno del usuario se confirma,
-      // ANTES de que Whisper transcriba. Reservamos su slot en el historial.
       case "conversation.item.created":
         if (msg.item?.role === "user" && msg.item?.id && this.onItemCreated) {
           this.onItemCreated(msg.item.id);
@@ -174,6 +186,41 @@ export class OpenAIRealtime {
         }
         break;
 
+      // === FUNCTION CALLING ===
+      case "response.output_item.added":
+        if (msg.item?.type === "function_call") {
+          this.funcionActual = {
+            callId: msg.item.call_id || "",
+            name: msg.item.name || "",
+            args: "",
+          };
+          console.log(`[REALTIME] Función iniciada: ${msg.item.name}`);
+        }
+        break;
+
+      case "response.function_call_arguments.delta":
+        if (this.funcionActual && msg.delta) {
+          this.funcionActual.args += msg.delta;
+        }
+        break;
+
+      case "response.function_call_arguments.done":
+        if (this.funcionActual && this.onFunctionCall) {
+          const { callId, name } = this.funcionActual;
+          const argsStr = msg.arguments || this.funcionActual.args;
+          this.funcionActual = null;
+          console.log(`[REALTIME] Función lista: ${name}(${argsStr})`);
+          let args: any = {};
+          try { args = JSON.parse(argsStr); } catch {}
+          this.onFunctionCall(name, args, callId)
+            .then((resultado) => this.enviarResultadoFuncion(callId, resultado))
+            .catch((err) => {
+              console.error("[REALTIME] Error en función:", err);
+              this.enviarResultadoFuncion(callId, { error: "Error procesando la acción" });
+            });
+        }
+        break;
+
       case "error":
         console.error("[REALTIME] Error:", JSON.stringify(msg.error));
         break;
@@ -181,6 +228,20 @@ export class OpenAIRealtime {
       case "rate_limits.updated":
         break;
     }
+  }
+
+  enviarResultadoFuncion(callId: string, resultado: any) {
+    if (!this.ws || !this.conectado) return;
+    this.ws.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "function_call_output",
+        call_id: callId,
+        output: JSON.stringify(resultado),
+      },
+    }));
+    this.ws.send(JSON.stringify({ type: "response.create" }));
+    console.log(`[REALTIME] Resultado función enviado (callId=${callId}):`, resultado);
   }
 
   enviarAudio(base64Audio: string) {
@@ -203,6 +264,7 @@ export class OpenAIRealtime {
   setOnTranscript(callback: (texto: string, role: "user" | "assistant", itemId?: string) => void) { this.onTranscript = callback; }
   setOnItemCreated(callback: (itemId: string) => void) { this.onItemCreated = callback; }
   setOnInterrupcion(callback: () => void) { this.onInterrupcion = callback; }
+  setOnFunctionCall(callback: (name: string, args: any, callId: string) => Promise<any>) { this.onFunctionCall = callback; }
 
   cerrar() {
     if (this.ws) {
