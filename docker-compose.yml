@@ -19,39 +19,18 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
     labels:
       - "traefik.enable=true"
-
-      # ── Router HTTP → HTTPS redirect ──
-      - "traefik.http.routers.odin-voice-http.rule=Host(`voice-odin.duckdns.org`)"
-      - "traefik.http.routers.odin-voice-http.entrypoints=web"
-      - "traefik.http.routers.odin-voice-http.middlewares=https-redirect"
-
-      # ── Router HTTPS general (REST API) ──
+      - "traefik.docker.network=dokploy-network"
+      # Traefik v3 maneja WebSocket automáticamente — sin labels duplicados
       - "traefik.http.routers.odin-voice-https.rule=Host(`voice-odin.duckdns.org`)"
       - "traefik.http.routers.odin-voice-https.entrypoints=websecure"
       - "traefik.http.routers.odin-voice-https.tls.certresolver=letsencrypt"
       - "traefik.http.routers.odin-voice-https.service=odin-voice-svc"
-
-      # ── Router WebSocket (path /ws) ──
-      - "traefik.http.routers.odin-voice-ws.rule=Host(`voice-odin.duckdns.org`) && PathPrefix(`/ws`)"
-      - "traefik.http.routers.odin-voice-ws.entrypoints=websecure"
-      - "traefik.http.routers.odin-voice-ws.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.odin-voice-ws.service=odin-voice-svc"
-      - "traefik.http.routers.odin-voice-ws.middlewares=ws-headers"
-      - "traefik.http.routers.odin-voice-ws.priority=100"
-
-      # ── Middleware: headers para WebSocket ──
-      - "traefik.http.middlewares.ws-headers.headers.customRequestHeaders.X-Forwarded-Proto=https"
-      - "traefik.http.middlewares.ws-headers.headers.customRequestHeaders.Connection=Upgrade"
-      - "traefik.http.middlewares.ws-headers.headers.customRequestHeaders.Upgrade=websocket"
-
-      # ── Middleware: redirect HTTP→HTTPS ──
-      - "traefik.http.middlewares.https-redirect.redirectscheme.scheme=https"
-      - "traefik.http.middlewares.https-redirect.redirectscheme.permanent=true"
-
-      # ── Service ──
+      - "traefik.http.routers.odin-voice-http.rule=Host(`voice-odin.duckdns.org`)"
+      - "traefik.http.routers.odin-voice-http.entrypoints=web"
+      - "traefik.http.routers.odin-voice-http.middlewares=redirect-to-https@file"
+      - "traefik.http.routers.odin-voice-http.service=odin-voice-svc"
       - "traefik.http.services.odin-voice-svc.loadbalancer.server.port=3001"
       - "traefik.http.services.odin-voice-svc.loadbalancer.passHostHeader=true"
-
     networks:
       - dokploy-network
 

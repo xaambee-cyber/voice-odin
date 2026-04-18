@@ -9,14 +9,17 @@ export function handleIncomingCall(req: Request, res: Response) {
   const callerNumber = ((req.body?.From || req.body?.Caller || "") as string).replace("+", "");
   const wsUrl = config.voiceServerUrl.replace("wss://", "").replace("ws://", "");
 
+  // Si el WebSocket falla o se cierra, Twilio ejecuta el <Say> como fallback
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
+  <Connect action="/twiml-fallback" method="POST">
     <Stream url="wss://${wsUrl}/ws">
       <Parameter name="negocioId" value="${negocioId}" />
       <Parameter name="callerNumber" value="${callerNumber}" />
     </Stream>
   </Connect>
+  <Say language="es-MX" voice="Polly.Mia">Lo sentimos, hubo un problema con el asistente. Por favor intente de nuevo en unos momentos.</Say>
+  <Hangup/>
 </Response>`;
 
   res.type("text/xml");
