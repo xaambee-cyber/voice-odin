@@ -146,6 +146,7 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
     },
   });
 
+  console.log(`[PIPELINE] Herramientas cargadas: ${herramientas.map((h) => h.name).join(", ") || "(ninguna)"}`);
   return herramientas;
 }
 
@@ -405,7 +406,7 @@ export class PipelineLlamada {
         }
 
         case "escalar_humano": {
-          await fetch(`${odinUrl}/api/voice/escalar`, {
+          const respEscalar = await fetch(`${odinUrl}/api/voice/escalar`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -416,6 +417,12 @@ export class PipelineLlamada {
             }),
             signal: AbortSignal.timeout(8000),
           });
+          if (!respEscalar.ok) {
+            const errBody = await respEscalar.text().catch(() => "");
+            console.error(`[FUNCIÓN] escalar_humano → HTTP ${respEscalar.status}: ${errBody}`);
+          } else {
+            console.log(`[FUNCIÓN] escalar_humano → HTTP ${respEscalar.status} OK`);
+          }
           const mensajes: Record<string, string> = {
             directo: "Listo, ya notifiqué al equipo. Alguien te contactará pronto.",
             emergencia: "Entendido. El equipo fue notificado de inmediato.",
@@ -425,7 +432,7 @@ export class PipelineLlamada {
         }
 
         case "registrar_pregunta": {
-          await fetch(`${odinUrl}/api/voice/aprendizaje`, {
+          const respAprendizaje = await fetch(`${odinUrl}/api/voice/aprendizaje`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -436,6 +443,12 @@ export class PipelineLlamada {
             }),
             signal: AbortSignal.timeout(8000),
           });
+          if (!respAprendizaje.ok) {
+            const errBody = await respAprendizaje.text().catch(() => "");
+            console.error(`[FUNCIÓN] registrar_pregunta → HTTP ${respAprendizaje.status}: ${errBody}`);
+          } else {
+            console.log(`[FUNCIÓN] registrar_pregunta → HTTP ${respAprendizaje.status} OK`);
+          }
           return { ok: true, mensaje: "Anotado. El equipo te contactará con esa información." };
         }
 

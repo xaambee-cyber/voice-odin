@@ -65,11 +65,10 @@ wss.on("connection", (ws: WebSocket) => {
         console.log(`[WS] Llamada ${callSid} → negocioId: ${negocioId}, caller: ${callerNumber || "desconocido"}`);
 
         pipeline = new PipelineLlamada(ws, negocioId, configNegocio, callerNumber);
+        // Registrar el streamSid ANTES de conectar a OpenAI para que el saludo no se descarte
+        pipeline.recibirMensajeTwilio(mensaje);
         await pipeline.iniciar();
         llamadasActivas.set(callSid, pipeline);
-
-        // Pasar el mensaje start al pipeline
-        pipeline.recibirMensajeTwilio(mensaje);
         return;
       }
 
