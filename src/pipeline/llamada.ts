@@ -355,7 +355,7 @@ export class PipelineLlamada {
             }),
             signal: AbortSignal.timeout(8000),
           });
-          const data = await resp.json();
+          const data = await resp.json() as { slotsDisponibles?: string[]; citaId?: string };
           if (!resp.ok) {
             if (data.slotsDisponibles) {
               return {
@@ -391,7 +391,7 @@ export class PipelineLlamada {
             }),
             signal: AbortSignal.timeout(8000),
           });
-          const data = await resp.json();
+          const data = await resp.json() as { slotsDisponibles?: string[] };
           if (!resp.ok) {
             if (data.slotsDisponibles) {
               return {
