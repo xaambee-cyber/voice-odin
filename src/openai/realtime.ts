@@ -222,6 +222,9 @@ export class OpenAIRealtime {
         break;
 
       case "error":
+        // response_cancel_not_active es inofensivo: ocurre cuando la respuesta
+        // ya terminó justo cuando intentamos cancelarla por interrupción
+        if (msg.error?.code === "response_cancel_not_active") break;
         console.error("[REALTIME] Error:", JSON.stringify(msg.error));
         break;
 
