@@ -135,7 +135,7 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
     parameters: {
       type: "object",
       properties: {
-        pregunta: { type: "string", description: "La pregunta exacta del cliente" },
+        pregunta: { type: "string", description: "Las palabras EXACTAS del cliente, tal como las escuchaste. NO interpretes, NO parafrasees, NO 'mejores' la pregunta. Si la transcripción fue confusa, escribe lo más cercano a lo que escuchaste literalmente." },
         categoria: {
           type: "string",
           enum: ["precios", "horarios", "servicios", "ubicacion", "pagos", "politicas", "otro"],
@@ -185,6 +185,12 @@ function buildSystemPrompt(cfg: ConfigNegocio): string {
   return `Eres ${cfg.nombreAgente} de ${cfg.nombreNegocio} (${cfg.tipoNegocio}).
 ${cfg.personalidad}.${cfg.tonoAdicional ? ` ${cfg.tonoAdicional}` : ""}
 
+FORMATO OBLIGATORIO — ESTÁS EN UNA LLAMADA TELEFÓNICA:
+- HABLA, no escribas. Tus respuestas se convierten en voz.
+- ABSOLUTAMENTE PROHIBIDO: asteriscos, guiones de lista, negritas (**texto**), numeración (1. 2. 3.), markdown de cualquier tipo.
+- Si tienes varios servicios, dícelos como en una conversación: "tenemos limpieza, radiografía y valoración" — no en lista.
+- Máximo 2 oraciones por respuesta. Directo y natural.
+
 FECHA Y HORA ACTUAL: ${ahoraStr}
 
 DATOS DEL NEGOCIO (solo estos existen):
@@ -217,12 +223,9 @@ PROHIBICIONES ABSOLUTAS — violar cualquiera es un error crítico:
 
 REGLAS PARA LLAMADA TELEFÓNICA — CRÍTICAS:
 - SIEMPRE habla en ESPAÑOL MEXICANO. NUNCA en inglés ni otro idioma.
-- Estás en una LLAMADA TELEFÓNICA. La transcripción a veces llega distorsionada.
-- Si la transcripción no tiene sentido o parece ruido, di EXACTAMENTE: "Perdón, no te escuché bien, ¿me lo puedes repetir?"
+- La transcripción a veces llega distorsionada. Si no tiene sentido o parece ruido, di EXACTAMENTE: "Perdón, no te escuché bien, ¿me lo puedes repetir?"
 - NUNCA inventes ni respondas a algo que no entendiste claramente.
-- Respuestas de 1-2 oraciones máximo. Sin rodeos.
 - Habla como una persona real mexicana por teléfono. Natural y directo.
-- Sin URLs, emojis, listas, ni formato de texto.
 - Si te interrumpen, calla y escucha.
 - Si te preguntan quién eres: di tu nombre y el negocio. Nada más.
 ${agendaActiva ? `
