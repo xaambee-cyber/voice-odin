@@ -92,13 +92,8 @@ export class OpenAIRealtime {
       voice: this.voz,
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
-      // gpt-4o-mini-transcribe: más rápido y preciso que whisper-1 en español.
-      // Solo afecta los logs de transcripción (el modelo Realtime entiende el
-      // audio directo sin pasar por transcripción), pero mejor data ayuda al
-      // sistema de "registrar_pregunta" porque las palabras del cliente
-      // llegan más fieles a lo que dijo.
       input_audio_transcription: {
-        model: "gpt-4o-mini-transcribe",
+        model: "whisper-1",
         language: "es",
       },
       // semantic_vad evalúa si lo que oye es habla humana REAL, no solo

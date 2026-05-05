@@ -2,7 +2,7 @@ import WebSocket from "ws";
 import twilio from "twilio";
 import { OpenAIRealtime, HerramientaVoz } from "../openai/realtime";
 import { config } from "../utils/config";
-import { obtenerCache, guardarEnCache } from "../utils/config-cache";
+import { obtenerVozPorNumero } from "../api/registro-voz";
 
 interface Servicio {
   id: string;
@@ -577,39 +577,28 @@ export class PipelineLlamada {
   async iniciar() {
     this.registrarCallbacks();
 
-    // Estrategia de carga de config (de más rápido a más lento):
-    // 1. Cache local (instantáneo, TTL 5min) → saludo con memoria desde 0ms
-    // 2. Fetch race ≤1.5s → saludo con memoria si Odin responde rápido
-    // 3. Saludo con defaults + memoria post-saludo si Vercel está cold
+    // VOZ: leer del registro local (push desde Odin cuando el dueño cambia voz).
+    // Si está, usamos esa para el saludo. Si no, fallback a la voz que llegue
+    // del fetch (si llega a tiempo) o "marin" por defecto. Es independiente
+    // del fetch de config — la voz se decide ANTES del saludo siempre.
+    const vozRegistrada = this.numeroTwilio ? obtenerVozPorNumero(this.numeroTwilio) : null;
+    if (vozRegistrada) {
+      this.configNegocio.voz = vozRegistrada;
+    }
+
+    // Iniciamos el fetch de config en background (con timeout largo + retry).
     const params = new URLSearchParams();
     if (this.negocioId) params.set("negocioId", this.negocioId);
     if (this.numeroTwilio) params.set("numeroTwilio", this.numeroTwilio);
     if (this.callerNumber) params.set("callerNumber", this.callerNumber);
     const url = `${config.odinAppUrl}/api/voice/config-llamada?${params.toString()}`;
 
-    // 1) Intentar cache local primero
-    const configCacheada = obtenerCache(this.numeroTwilio, this.negocioId);
-    if (configCacheada) {
-      this.configNegocio = { ...this.configNegocio, ...configCacheada };
-      if (configCacheada.negocioId) this.negocioId = configCacheada.negocioId;
-
-      await this.realtime.abrirConexion();
-
-      const prompt = buildSystemPrompt(this.configNegocio);
-      const tools = construirHerramientas(this.configNegocio);
-      this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin");
-      console.log(`[PIPELINE] Saludo desde CACHE — ${this.configNegocio.nombreNegocio} (voz=${this.configNegocio.voz || "marin"})`);
-
-      // Refrescar cache en background (sin bloquear). Si la config cambió en
-      // Odin desde la última cache, la próxima llamada ya verá los cambios.
-      fetchConfigConRetry(url, 10000).then((nueva) => {
-        if (nueva) guardarEnCache(nueva, this.numeroTwilio);
-      });
-      return;
-    }
-
-    // 2 y 3) Sin cache: fetch + race
     const fetchPromise = fetchConfigConRetry(url, 10000);
+
+    // Race: si Odin responde en ≤1.5s, arrancamos el saludo CON la voz y la
+    // memoria del negocio correctas. Si tarda más, arrancamos con defaults
+    // (voz=marin o la del registro local) para no retrasar el saludo, y
+    // aplicamos la memoria del negocio cuando llegue (sin tocar la voz).
     const configRapida = await Promise.race([
       fetchPromise,
       new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
@@ -618,9 +607,11 @@ export class PipelineLlamada {
     await this.realtime.abrirConexion();
 
     if (configRapida) {
+      // Llegó a tiempo: saludo con memoria. La voz priorizamos el registro
+      // local (más reciente), si no la del fetch, si no marin.
       this.configNegocio = { ...this.configNegocio, ...configRapida };
       if (configRapida.negocioId) this.negocioId = configRapida.negocioId;
-      guardarEnCache(configRapida, this.numeroTwilio);
+      if (vozRegistrada) this.configNegocio.voz = vozRegistrada;
 
       const prompt = buildSystemPrompt(this.configNegocio);
       const tools = construirHerramientas(this.configNegocio);
@@ -630,7 +621,7 @@ export class PipelineLlamada {
       const prompt = buildSystemPrompt(this.configNegocio);
       const tools = construirHerramientas(this.configNegocio);
       this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin");
-      console.log("[PIPELINE] Saludo con defaults — config llegará en background");
+      console.log(`[PIPELINE] Saludo con defaults — config llegará en background (voz=${this.configNegocio.voz || "marin"})`);
 
       fetchPromise.then((configCompleta) => {
         if (!configCompleta) {
@@ -639,7 +630,6 @@ export class PipelineLlamada {
         }
         this.configNegocio = { ...this.configNegocio, ...configCompleta };
         if (configCompleta.negocioId) this.negocioId = configCompleta.negocioId;
-        guardarEnCache(configCompleta, this.numeroTwilio);
 
         const promptC = buildSystemPrompt(this.configNegocio);
         const toolsC = construirHerramientas(this.configNegocio);
