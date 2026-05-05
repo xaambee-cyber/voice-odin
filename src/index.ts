@@ -1,3 +1,6 @@
+// IMPORTANTE: importar primero http.ts para que el keep-alive global
+// se configure antes de cualquier fetch a Odin.
+import "./utils/http";
 import express from "express";
 import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
@@ -5,6 +8,7 @@ import { config } from "./utils/config";
 import { handleIncomingCall, handleFallback } from "./twilio/twiml";
 import { configurarNegocio, obtenerEstado, obtenerConfig, listarNegocios } from "./api/configurar";
 import { previewVoz } from "./api/preview-voz";
+import { invalidarCacheHandler } from "./api/invalidar-cache";
 import { PipelineLlamada } from "./pipeline/llamada";
 
 const app = express();
@@ -56,6 +60,7 @@ app.post("/api/configurar", configurarNegocio);
 app.get("/api/estado/:negocioId", obtenerEstado);
 app.get("/api/negocios", listarNegocios);
 app.get("/api/preview-voz", previewVoz);
+app.post("/api/invalidar-cache", invalidarCacheHandler);
 
 // ═══ WebSocket Server ═══
 
@@ -124,21 +129,34 @@ wss.on("connection", (ws: WebSocket) => {
   });
 });
 
-// ═══ Warmup periódico de Vercel ═══
-// Cada 4 minutos hacemos un ping al endpoint de config para mantener la
-// función serverless caliente. Sin esto, una llamada que entra después de
-// rato encuentra Vercel frío y el fetch tarda 3-5s extra.
-const WARMUP_MS = 4 * 60 * 1000;
+// ═══ Warmup multi-endpoint ═══
+// Cada 90s pingueamos los endpoints críticos de Odin para mantenerlos warm
+// y para mantener vivas las conexiones TLS del keep-alive pool. Sin esto,
+// cuando una llamada invoca una función después de un rato, hay 1-3s de
+// cold start de Vercel + 400ms de TLS handshake nuevo.
+//
+// Endpoints pingueados:
+// - config-llamada: usado al inicio de cada llamada (memoria del negocio)
+// - citas, escalar, aprendizaje: usados durante la llamada (function calls)
+const WARMUP_MS = 90 * 1000;
+const WARMUP_ENDPOINTS = [
+  "/api/voice/config-llamada?negocioId=__warmup__",
+  "/api/voice/citas?warmup=1",
+  "/api/voice/escalar?warmup=1",
+  "/api/voice/aprendizaje?warmup=1",
+];
 async function warmupOdin() {
-  try {
-    const resp = await fetch(`${config.odinAppUrl}/api/voice/config-llamada?negocioId=__warmup__`, {
-      signal: AbortSignal.timeout(8000),
-    });
-    // Cualquier respuesta (incluido 400 por negocioId inválido) cuenta como warm
-    console.log(`[WARMUP] Odin respondió ${resp.status}`);
-  } catch (err: any) {
-    console.warn("[WARMUP] Odin no respondió:", err?.message || err);
-  }
+  const t0 = Date.now();
+  await Promise.all(
+    WARMUP_ENDPOINTS.map((path) =>
+      fetch(`${config.odinAppUrl}${path}`, { signal: AbortSignal.timeout(8000) })
+        .catch((err) => {
+          console.warn(`[WARMUP] ${path}:`, err?.message || err);
+          return null;
+        })
+    )
+  );
+  console.log(`[WARMUP] ${WARMUP_ENDPOINTS.length} endpoints warmed en ${Date.now() - t0}ms`);
 }
 setInterval(warmupOdin, WARMUP_MS);
 

@@ -92,8 +92,13 @@ export class OpenAIRealtime {
       voice: this.voz,
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
+      // gpt-4o-mini-transcribe: más rápido y preciso que whisper-1 en español.
+      // Solo afecta los logs de transcripción (el modelo Realtime entiende el
+      // audio directo sin pasar por transcripción), pero mejor data ayuda al
+      // sistema de "registrar_pregunta" porque las palabras del cliente
+      // llegan más fieles a lo que dijo.
       input_audio_transcription: {
-        model: "whisper-1",
+        model: "gpt-4o-mini-transcribe",
         language: "es",
       },
       // semantic_vad evalúa si lo que oye es habla humana REAL, no solo
@@ -127,9 +132,27 @@ export class OpenAIRealtime {
     this.ws.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
   }
 
-  // Actualiza prompt/tools sin disparar nuevo saludo (para cargar config tarde)
-  actualizarConfiguracion(prompt: string, tools: HerramientaVoz[] = [], voz?: string) {
-    this.configurarSesion(prompt, tools, voz);
+  // Actualiza prompt y tools mid-conversation, SIN tocar la voz.
+  // OpenAI rechaza session.update con `voice` cuando ya hay audio del asistente
+  // ("cannot_update_voice"), y el rechazo descarta el update ENTERO. Por eso
+  // separamos: configurarSesion (inicial, con voz) vs actualizarConfiguracion (después, sin voz).
+  actualizarConfiguracion(prompt: string, tools: HerramientaVoz[] = []) {
+    this.systemPrompt = prompt;
+    this.tools = tools;
+
+    if (!this.ws || !this.conectado) return;
+
+    const sessionConfig: any = {
+      instructions: prompt,
+    };
+
+    if (tools.length > 0) {
+      sessionConfig.tools = tools;
+      sessionConfig.tool_choice = "auto";
+    }
+
+    this.ws.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
+    console.log("[REALTIME] Instrucciones y herramientas actualizadas (voz preservada)");
   }
 
   async conectar(): Promise<void> {

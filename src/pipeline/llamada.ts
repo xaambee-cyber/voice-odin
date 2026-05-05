@@ -2,6 +2,7 @@ import WebSocket from "ws";
 import twilio from "twilio";
 import { OpenAIRealtime, HerramientaVoz } from "../openai/realtime";
 import { config } from "../utils/config";
+import { obtenerCache, guardarEnCache } from "../utils/config-cache";
 
 interface Servicio {
   id: string;
@@ -576,39 +577,75 @@ export class PipelineLlamada {
   async iniciar() {
     this.registrarCallbacks();
 
-    // ETAPA 1: arrancar OpenAI Realtime y disparar el saludo INMEDIATAMENTE
-    // con la config que tengamos a la mano (cache local o defaults). NO esperamos
-    // al fetch de Vercel — el saludo arranca en cuanto OpenAI conecta (~600ms),
-    // no en 4-13s como antes.
-    await this.realtime.abrirConexion();
-    const promptInicial = buildSystemPrompt(this.configNegocio);
-    const herramientasIniciales = construirHerramientas(this.configNegocio);
-    this.realtime.configurarSesion(promptInicial, herramientasIniciales, this.configNegocio.voz || "marin");
-    console.log(`[PIPELINE] Saludo disparado — negocioId(start): ${this.negocioId || "(lookup)"}, numeroTwilio: ${this.numeroTwilio || "?"}`);
-
-    // ETAPA 2: en paralelo, traer config completa de Odin. Cuando llegue,
-    // actualizar la sesión OpenAI con los datos reales del negocio. El saludo
-    // ya está sonando, esto solo afecta a la primera respuesta del cliente
-    // (que será unos segundos después).
+    // Estrategia de carga de config (de más rápido a más lento):
+    // 1. Cache local (instantáneo, TTL 5min) → saludo con memoria desde 0ms
+    // 2. Fetch race ≤1.5s → saludo con memoria si Odin responde rápido
+    // 3. Saludo con defaults + memoria post-saludo si Vercel está cold
     const params = new URLSearchParams();
     if (this.negocioId) params.set("negocioId", this.negocioId);
     if (this.numeroTwilio) params.set("numeroTwilio", this.numeroTwilio);
     if (this.callerNumber) params.set("callerNumber", this.callerNumber);
-
     const url = `${config.odinAppUrl}/api/voice/config-llamada?${params.toString()}`;
-    const configData = await fetchConfigConRetry(url, 10000);
 
-    if (configData) {
-      this.configNegocio = { ...this.configNegocio, ...configData };
-      // Si el negocioId se resolvió por lookup de número Twilio, actualizar
-      if (configData.negocioId) this.negocioId = configData.negocioId;
+    // 1) Intentar cache local primero
+    const configCacheada = obtenerCache(this.numeroTwilio, this.negocioId);
+    if (configCacheada) {
+      this.configNegocio = { ...this.configNegocio, ...configCacheada };
+      if (configCacheada.negocioId) this.negocioId = configCacheada.negocioId;
 
-      const promptCompleto = buildSystemPrompt(this.configNegocio);
-      const herramientasCompletas = construirHerramientas(this.configNegocio);
-      this.realtime.actualizarConfiguracion(promptCompleto, herramientasCompletas, this.configNegocio.voz || "marin");
-      console.log(`[PIPELINE] Config completa cargada: ${this.configNegocio.nombreNegocio}`);
+      await this.realtime.abrirConexion();
+
+      const prompt = buildSystemPrompt(this.configNegocio);
+      const tools = construirHerramientas(this.configNegocio);
+      this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin");
+      console.log(`[PIPELINE] Saludo desde CACHE — ${this.configNegocio.nombreNegocio} (voz=${this.configNegocio.voz || "marin"})`);
+
+      // Refrescar cache en background (sin bloquear). Si la config cambió en
+      // Odin desde la última cache, la próxima llamada ya verá los cambios.
+      fetchConfigConRetry(url, 10000).then((nueva) => {
+        if (nueva) guardarEnCache(nueva, this.numeroTwilio);
+      });
+      return;
+    }
+
+    // 2 y 3) Sin cache: fetch + race
+    const fetchPromise = fetchConfigConRetry(url, 10000);
+    const configRapida = await Promise.race([
+      fetchPromise,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+    ]);
+
+    await this.realtime.abrirConexion();
+
+    if (configRapida) {
+      this.configNegocio = { ...this.configNegocio, ...configRapida };
+      if (configRapida.negocioId) this.negocioId = configRapida.negocioId;
+      guardarEnCache(configRapida, this.numeroTwilio);
+
+      const prompt = buildSystemPrompt(this.configNegocio);
+      const tools = construirHerramientas(this.configNegocio);
+      this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin");
+      console.log(`[PIPELINE] Saludo con memoria + voz=${this.configNegocio.voz || "marin"} — ${this.configNegocio.nombreNegocio}`);
     } else {
-      console.warn("[PIPELINE] Config no disponible (fetch falló) — agente seguirá con defaults");
+      const prompt = buildSystemPrompt(this.configNegocio);
+      const tools = construirHerramientas(this.configNegocio);
+      this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin");
+      console.log("[PIPELINE] Saludo con defaults — config llegará en background");
+
+      fetchPromise.then((configCompleta) => {
+        if (!configCompleta) {
+          console.warn("[PIPELINE] Config nunca llegó — agente seguirá con defaults");
+          return;
+        }
+        this.configNegocio = { ...this.configNegocio, ...configCompleta };
+        if (configCompleta.negocioId) this.negocioId = configCompleta.negocioId;
+        guardarEnCache(configCompleta, this.numeroTwilio);
+
+        const promptC = buildSystemPrompt(this.configNegocio);
+        const toolsC = construirHerramientas(this.configNegocio);
+        this.realtime.actualizarConfiguracion(promptC, toolsC);
+        console.log(`[PIPELINE] Memoria del negocio aplicada (post-saludo): ${configCompleta.nombreNegocio}`);
+      });
     }
   }
 
