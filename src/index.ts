@@ -4,11 +4,35 @@ import { WebSocketServer, WebSocket } from "ws";
 import { config } from "./utils/config";
 import { handleIncomingCall, handleFallback } from "./twilio/twiml";
 import { configurarNegocio, obtenerEstado, obtenerConfig, listarNegocios } from "./api/configurar";
+import { previewVoz } from "./api/preview-voz";
 import { PipelineLlamada } from "./pipeline/llamada";
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// CORS — permitir que el panel de Odin llame al voice server (preview de voz).
+// Permitimos *.vercel.app y xambee.com (con/sin www).
+function originPermitido(origin: string | undefined): boolean {
+  if (!origin) return false;
+  try {
+    const host = new URL(origin).hostname.toLowerCase();
+    return host.endsWith(".vercel.app") || host === "xambee.com" || host === "www.xambee.com";
+  } catch {
+    return false;
+  }
+}
+app.use((req, res, next) => {
+  const origin = req.headers.origin as string | undefined;
+  if (originPermitido(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin!);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Vary", "Origin");
+  }
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
 // ═══ API REST ═══
 
@@ -31,6 +55,7 @@ app.post("/twiml-fallback", handleFallback);
 app.post("/api/configurar", configurarNegocio);
 app.get("/api/estado/:negocioId", obtenerEstado);
 app.get("/api/negocios", listarNegocios);
+app.get("/api/preview-voz", previewVoz);
 
 // ═══ WebSocket Server ═══
 

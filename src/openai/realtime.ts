@@ -96,15 +96,23 @@ export class OpenAIRealtime {
         model: "whisper-1",
         language: "es",
       },
+      // semantic_vad evalúa si lo que oye es habla humana REAL, no solo
+      // nivel de audio. Mucho mejor para:
+      // - personas mayores con pausas y respiraciones
+      // - ruido ambiente que dispararía un VAD por volumen
+      // - hablantes que empiezan bajito
+      //
+      // eagerness "medium" = balance entre rapidez y precisión. "low" sería
+      // más conservador (corta menos cuando duda) pero también responde más
+      // tarde después de que terminas de hablar. "high" lo opuesto.
       turn_detection: {
-        type: "server_vad",
-        threshold: 0.6,
-        prefix_padding_ms: 300,
-        silence_duration_ms: 700,
-        // CRÍTICO: NO dejar que el server cancele respuestas automáticamente.
-        // Antes esto causaba que el saludo se cancelara apenas el cliente
-        // empezaba a respirar o hacer ruido.
+        type: "semantic_vad",
+        eagerness: "medium",
         create_response: true,
+        // CRÍTICO: NO dejar que OpenAI cancele respuestas automáticamente.
+        // Nosotros lo manejamos en speech_started → así podemos limpiar
+        // el buffer de Twilio ANTES de mandar el cancel, y el silencio
+        // del agente es instantáneo.
         interrupt_response: false,
       },
       temperature: 0.7,
@@ -187,10 +195,14 @@ export class OpenAIRealtime {
         // 2) Ya pasó el grace period (saludo o respuesta inicial)
         // 3) No hay otra cancelación en curso
         if (this.respondiendo && this.ws && this.conectado && Date.now() > this.graceUntil && !this.cancelacionEnCurso) {
-          console.log("[REALTIME] INTERRUPCIÓN → cancelando respuesta");
           this.cancelacionEnCurso = true;
-          this.ws.send(JSON.stringify({ type: "response.cancel" }));
+          // ORDEN CRÍTICO para que el agente se calle al instante:
+          // 1° Limpiar el buffer de audio en Twilio (el cliente DEJA DE OÍR al agente YA)
+          //    Esto se aplica en ~30-50ms vs los ~200ms que toma el round-trip a OpenAI.
+          // 2° Después cancelar la respuesta en OpenAI (deja de generar más audio)
           if (this.onInterrupcion) this.onInterrupcion();
+          this.ws.send(JSON.stringify({ type: "response.cancel" }));
+          console.log("[REALTIME] INTERRUPCIÓN → audio cortado + cancel enviado");
         }
         break;
 
