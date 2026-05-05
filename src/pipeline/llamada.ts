@@ -1,4 +1,5 @@
 import WebSocket from "ws";
+import twilio from "twilio";
 import { OpenAIRealtime, HerramientaVoz } from "../openai/realtime";
 import { config } from "../utils/config";
 
@@ -43,6 +44,7 @@ export interface ConfigNegocio {
   // Datos extendidos
   negocioId?: string;
   zonaHoraria?: string;
+  voz?: string;
   servicios?: Servicio[];
   horarioDetallado?: HorarioDetallado[];
   citasCliente?: CitaCliente[];
@@ -143,6 +145,22 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
         },
       },
       required: ["pregunta", "categoria"],
+    },
+  });
+
+  // Colgar llamada — siempre disponible. El modelo decide cuándo invocarla
+  // por sí mismo al detectar despedida del cliente. NO se menciona en el
+  // system prompt para no contaminarlo; basta con la descripción de la tool.
+  herramientas.push({
+    type: "function",
+    name: "colgar_llamada",
+    description: "Termina la llamada telefónica. Llama esta función SOLO cuando el cliente se haya despedido claramente (por ejemplo: 'gracias, adiós', 'ya con eso', 'hasta luego', 'bye') y no quede ninguna acción pendiente. Despídete brevemente ANTES de llamar a la función. NO la llames si el cliente sigue preguntando o si hay una acción a medias.",
+    parameters: {
+      type: "object",
+      properties: {
+        despedida: { type: "string", description: "Frase corta de despedida que ya dijiste o estás por decir" },
+      },
+      required: ["despedida"],
     },
   });
 
@@ -292,27 +310,55 @@ const ENGLISH_STOPWORDS = new Set([
   "music", "provided", "copyright", "rights", "reserved",
 ]);
 
+// Fetch con timeout largo + 1 reintento. Antes el timeout era 4s y
+// con cold start de Vercel siempre fallaba → agente sin datos del negocio.
+async function fetchConfigConRetry(url: string, timeoutMs: number = 10000): Promise<ConfigNegocio | null> {
+  for (let intento = 1; intento <= 2; intento++) {
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+      if (resp.ok) return await resp.json() as ConfigNegocio;
+      const errBody = await resp.text().catch(() => "");
+      console.warn(`[PIPELINE] config-llamada HTTP ${resp.status} (intento ${intento}): ${errBody}`);
+      if (resp.status === 404) return null; // no existe → no reintentar
+    } catch (err: any) {
+      console.warn(`[PIPELINE] config-llamada falló (intento ${intento}): ${err?.message || err}`);
+    }
+  }
+  return null;
+}
+
 export class PipelineLlamada {
   private ws: WebSocket;
   private realtime: OpenAIRealtime;
   private streamSid: string = "";
+  private callSid: string;
   private configNegocio: ConfigNegocio;
   private historialOrdenado: TurnoHistorial[] = [];
   private inicioLlamada: number;
   private negocioId: string;
+  private numeroTwilio: string;
   private callerNumber: string;
   private turnos: number = 0;
 
-  constructor(ws: WebSocket, negocioId: string, configNegocio: ConfigNegocio, callerNumber: string = "") {
+  constructor(
+    ws: WebSocket,
+    negocioId: string,
+    configNegocio: ConfigNegocio,
+    callerNumber: string = "",
+    numeroTwilio: string = "",
+    callSid: string = "",
+  ) {
     this.ws = ws;
     this.negocioId = negocioId;
+    this.numeroTwilio = numeroTwilio;
+    this.callSid = callSid;
     this.configNegocio = configNegocio;
     this.callerNumber = callerNumber;
     this.inicioLlamada = Date.now();
 
     const prompt = buildSystemPrompt(configNegocio);
     const herramientas = construirHerramientas(configNegocio);
-    this.realtime = new OpenAIRealtime(prompt, herramientas);
+    this.realtime = new OpenAIRealtime(prompt, herramientas, configNegocio.voz || "marin");
   }
 
   private esTranscripcionValida(texto: string): boolean {
@@ -343,6 +389,22 @@ export class PipelineLlamada {
     }
 
     return true;
+  }
+
+  private async colgarTwilioCall(): Promise<void> {
+    if (!this.callSid) {
+      console.warn("[FUNCIÓN] colgar_llamada: no hay callSid, cerrando WebSocket");
+      try { this.ws.close(); } catch {}
+      return;
+    }
+    try {
+      const client = twilio(config.twilioAccountSid, config.twilioAuthToken);
+      await client.calls(this.callSid).update({ status: "completed" });
+      console.log(`[FUNCIÓN] colgar_llamada: llamada ${this.callSid} colgada vía Twilio API`);
+    } catch (err: any) {
+      console.error("[FUNCIÓN] colgar_llamada: error con Twilio API, cerrando WS:", err?.message || err);
+      try { this.ws.close(); } catch {}
+    }
   }
 
   private async manejarFuncion(nombre: string, args: any, callId: string): Promise<any> {
@@ -463,6 +525,13 @@ export class PipelineLlamada {
           return { ok: true, mensaje: "Anotado. El equipo te contactará con esa información." };
         }
 
+        case "colgar_llamada": {
+          // Esperar ~2s para que termine de hablar la despedida antes de colgar.
+          // El modelo ya emitió la frase de despedida antes de invocar la función.
+          setTimeout(() => { this.colgarTwilioCall(); }, 2000);
+          return { ok: true, mensaje: "Hasta luego." };
+        }
+
         default:
           return { ok: false, mensaje: "Función no reconocida." };
       }
@@ -478,7 +547,6 @@ export class PipelineLlamada {
     this.realtime.setOnFunctionCall((nombre, args, callId) => this.manejarFuncion(nombre, args, callId));
     this.realtime.setOnItemCreated((itemId) => {
       this.historialOrdenado.push({ role: "user", content: "", itemId, pending: true });
-      console.log(`[PIPELINE] Slot reservado usuario itemId=${itemId}`);
     });
     this.realtime.setOnTranscript((texto, role, itemId) => {
       if (role === "user") {
@@ -508,37 +576,40 @@ export class PipelineLlamada {
   async iniciar() {
     this.registrarCallbacks();
 
-    // Abrir WebSocket con OpenAI Y cargar config del negocio en paralelo.
-    // Solo cuando ambos estén listos se envía el session.update (una sola vez).
-    // Esto elimina el segundo session.update que antes interrumpía el saludo.
-    const callerParam = this.callerNumber ? `&callerNumber=${encodeURIComponent(this.callerNumber)}` : "";
-    const [, configData] = await Promise.all([
-      this.realtime.abrirConexion(),
-      (async (): Promise<ConfigNegocio | null> => {
-        try {
-          const resp = await fetch(
-            `${config.odinAppUrl}/api/voice/config-llamada?negocioId=${this.negocioId}${callerParam}`,
-            { signal: AbortSignal.timeout(4000) }
-          );
-          if (resp.ok) return await resp.json() as ConfigNegocio;
-        } catch {}
-        return null;
-      })(),
-    ]);
+    // ETAPA 1: arrancar OpenAI Realtime y disparar el saludo INMEDIATAMENTE
+    // con la config que tengamos a la mano (cache local o defaults). NO esperamos
+    // al fetch de Vercel — el saludo arranca en cuanto OpenAI conecta (~600ms),
+    // no en 4-13s como antes.
+    await this.realtime.abrirConexion();
+    const promptInicial = buildSystemPrompt(this.configNegocio);
+    const herramientasIniciales = construirHerramientas(this.configNegocio);
+    this.realtime.configurarSesion(promptInicial, herramientasIniciales, this.configNegocio.voz || "marin");
+    console.log(`[PIPELINE] Saludo disparado — negocioId(start): ${this.negocioId || "(lookup)"}, numeroTwilio: ${this.numeroTwilio || "?"}`);
+
+    // ETAPA 2: en paralelo, traer config completa de Odin. Cuando llegue,
+    // actualizar la sesión OpenAI con los datos reales del negocio. El saludo
+    // ya está sonando, esto solo afecta a la primera respuesta del cliente
+    // (que será unos segundos después).
+    const params = new URLSearchParams();
+    if (this.negocioId) params.set("negocioId", this.negocioId);
+    if (this.numeroTwilio) params.set("numeroTwilio", this.numeroTwilio);
+    if (this.callerNumber) params.set("callerNumber", this.callerNumber);
+
+    const url = `${config.odinAppUrl}/api/voice/config-llamada?${params.toString()}`;
+    const configData = await fetchConfigConRetry(url, 10000);
 
     if (configData) {
-      this.configNegocio = configData;
-      console.log(`[PIPELINE] Config cargada: ${configData.nombreNegocio}`);
+      this.configNegocio = { ...this.configNegocio, ...configData };
+      // Si el negocioId se resolvió por lookup de número Twilio, actualizar
+      if (configData.negocioId) this.negocioId = configData.negocioId;
+
+      const promptCompleto = buildSystemPrompt(this.configNegocio);
+      const herramientasCompletas = construirHerramientas(this.configNegocio);
+      this.realtime.actualizarConfiguracion(promptCompleto, herramientasCompletas, this.configNegocio.voz || "marin");
+      console.log(`[PIPELINE] Config completa cargada: ${this.configNegocio.nombreNegocio}`);
     } else {
-      console.warn("[PIPELINE] Config no disponible, usando defaults");
+      console.warn("[PIPELINE] Config no disponible (fetch falló) — agente seguirá con defaults");
     }
-
-    // UN SOLO session.update con la config definitiva → saludo sin interrupciones
-    const prompt = buildSystemPrompt(this.configNegocio);
-    const herramientas = construirHerramientas(this.configNegocio);
-    this.realtime.configurarSesion(prompt, herramientas);
-
-    console.log(`[PIPELINE] Llamada iniciada — negocioId: ${this.negocioId}, caller: ${this.callerNumber || "desconocido"}`);
   }
 
   recibirMensajeTwilio(mensaje: any) {
@@ -595,6 +666,12 @@ export class PipelineLlamada {
     console.log(`[PIPELINE] Llamada finalizada — ${duracionSegundos}s, ${this.turnos} turnos`);
     console.log(`[PIPELINE] Enviando ${historial.length} mensajes a Odin`);
     if (historial.length > 0) console.log("[PIPELINE] Historial:\n" + transcripcion);
+
+    // Solo enviar webhook si tenemos un negocioId real (no lookup fallido)
+    if (!this.negocioId) {
+      console.warn("[PIPELINE] No hay negocioId — webhook a Odin omitido");
+      return;
+    }
 
     try {
       const resp = await fetch(`${config.odinAppUrl}/api/webhooks/voice`, {

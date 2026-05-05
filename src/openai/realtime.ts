@@ -8,6 +8,11 @@ export interface HerramientaVoz {
   parameters: any;
 }
 
+// Voces disponibles en gpt-realtime (GA): alloy, ash, ballad, cedar, coral,
+// echo, marin, sage, shimmer, verse. Default: marin (más natural en español).
+const VOZ_DEFAULT = "marin";
+const MODELO = "gpt-realtime";
+
 export class OpenAIRealtime {
   private ws: WebSocket | null = null;
   private onAudioDelta: ((base64Audio: string) => void) | null = null;
@@ -18,22 +23,25 @@ export class OpenAIRealtime {
   private conectado: boolean = false;
   private systemPrompt: string;
   private tools: HerramientaVoz[];
+  private voz: string;
   private respondiendo: boolean = false;
   private graceUntil: number = 0;
   private saludoEnviado: boolean = false;
+  private cancelacionEnCurso: boolean = false;
 
   // Acumulador de argumentos de la función en curso
   private funcionActual: { callId: string; name: string; args: string } | null = null;
 
-  constructor(systemPrompt: string, tools: HerramientaVoz[] = []) {
+  constructor(systemPrompt: string, tools: HerramientaVoz[] = [], voz: string = VOZ_DEFAULT) {
     this.systemPrompt = systemPrompt;
     this.tools = tools;
+    this.voz = voz;
   }
 
   // Paso 1: abre la conexión WebSocket pero NO envía session.update todavía
   async abrirConexion(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
+      const url = `wss://api.openai.com/v1/realtime?model=${MODELO}`;
 
       this.ws = new WebSocket(url, {
         headers: {
@@ -44,8 +52,8 @@ export class OpenAIRealtime {
 
       this.ws.on("open", () => {
         this.conectado = true;
-        console.log("[REALTIME] Conectado a OpenAI");
-        resolve(); // resuelve sin enviar session.update
+        console.log(`[REALTIME] Conectado a OpenAI (${MODELO}, voz=${this.voz})`);
+        resolve();
       });
 
       this.ws.on("message", (data: Buffer) => {
@@ -68,18 +76,20 @@ export class OpenAIRealtime {
     });
   }
 
-  // Paso 2: configura la sesión con el prompt/tools definitivos y dispara el saludo
-  // Se llama UNA SOLA VEZ, cuando ya se tiene la config real del negocio
-  configurarSesion(prompt: string, tools: HerramientaVoz[] = []) {
+  // Configura la sesión y dispara el saludo. Si ya se envió saludo previamente
+  // (por ejemplo, configurarSesion se llamó dos veces), solo actualiza
+  // instrucciones/tools sin saludar de nuevo.
+  configurarSesion(prompt: string, tools: HerramientaVoz[] = [], voz?: string) {
     this.systemPrompt = prompt;
     this.tools = tools;
+    if (voz) this.voz = voz;
 
     if (!this.ws || !this.conectado) return;
 
     const sessionConfig: any = {
       modalities: ["text", "audio"],
       instructions: prompt,
-      voice: "coral",
+      voice: this.voz,
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
       input_audio_transcription: {
@@ -88,9 +98,14 @@ export class OpenAIRealtime {
       },
       turn_detection: {
         type: "server_vad",
-        threshold: 0.85,
+        threshold: 0.6,
         prefix_padding_ms: 300,
-        silence_duration_ms: 1000,
+        silence_duration_ms: 700,
+        // CRÍTICO: NO dejar que el server cancele respuestas automáticamente.
+        // Antes esto causaba que el saludo se cancelara apenas el cliente
+        // empezaba a respirar o hacer ruido.
+        create_response: true,
+        interrupt_response: false,
       },
       temperature: 0.7,
       max_response_output_tokens: "inf",
@@ -102,10 +117,13 @@ export class OpenAIRealtime {
     }
 
     this.ws.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
-    // El saludo se dispara en handleMessage cuando llega session.updated
   }
 
-  // Mantener por compatibilidad — ya no se usa en el flujo normal
+  // Actualiza prompt/tools sin disparar nuevo saludo (para cargar config tarde)
+  actualizarConfiguracion(prompt: string, tools: HerramientaVoz[] = [], voz?: string) {
+    this.configurarSesion(prompt, tools, voz);
+  }
+
   async conectar(): Promise<void> {
     await this.abrirConexion();
     this.configurarSesion(this.systemPrompt, this.tools);
@@ -121,18 +139,20 @@ export class OpenAIRealtime {
         if (!this.saludoEnviado) {
           this.saludoEnviado = true;
           console.log("[REALTIME] Sesión configurada → enviando saludo");
-          this.graceUntil = Date.now() + 5000;
+          // Grace de 1.5s: durante el saludo no aceptamos interrupciones reales,
+          // pero como interrupt_response=false, OpenAI tampoco cancela solo.
+          this.graceUntil = Date.now() + 1500;
           if (this.ws && this.conectado) {
             this.ws.send(JSON.stringify({
               type: "response.create",
               response: {
                 modalities: ["text", "audio"],
-                instructions: "Saluda brevemente al usuario en español mexicano. Una sola oración corta como: 'Hola, ¿en qué te puedo ayudar?' Nada más.",
+                instructions: "Saluda brevemente al cliente en español mexicano. Una sola oración corta como: 'Hola, ¿en qué te puedo ayudar?' Nada más.",
               },
             }));
           }
         } else {
-          console.log("[REALTIME] Instrucciones actualizadas (sesión ya activa)");
+          console.log("[REALTIME] Configuración actualizada (sesión ya activa)");
         }
         break;
 
@@ -162,30 +182,31 @@ export class OpenAIRealtime {
         break;
 
       case "input_audio_buffer.speech_started":
-        console.log("[REALTIME] Usuario empezó a hablar");
-        if (this.respondiendo && this.ws && this.conectado && Date.now() > this.graceUntil) {
+        // Solo cancelamos respuesta en curso si:
+        // 1) Estamos respondiendo
+        // 2) Ya pasó el grace period (saludo o respuesta inicial)
+        // 3) No hay otra cancelación en curso
+        if (this.respondiendo && this.ws && this.conectado && Date.now() > this.graceUntil && !this.cancelacionEnCurso) {
           console.log("[REALTIME] INTERRUPCIÓN → cancelando respuesta");
+          this.cancelacionEnCurso = true;
           this.ws.send(JSON.stringify({ type: "response.cancel" }));
-          this.respondiendo = false;
           if (this.onInterrupcion) this.onInterrupcion();
         }
         break;
 
       case "input_audio_buffer.speech_stopped":
-        console.log("[REALTIME] Usuario dejó de hablar");
         break;
 
       case "response.created":
         this.respondiendo = true;
-        console.log("[REALTIME] Generando respuesta...");
+        this.cancelacionEnCurso = false;
         break;
 
       case "response.done":
         this.respondiendo = false;
+        this.cancelacionEnCurso = false;
         if (msg.response?.status === "cancelled") {
-          console.log("[REALTIME] Respuesta cancelada (interrupción)");
-        } else {
-          console.log("[REALTIME] Respuesta completa");
+          console.log("[REALTIME] Respuesta cancelada");
         }
         break;
 
@@ -226,7 +247,7 @@ export class OpenAIRealtime {
 
       case "error":
         // response_cancel_not_active es inofensivo: ocurre cuando la respuesta
-        // ya terminó justo cuando intentamos cancelarla por interrupción
+        // ya terminó justo cuando intentamos cancelarla
         if (msg.error?.code === "response_cancel_not_active") break;
         console.error("[REALTIME] Error:", JSON.stringify(msg.error));
         break;

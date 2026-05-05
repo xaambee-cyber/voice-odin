@@ -12,12 +12,11 @@ app.use(express.urlencoded({ extended: true }));
 
 // ═══ API REST ═══
 
-// Health check
 app.get("/", (req, res) => {
   res.json({
     servicio: "odin-voice",
     estado: "online",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 });
 
@@ -38,7 +37,6 @@ app.get("/api/negocios", listarNegocios);
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-// Map de llamadas activas
 const llamadasActivas: Map<string, PipelineLlamada> = new Map();
 
 wss.on("connection", (ws: WebSocket) => {
@@ -58,13 +56,22 @@ wss.on("connection", (ws: WebSocket) => {
 
       if (mensaje.event === "start") {
         callSid = mensaje.start?.callSid || "";
-        const negocioId = mensaje.start?.customParameters?.negocioId || "default";
-        const callerNumber = mensaje.start?.customParameters?.callerNumber || "";
-        const configNegocio = obtenerConfig(negocioId);
+        const params = mensaje.start?.customParameters || {};
+        const negocioId = String(params.negocioId || "");
+        const numeroTwilio = String(params.numeroTwilio || "");
+        const callerNumber = String(params.callerNumber || "");
+        const configNegocio = obtenerConfig(negocioId || "default");
 
-        console.log(`[WS] Llamada ${callSid} → negocioId: ${negocioId}, caller: ${callerNumber || "desconocido"}`);
+        console.log(`[WS] Llamada ${callSid} → negocioId: ${negocioId || "(lookup)"}, numeroTwilio: ${numeroTwilio || "?"}, caller: ${callerNumber || "desconocido"}`);
 
-        pipeline = new PipelineLlamada(ws, negocioId, configNegocio, callerNumber);
+        pipeline = new PipelineLlamada(
+          ws,
+          negocioId,
+          configNegocio,
+          callerNumber,
+          numeroTwilio,
+          callSid,
+        );
         // Registrar el streamSid ANTES de conectar a OpenAI para que el saludo no se descarte
         pipeline.recibirMensajeTwilio(mensaje);
         await pipeline.iniciar();
@@ -72,7 +79,6 @@ wss.on("connection", (ws: WebSocket) => {
         return;
       }
 
-      // Todos los demás mensajes van al pipeline
       if (pipeline) {
         pipeline.recibirMensajeTwilio(mensaje);
       }
@@ -93,6 +99,24 @@ wss.on("connection", (ws: WebSocket) => {
   });
 });
 
+// ═══ Warmup periódico de Vercel ═══
+// Cada 4 minutos hacemos un ping al endpoint de config para mantener la
+// función serverless caliente. Sin esto, una llamada que entra después de
+// rato encuentra Vercel frío y el fetch tarda 3-5s extra.
+const WARMUP_MS = 4 * 60 * 1000;
+async function warmupOdin() {
+  try {
+    const resp = await fetch(`${config.odinAppUrl}/api/voice/config-llamada?negocioId=__warmup__`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    // Cualquier respuesta (incluido 400 por negocioId inválido) cuenta como warm
+    console.log(`[WARMUP] Odin respondió ${resp.status}`);
+  } catch (err: any) {
+    console.warn("[WARMUP] Odin no respondió:", err?.message || err);
+  }
+}
+setInterval(warmupOdin, WARMUP_MS);
+
 // ═══ Iniciar servidor ═══
 
 server.listen(config.port, () => {
@@ -105,4 +129,6 @@ server.listen(config.port, () => {
 ║   Estado:  ONLINE                          ║
 ╚════════════════════════════════════════════╝
   `);
+  // Primer warmup a los 30s del arranque
+  setTimeout(warmupOdin, 30_000);
 });
