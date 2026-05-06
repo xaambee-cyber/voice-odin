@@ -586,7 +586,10 @@ export class PipelineLlamada {
       this.configNegocio.voz = vozRegistrada;
     }
 
-    // Iniciamos el fetch de config en background (con timeout largo + retry).
+    // Iniciamos el fetch de config Y la conexión OpenAI EN PARALELO.
+    // Antes esperaba race primero (1.5s) y después conexión (600ms) en serie.
+    // Ahora ambos arrancan al mismo tiempo: cuando termine el más lento de
+    // los dos, ya tenemos todo listo. Ahorra ~600ms en la mayoría de casos.
     const params = new URLSearchParams();
     if (this.negocioId) params.set("negocioId", this.negocioId);
     if (this.numeroTwilio) params.set("numeroTwilio", this.numeroTwilio);
@@ -594,17 +597,16 @@ export class PipelineLlamada {
     const url = `${config.odinAppUrl}/api/voice/config-llamada?${params.toString()}`;
 
     const fetchPromise = fetchConfigConRetry(url, 10000);
+    const conexionPromise = this.realtime.abrirConexion();
 
-    // Race: si Odin responde en ≤1.5s, arrancamos el saludo CON la voz y la
-    // memoria del negocio correctas. Si tarda más, arrancamos con defaults
-    // (voz=marin o la del registro local) para no retrasar el saludo, y
-    // aplicamos la memoria del negocio cuando llegue (sin tocar la voz).
-    const configRapida = await Promise.race([
-      fetchPromise,
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+    // Race del fetch contra timeout 1.5s. La conexión OpenAI corre en paralelo.
+    const [configRapida] = await Promise.all([
+      Promise.race([
+        fetchPromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+      ]),
+      conexionPromise,
     ]);
-
-    await this.realtime.abrirConexion();
 
     if (configRapida) {
       // Llegó a tiempo: saludo con memoria. La voz priorizamos el registro

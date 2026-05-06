@@ -38,7 +38,10 @@ export class OpenAIRealtime {
     this.voz = voz;
   }
 
-  // Paso 1: abre la conexión WebSocket pero NO envía session.update todavía
+  // Paso 1: abre la conexión WebSocket Y espera el evento session.created
+  // antes de resolver. Si mandamos session.update antes de session.created,
+  // OpenAI puede ignorarlo silenciosamente o procesar mal el voice → el
+  // saludo sale con voz default en vez de la seleccionada.
   async abrirConexion(): Promise<void> {
     return new Promise((resolve, reject) => {
       const url = `wss://api.openai.com/v1/realtime?model=${MODELO}`;
@@ -50,15 +53,25 @@ export class OpenAIRealtime {
         },
       });
 
+      let inicializado = false;
+
       this.ws.on("open", () => {
         this.conectado = true;
-        console.log(`[REALTIME] Conectado a OpenAI (${MODELO}, voz=${this.voz})`);
-        resolve();
+        // NO resolver aquí — esperamos a session.created abajo
       });
 
       this.ws.on("message", (data: Buffer) => {
         try {
           const msg = JSON.parse(data.toString());
+
+          // Resolver la promise solo cuando OpenAI confirma que la sesión
+          // está lista para recibir updates.
+          if (msg.type === "session.created" && !inicializado) {
+            inicializado = true;
+            console.log(`[REALTIME] Sesión lista (${MODELO}, voz=${this.voz})`);
+            resolve();
+          }
+
           this.handleMessage(msg);
         } catch {}
       });
@@ -66,12 +79,13 @@ export class OpenAIRealtime {
       this.ws.on("error", (err) => {
         console.error("[REALTIME] Error:", err.message);
         this.conectado = false;
-        reject(err);
+        if (!inicializado) reject(err);
       });
 
       this.ws.on("close", (code, reason) => {
         console.log(`[REALTIME] Cerrado: ${code} ${reason}`);
         this.conectado = false;
+        if (!inicializado) reject(new Error(`WS cerrado antes de session.created (code ${code})`));
       });
     });
   }
@@ -158,7 +172,7 @@ export class OpenAIRealtime {
   private handleMessage(msg: any) {
     switch (msg.type) {
       case "session.created":
-        console.log("[REALTIME] Sesión creada");
+        // Ya se logea en abrirConexion cuando llega este evento
         break;
 
       case "session.updated":
