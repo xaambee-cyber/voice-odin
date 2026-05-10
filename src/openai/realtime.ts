@@ -11,7 +11,11 @@ export interface HerramientaVoz {
 // Voces disponibles en gpt-realtime (GA): alloy, ash, ballad, cedar, coral,
 // echo, marin, sage, shimmer, verse. Default: marin (más natural en español).
 const VOZ_DEFAULT = "marin";
-const MODELO = "gpt-realtime";
+// gpt-realtime-2 (lanzado 7 mayo 2026): +15% audio intelligence, +14% seguir
+// instrucciones, decoder mejorado (voces más naturales), 128K context, soporte
+// para preambles/parallel tool calls/reasoning.effort. Default de reasoning
+// es "low" → no aumenta latencia. Compatible con marin/cedar.
+const MODELO = "gpt-realtime-2";
 
 export class OpenAIRealtime {
   private ws: WebSocket | null = null;
