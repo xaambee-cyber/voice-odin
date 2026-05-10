@@ -29,6 +29,18 @@ interface HabilidadesActivas {
   escalamiento: boolean;
   agenda_citas: boolean;
   aprendizaje: boolean;
+  solicitud_reserva?: boolean;
+}
+
+interface ItemCatalogo {
+  id: string;
+  nombre: string;
+  precio: number;
+  descripcion?: string;
+  tipo: string; // servicio | habitacion | producto | platillo
+  duracionMinutos?: number | null;
+  capacidad?: number | null;
+  unidad?: string | null;
 }
 
 export interface ConfigNegocio {
@@ -37,6 +49,7 @@ export interface ConfigNegocio {
   tonoAdicional?: string;
   nombreNegocio: string;
   tipoNegocio: string;
+  vertical?: string; // servicios | hospedaje | restaurante | tienda | otro
   horario?: string;
   direccion?: string;
   telefono?: string;
@@ -46,6 +59,7 @@ export interface ConfigNegocio {
   negocioId?: string;
   zonaHoraria?: string;
   voz?: string;
+  catalogo?: ItemCatalogo[];
   servicios?: Servicio[];
   horarioDetallado?: HorarioDetallado[];
   citasCliente?: CitaCliente[];
@@ -65,6 +79,7 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
   const herramientas: HerramientaVoz[] = [];
   const agendaActiva = cfg.habilidadesActivas?.agenda_citas ?? cfg.habilidades.includes("agenda_citas");
   const escalamientoActivo = cfg.habilidadesActivas?.escalamiento ?? cfg.habilidades.includes("escalamiento");
+  const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
 
   if (agendaActiva) {
     herramientas.push({
@@ -106,6 +121,30 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
           fechaInicio: { type: "string", description: "Nueva fecha y hora ISO: YYYY-MM-DDTHH:MM:00 (solo si cambia)" },
         },
         required: ["citaId"],
+      },
+    });
+  }
+
+  if (solicitudReservaActiva) {
+    herramientas.push({
+      type: "function",
+      name: "solicitar_reserva",
+      description: "Envía una solicitud de reserva al negocio para que un humano la valide y confirme. Úsalo cuando el cliente quiera reservar (habitación, mesa, evento, etc.). NO confirmas tú la reserva — solo recolectas los datos y los mandas. Despídete del cliente diciendo que el negocio le confirmará en breve por WhatsApp.",
+      parameters: {
+        type: "object",
+        properties: {
+          detalles: {
+            type: "string",
+            description: "Resumen completo y claro de lo que pide el cliente (qué quiere reservar, fechas, cantidad de personas, preferencias). Escribe esto como si fuera un mensaje a un recepcionista humano.",
+          },
+          fechaSolicitada: {
+            type: "string",
+            description: "Fecha o rango de fechas que pidió el cliente (formato libre: '15 de mayo', 'del 10 al 12', 'mañana a las 8pm')",
+          },
+          personas: { type: "number", description: "Número de personas si aplica" },
+          itemNombre: { type: "string", description: "Habitación, mesa, servicio o ítem específico que pidió, si aplica" },
+        },
+        required: ["detalles"],
       },
     });
   }
@@ -181,6 +220,31 @@ function buildSystemPrompt(cfg: ConfigNegocio): string {
   const agendaActiva = cfg.habilidadesActivas?.agenda_citas ?? cfg.habilidades.includes("agenda_citas");
   const escalamientoActivo = cfg.habilidadesActivas?.escalamiento ?? cfg.habilidades.includes("escalamiento");
 
+  // Catálogo adaptado al vertical: muestra el inventario con la etiqueta
+  // correcta para que el agente hable con naturalidad ("habitaciones" vs
+  // "servicios" vs "platillos"). Es aditivo al prompt original.
+  const vertical = cfg.vertical || "servicios";
+  const catalogo = cfg.catalogo || [];
+  const itemsHospedaje = catalogo.filter((i) => i.tipo === "habitacion");
+  const itemsPlatillos = catalogo.filter((i) => i.tipo === "platillo");
+  const itemsProductos = catalogo.filter((i) => i.tipo === "producto");
+
+  const formatearMoneda = (n: number) => `$${n.toLocaleString("es-MX")} MXN`;
+
+  const habitacionesTexto = vertical === "hospedaje" && itemsHospedaje.length > 0
+    ? itemsHospedaje.map((h) =>
+        `- ${h.nombre}${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}`
+      ).join("\n")
+    : null;
+
+  const menuTexto = vertical === "restaurante" && itemsPlatillos.length > 0
+    ? itemsPlatillos.map((p) => `- ${p.nombre} — ${formatearMoneda(p.precio)}${p.descripcion ? ` (${p.descripcion})` : ""}`).join("\n")
+    : null;
+
+  const productosTexto = vertical === "tienda" && itemsProductos.length > 0
+    ? itemsProductos.map((p) => `- ${p.nombre} — ${formatearMoneda(p.precio)}${p.descripcion ? ` (${p.descripcion})` : ""}`).join("\n")
+    : null;
+
   const serviciosTexto = cfg.servicios && cfg.servicios.length > 0
     ? cfg.servicios.map((s) =>
         `- ${s.nombre} [ID:${s.id}]${s.duracionMinutos ? ` — ${s.duracionMinutos} min` : ""}${s.precio ? ` — $${s.precio.toLocaleString("es-MX")} MXN` : ""}${s.descripcion ? ` (${s.descripcion})` : ""}`
@@ -219,6 +283,9 @@ ${cfg.telefono ? `- Teléfono: ${cfg.telefono}` : ""}
 
 ${cfg.conocimiento ? `BASE DE CONOCIMIENTO (esta es TODA la información que tienes, no existe más):\n${cfg.conocimiento}` : "NO TIENES BASE DE CONOCIMIENTO. No tienes información adicional sobre este negocio."}
 ${serviciosTexto ? `\nCATÁLOGO DE SERVICIOS Y PRODUCTOS:\n${serviciosTexto}` : ""}
+${habitacionesTexto ? `\nHABITACIONES DISPONIBLES:\n${habitacionesTexto}\n(Cuando hables con el cliente di "habitaciones", no "servicios". Para reservar usa la función solicitar_reserva — el agente NO confirma disponibilidad, solo recolecta y manda la solicitud.)` : ""}
+${menuTexto ? `\nMENÚ:\n${menuTexto}\n(Cuando hables del menú di "platillos" o el nombre de cada uno, no "servicios".)` : ""}
+${productosTexto ? `\nPRODUCTOS:\n${productosTexto}` : ""}
 
 FUNCIONES HABILITADAS (solo puedes hacer esto):
 ${habilidadesTexto}
@@ -477,6 +544,28 @@ export class PipelineLlamada {
             return { ok: false, mensaje: "No pude modificar la cita. Por favor intenta con otro horario." };
           }
           return { ok: true, mensaje: "Tu cita ha sido actualizada. ¿Hay algo más en lo que te pueda ayudar?" };
+        }
+
+        case "solicitar_reserva": {
+          const resp = await fetch(`${odinUrl}/api/voice/reservar`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              negocioId,
+              nombreCliente: "Llamada entrante",
+              telefonoCliente: callerNumber || "desconocido",
+              detalles: args.detalles,
+              fechaSolicitada: args.fechaSolicitada,
+              personas: args.personas,
+              itemNombre: args.itemNombre,
+              canal: "voz",
+            }),
+            signal: AbortSignal.timeout(8000),
+          });
+          if (!resp.ok) {
+            return { ok: false, mensaje: "No pude enviar tu solicitud. Por favor intenta más tarde." };
+          }
+          return { ok: true, mensaje: "Listo, tu solicitud quedó registrada. El negocio te confirmará en breve por WhatsApp. ¿Hay algo más?" };
         }
 
         case "escalar_humano": {
