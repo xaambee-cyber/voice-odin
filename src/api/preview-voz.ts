@@ -46,7 +46,7 @@ export async function previewVoz(req: Request, res: Response) {
 
 function generarPreview(voz: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const url = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2";
+    const url = "wss://api.openai.com/v1/realtime?model=gpt-realtime";
     const ws = new WebSocket(url, {
       headers: {
         "Authorization": `Bearer ${config.openaiApiKey}`,
