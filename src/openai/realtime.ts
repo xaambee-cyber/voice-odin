@@ -104,6 +104,8 @@ export class OpenAIRealtime {
     if (!this.ws || !this.conectado) return;
 
     const sessionConfig: any = {
+      // GA API requiere campo "type" en session.update
+      type: "realtime",
       modalities: ["text", "audio"],
       instructions: prompt,
       voice: this.voz,
@@ -155,6 +157,8 @@ export class OpenAIRealtime {
     if (!this.ws || !this.conectado) return;
 
     const sessionConfig: any = {
+      // GA API requiere "type" también en updates posteriores
+      type: "realtime",
       instructions: prompt,
     };
 

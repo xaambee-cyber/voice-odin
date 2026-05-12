@@ -77,6 +77,7 @@ function generarPreview(voz: string): Promise<Buffer> {
       ws.send(JSON.stringify({
         type: "session.update",
         session: {
+          type: "realtime",
           modalities: ["audio", "text"],
           instructions: "Eres una voz demo. Habla en español mexicano.",
           voice: voz,
