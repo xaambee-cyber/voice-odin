@@ -50,7 +50,6 @@ function generarPreview(voz: string): Promise<Buffer> {
     const ws = new WebSocket(url, {
       headers: {
         "Authorization": `Bearer ${config.openaiApiKey}`,
-        "OpenAI-Beta": "realtime=v1",
       },
     });
 

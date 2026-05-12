@@ -577,6 +577,7 @@ export class PipelineLlamada {
               tipo: args.tipo,
               resumen: args.resumen,
               telefonoCliente: callerNumber || "desconocido",
+              nombreCliente: "Llamada entrante",
             }),
             signal: AbortSignal.timeout(8000),
           });

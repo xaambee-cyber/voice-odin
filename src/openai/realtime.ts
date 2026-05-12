@@ -48,10 +48,11 @@ export class OpenAIRealtime {
     return new Promise((resolve, reject) => {
       const url = `wss://api.openai.com/v1/realtime?model=${MODELO}`;
 
+      // Realtime salió de beta a GA. El header OpenAI-Beta ya no se acepta
+      // (error "Unknown beta requested: 'realtime'"). Solo Authorization.
       this.ws = new WebSocket(url, {
         headers: {
           "Authorization": `Bearer ${config.openaiApiKey}`,
-          "OpenAI-Beta": "realtime=v1",
         },
       });
 
