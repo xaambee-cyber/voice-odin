@@ -74,15 +74,21 @@ function generarPreview(voz: string): Promise<Buffer> {
     };
 
     ws.on("open", () => {
+      // GA format: audio.input/output como objetos con `format`, voice dentro
+      // de audio.output, output_modalities reemplaza modalities.
       ws.send(JSON.stringify({
         type: "session.update",
         session: {
           type: "realtime",
-          modalities: ["audio", "text"],
+          model: "gpt-realtime",
+          output_modalities: ["audio"],
           instructions: "Eres una voz demo. Habla en español mexicano.",
-          voice: voz,
-          output_audio_format: "g711_ulaw",
-          turn_detection: null,
+          audio: {
+            output: {
+              format: { type: "audio/pcmu" },
+              voice: voz,
+            },
+          },
         },
       }));
     });
@@ -96,13 +102,13 @@ function generarPreview(voz: string): Promise<Buffer> {
           ws.send(JSON.stringify({
             type: "response.create",
             response: {
-              modalities: ["audio", "text"],
               instructions: PROMPT_PREVIEW,
             },
           }));
         }
 
-        if (msg.type === "response.audio.delta" && msg.delta) {
+        // GA: response.output_audio.delta reemplaza response.audio.delta
+        if ((msg.type === "response.output_audio.delta" || msg.type === "response.audio.delta") && msg.delta) {
           chunks.push(Buffer.from(msg.delta, "base64"));
         }
 

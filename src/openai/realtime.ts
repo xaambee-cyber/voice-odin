@@ -11,9 +11,11 @@ export interface HerramientaVoz {
 // Voces disponibles en gpt-realtime (GA): alloy, ash, ballad, cedar, coral,
 // echo, marin, sage, shimmer, verse. Default: marin (más natural en español).
 const VOZ_DEFAULT = "marin";
-// NOTA: gpt-realtime-2 requiere la GA API (header diferente). Mientras
-// migramos a la GA, usamos gpt-realtime estable con beta API.
 const MODELO = "gpt-realtime";
+
+// Formato de audio para Twilio: G.711 μ-law a 8kHz.
+// En GA la API espera objeto con `type`, valor "audio/pcmu" (codec estándar).
+const FORMATO_AUDIO_TWILIO = { type: "audio/pcmu" as const };
 
 export class OpenAIRealtime {
   private ws: WebSocket | null = null;
@@ -40,41 +42,28 @@ export class OpenAIRealtime {
     this.voz = voz;
   }
 
-  // Paso 1: abre la conexión WebSocket Y espera el evento session.created
-  // antes de resolver. Si mandamos session.update antes de session.created,
-  // OpenAI puede ignorarlo silenciosamente o procesar mal el voice → el
-  // saludo sale con voz default en vez de la seleccionada.
+  // Abre WebSocket y espera evento session.created antes de resolver.
   async abrirConexion(): Promise<void> {
     return new Promise((resolve, reject) => {
       const url = `wss://api.openai.com/v1/realtime?model=${MODELO}`;
-
-      // Realtime salió de beta a GA. El header OpenAI-Beta ya no se acepta
-      // (error "Unknown beta requested: 'realtime'"). Solo Authorization.
       this.ws = new WebSocket(url, {
-        headers: {
-          "Authorization": `Bearer ${config.openaiApiKey}`,
-        },
+        headers: { "Authorization": `Bearer ${config.openaiApiKey}` },
       });
 
       let inicializado = false;
 
       this.ws.on("open", () => {
         this.conectado = true;
-        // NO resolver aquí — esperamos a session.created abajo
       });
 
       this.ws.on("message", (data: Buffer) => {
         try {
           const msg = JSON.parse(data.toString());
-
-          // Resolver la promise solo cuando OpenAI confirma que la sesión
-          // está lista para recibir updates.
           if (msg.type === "session.created" && !inicializado) {
             inicializado = true;
             console.log(`[REALTIME] Sesión lista (${MODELO}, voz=${this.voz})`);
             resolve();
           }
-
           this.handleMessage(msg);
         } catch {}
       });
@@ -93,9 +82,15 @@ export class OpenAIRealtime {
     });
   }
 
-  // Configura la sesión y dispara el saludo. Si ya se envió saludo previamente
-  // (por ejemplo, configurarSesion se llamó dos veces), solo actualiza
-  // instrucciones/tools sin saludar de nuevo.
+  // ============================================================================
+  // FORMATO GA (Realtime API General Availability):
+  //   - session.update.session debe tener `type: "realtime"`
+  //   - audio.input  → { format, transcription, turn_detection }
+  //   - audio.output → { format, voice }
+  //   - `output_modalities` reemplaza al `modalities` viejo
+  //   - voice va dentro de audio.output, no en raíz
+  //   - formato es objeto { type: "audio/pcmu" } no string "g711_ulaw"
+  // ============================================================================
   configurarSesion(prompt: string, tools: HerramientaVoz[] = [], voz?: string) {
     this.systemPrompt = prompt;
     this.tools = tools;
@@ -104,38 +99,28 @@ export class OpenAIRealtime {
     if (!this.ws || !this.conectado) return;
 
     const sessionConfig: any = {
-      // GA API requiere campo "type" en session.update
       type: "realtime",
-      modalities: ["text", "audio"],
+      model: MODELO,
+      output_modalities: ["audio"],
       instructions: prompt,
-      voice: this.voz,
-      input_audio_format: "g711_ulaw",
-      output_audio_format: "g711_ulaw",
-      input_audio_transcription: {
-        model: "whisper-1",
-        language: "es",
+      audio: {
+        input: {
+          format: FORMATO_AUDIO_TWILIO,
+          transcription: { model: "whisper-1", language: "es" },
+          turn_detection: {
+            type: "semantic_vad",
+            eagerness: "medium",
+            create_response: true,
+            // NO dejar que OpenAI cancele respuestas automáticamente.
+            // Nosotros lo manejamos en speech_started para sincronizar con Twilio.
+            interrupt_response: false,
+          },
+        },
+        output: {
+          format: FORMATO_AUDIO_TWILIO,
+          voice: this.voz,
+        },
       },
-      // semantic_vad evalúa si lo que oye es habla humana REAL, no solo
-      // nivel de audio. Mucho mejor para:
-      // - personas mayores con pausas y respiraciones
-      // - ruido ambiente que dispararía un VAD por volumen
-      // - hablantes que empiezan bajito
-      //
-      // eagerness "medium" = balance entre rapidez y precisión. "low" sería
-      // más conservador (corta menos cuando duda) pero también responde más
-      // tarde después de que terminas de hablar. "high" lo opuesto.
-      turn_detection: {
-        type: "semantic_vad",
-        eagerness: "medium",
-        create_response: true,
-        // CRÍTICO: NO dejar que OpenAI cancele respuestas automáticamente.
-        // Nosotros lo manejamos en speech_started → así podemos limpiar
-        // el buffer de Twilio ANTES de mandar el cancel, y el silencio
-        // del agente es instantáneo.
-        interrupt_response: false,
-      },
-      temperature: 0.7,
-      max_response_output_tokens: "inf",
     };
 
     if (tools.length > 0) {
@@ -146,10 +131,9 @@ export class OpenAIRealtime {
     this.ws.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
   }
 
-  // Actualiza prompt y tools mid-conversation, SIN tocar la voz.
-  // OpenAI rechaza session.update con `voice` cuando ya hay audio del asistente
-  // ("cannot_update_voice"), y el rechazo descarta el update ENTERO. Por eso
-  // separamos: configurarSesion (inicial, con voz) vs actualizarConfiguracion (después, sin voz).
+  // Update sin tocar la voz (mid-conversation, después del primer audio).
+  // OpenAI rechaza session.update con voice una vez que ya hay audio del
+  // asistente. Por eso este método NO incluye audio.output.voice.
   actualizarConfiguracion(prompt: string, tools: HerramientaVoz[] = []) {
     this.systemPrompt = prompt;
     this.tools = tools;
@@ -157,7 +141,6 @@ export class OpenAIRealtime {
     if (!this.ws || !this.conectado) return;
 
     const sessionConfig: any = {
-      // GA API requiere "type" también en updates posteriores
       type: "realtime",
       instructions: prompt,
     };
@@ -186,14 +169,12 @@ export class OpenAIRealtime {
         if (!this.saludoEnviado) {
           this.saludoEnviado = true;
           console.log("[REALTIME] Sesión configurada → enviando saludo");
-          // Grace de 1.5s: durante el saludo no aceptamos interrupciones reales,
-          // pero como interrupt_response=false, OpenAI tampoco cancela solo.
           this.graceUntil = Date.now() + 1500;
           if (this.ws && this.conectado) {
+            // GA: response.create ya NO acepta `modalities` — solo `instructions`
             this.ws.send(JSON.stringify({
               type: "response.create",
               response: {
-                modalities: ["text", "audio"],
                 instructions: "Saluda brevemente al cliente en español mexicano. Una sola oración corta como: 'Hola, ¿en qué te puedo ayudar?' Nada más.",
               },
             }));
@@ -204,17 +185,21 @@ export class OpenAIRealtime {
         break;
 
       case "conversation.item.created":
+      case "conversation.item.added":
         if (msg.item?.role === "user" && msg.item?.id && this.onItemCreated) {
           this.onItemCreated(msg.item.id);
         }
         break;
 
-      case "response.audio.delta":
+      // GA: nuevos nombres de eventos (con prefijo "output_")
+      case "response.output_audio.delta":
+      case "response.audio.delta": // backward compat por si alterna
         if (msg.delta && this.onAudioDelta) {
           this.onAudioDelta(msg.delta);
         }
         break;
 
+      case "response.output_audio_transcript.done":
       case "response.audio_transcript.done":
         if (msg.transcript && this.onTranscript) {
           this.onTranscript(msg.transcript, "assistant");
@@ -229,16 +214,8 @@ export class OpenAIRealtime {
         break;
 
       case "input_audio_buffer.speech_started":
-        // Solo cancelamos respuesta en curso si:
-        // 1) Estamos respondiendo
-        // 2) Ya pasó el grace period (saludo o respuesta inicial)
-        // 3) No hay otra cancelación en curso
         if (this.respondiendo && this.ws && this.conectado && Date.now() > this.graceUntil && !this.cancelacionEnCurso) {
           this.cancelacionEnCurso = true;
-          // ORDEN CRÍTICO para que el agente se calle al instante:
-          // 1° Limpiar el buffer de audio en Twilio (el cliente DEJA DE OÍR al agente YA)
-          //    Esto se aplica en ~30-50ms vs los ~200ms que toma el round-trip a OpenAI.
-          // 2° Después cancelar la respuesta en OpenAI (deja de generar más audio)
           if (this.onInterrupcion) this.onInterrupcion();
           this.ws.send(JSON.stringify({ type: "response.cancel" }));
           console.log("[REALTIME] INTERRUPCIÓN → audio cortado + cancel enviado");
@@ -297,8 +274,6 @@ export class OpenAIRealtime {
         break;
 
       case "error":
-        // response_cancel_not_active es inofensivo: ocurre cuando la respuesta
-        // ya terminó justo cuando intentamos cancelarla
         if (msg.error?.code === "response_cancel_not_active") break;
         console.error("[REALTIME] Error:", JSON.stringify(msg.error));
         break;
