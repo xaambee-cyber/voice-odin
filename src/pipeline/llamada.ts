@@ -378,12 +378,23 @@ const ENGLISH_STOPWORDS = new Set([
   "music", "provided", "copyright", "rights", "reserved",
 ]);
 
+// Cabecera de autenticación que el voice server manda a Odin en cada petición.
+// Odin la valida con verificarSecretoVoz() — sin ella devuelve 401.
+function odinAuth(): Record<string, string> {
+  return config.voiceServerSecret
+    ? { Authorization: `Bearer ${config.voiceServerSecret}` }
+    : {};
+}
+
 // Fetch con timeout largo + 1 reintento. Antes el timeout era 4s y
 // con cold start de Vercel siempre fallaba → agente sin datos del negocio.
 async function fetchConfigConRetry(url: string, timeoutMs: number = 10000): Promise<ConfigNegocio | null> {
   for (let intento = 1; intento <= 2; intento++) {
     try {
-      const resp = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+      const resp = await fetch(url, {
+        headers: odinAuth(),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
       if (resp.ok) return await resp.json() as ConfigNegocio;
       const errBody = await resp.text().catch(() => "");
       console.warn(`[PIPELINE] config-llamada HTTP ${resp.status} (intento ${intento}): ${errBody}`);
@@ -487,7 +498,7 @@ export class PipelineLlamada {
         case "agendar_cita": {
           const resp = await fetch(`${odinUrl}/api/voice/citas`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...odinAuth() },
             body: JSON.stringify({
               negocioId,
               servicioId: args.servicioId,
@@ -513,7 +524,7 @@ export class PipelineLlamada {
         case "cancelar_cita": {
           const resp = await fetch(`${odinUrl}/api/voice/citas`, {
             method: "PATCH",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...odinAuth() },
             body: JSON.stringify({ citaId: args.citaId, accion: "cancelar" }),
             signal: AbortSignal.timeout(8000),
           });
@@ -524,7 +535,7 @@ export class PipelineLlamada {
         case "reagendar_cita": {
           const resp = await fetch(`${odinUrl}/api/voice/citas`, {
             method: "PATCH",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...odinAuth() },
             body: JSON.stringify({
               citaId: args.citaId,
               accion: "reagendar",
@@ -549,7 +560,7 @@ export class PipelineLlamada {
         case "solicitar_reserva": {
           const resp = await fetch(`${odinUrl}/api/voice/reservar`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...odinAuth() },
             body: JSON.stringify({
               negocioId,
               nombreCliente: "Llamada entrante",
@@ -571,7 +582,7 @@ export class PipelineLlamada {
         case "escalar_humano": {
           const respEscalar = await fetch(`${odinUrl}/api/voice/escalar`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...odinAuth() },
             body: JSON.stringify({
               negocioId,
               tipo: args.tipo,
@@ -598,7 +609,7 @@ export class PipelineLlamada {
         case "registrar_pregunta": {
           const respAprendizaje = await fetch(`${odinUrl}/api/voice/aprendizaje`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...odinAuth() },
             body: JSON.stringify({
               negocioId,
               pregunta: args.pregunta,
@@ -795,7 +806,7 @@ export class PipelineLlamada {
     try {
       const resp = await fetch(`${config.odinAppUrl}/api/webhooks/voice`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...odinAuth() },
         body: JSON.stringify({
           negocioId: this.negocioId,
           telefonoCliente: this.callerNumber || "desconocido",

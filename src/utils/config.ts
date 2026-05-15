@@ -18,6 +18,9 @@ export const config = {
 
   // Odin
   odinAppUrl: process.env.ODIN_APP_URL || "https://odin-two-indol.vercel.app",
+  // Secret compartido con Odin — se envía en Authorization: Bearer <secret>
+  // para que Odin valide que la petición viene del voice server legítimo.
+  voiceServerSecret: process.env.VOICE_SERVER_SECRET || "",
 
   // Server
   port: parseInt(process.env.PORT || "3001"),

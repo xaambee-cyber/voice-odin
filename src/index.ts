@@ -133,7 +133,11 @@ wss.on("connection", (ws: WebSocket) => {
 const WARMUP_MS = 4 * 60 * 1000;
 async function warmupOdin() {
   try {
+    const authHeader: Record<string, string> = config.voiceServerSecret
+      ? { Authorization: `Bearer ${config.voiceServerSecret}` }
+      : {};
     const resp = await fetch(`${config.odinAppUrl}/api/voice/config-llamada?negocioId=__warmup__`, {
+      headers: authHeader,
       signal: AbortSignal.timeout(8000),
     });
     console.log(`[WARMUP] Odin respondió ${resp.status}`);
