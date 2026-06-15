@@ -614,27 +614,40 @@ export class PipelineLlamada {
               // mismo número del negocio que recibió la llamada. Sin esto,
               // Twilio rechaza el <Dial> silenciosamente y el destino nunca
               // suena.
-              //
-              // Si por algún motivo no tenemos el número Twilio en esta
-              // sesión, omitimos el atributo y Twilio usa el número que
-              // recibió la llamada por default (suele funcionar pero menos
-              // confiable).
               const callerIdAttr = this.numeroTwilio
                 ? ` callerId="${this.numeroTwilio}"`
                 : "";
+              // NO usamos <Say> de Twilio: cambiaba a Polly.Mia y se notaba
+              // el corte de voz vs la del agente (marin/cedar/etc.).
+              // En cambio, el AGENTE mismo dice "Te conecto con un asesor"
+              // con su propia voz Realtime — eso lo logramos devolviendo
+              // `mensaje` al modelo, y aplicando el TwiML después de un
+              // pequeño delay para que el agente tenga tiempo de hablar.
+              //
+              // El delay debe ser suficiente para que termine la frase de
+              // ~3s pero no tanto que el cliente se impaciente. 3500ms es
+              // un buen middle ground.
               const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice" language="es-MX">Te conecto con un asesor, un momento por favor.</Say>
   <Dial${callerIdAttr} timeout="25" answerOnBridge="true">${transferTo}</Dial>
-  <Say voice="alice" language="es-MX">No pudimos contactar al asesor. Por favor intenta más tarde.</Say>
 </Response>`;
-              console.log(`[FUNCIÓN] escalar_humano: aplicando TwiML transfer → ${transferTo} (callerId=${this.numeroTwilio || "default"})`);
-              const twClient = twilio(config.twilioAccountSid, config.twilioAuthToken);
-              const updated = await twClient.calls(this.callSid).update({ twiml });
-              console.log(`[FUNCIÓN] escalar_humano: Twilio status=${updated.status} → ${transferTo}`);
-              return { ok: true, mensaje: "Te conecto con un asesor, no cuelgues." };
+              const callSidSnapshot = this.callSid;
+              console.log(`[FUNCIÓN] escalar_humano: programando transfer → ${transferTo} en 3500ms (callerId=${this.numeroTwilio || "default"})`);
+              setTimeout(async () => {
+                try {
+                  const twClient = twilio(config.twilioAccountSid, config.twilioAuthToken);
+                  const updated = await twClient.calls(callSidSnapshot).update({ twiml });
+                  console.log(`[FUNCIÓN] escalar_humano: Twilio status=${updated.status} → ${transferTo}`);
+                } catch (e: any) {
+                  console.error("[FUNCIÓN] escalar_humano: fallo al aplicar TwiML:", e?.message || e, e?.code ? `(code=${e.code})` : "");
+                }
+              }, 3500);
+              // El agente dice esto con su voz Realtime mientras esperamos
+              // los 3500ms y Twilio aplica la transferencia. Cuando aplique,
+              // Twilio cierra el stream y el cliente escucha el ringing.
+              return { ok: true, mensaje: "Perfecto, te paso con un asesor. Un momento, no cuelgues." };
             } catch (e: any) {
-              console.error("[FUNCIÓN] escalar_humano: fallo al transferir:", e?.message || e, e?.code ? `(code=${e.code})` : "");
+              console.error("[FUNCIÓN] escalar_humano: fallo al programar transferencia:", e?.message || e, e?.code ? `(code=${e.code})` : "");
             }
           }
 
