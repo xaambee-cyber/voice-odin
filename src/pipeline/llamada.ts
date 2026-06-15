@@ -610,17 +610,31 @@ export class PipelineLlamada {
 
           if (transferTo && this.callSid) {
             try {
+              // callerId DEBE ser un número que la cuenta Twilio posee — el
+              // mismo número del negocio que recibió la llamada. Sin esto,
+              // Twilio rechaza el <Dial> silenciosamente y el destino nunca
+              // suena.
+              //
+              // Si por algún motivo no tenemos el número Twilio en esta
+              // sesión, omitimos el atributo y Twilio usa el número que
+              // recibió la llamada por default (suele funcionar pero menos
+              // confiable).
+              const callerIdAttr = this.numeroTwilio
+                ? ` callerId="${this.numeroTwilio}"`
+                : "";
               const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice" language="es-MX">Te conecto con un asesor, un momento por favor.</Say>
-  <Dial timeout="25">${transferTo}</Dial>
+  <Dial${callerIdAttr} timeout="25" answerOnBridge="true">${transferTo}</Dial>
+  <Say voice="alice" language="es-MX">No pudimos contactar al asesor. Por favor intenta más tarde.</Say>
 </Response>`;
+              console.log(`[FUNCIÓN] escalar_humano: aplicando TwiML transfer → ${transferTo} (callerId=${this.numeroTwilio || "default"})`);
               const twClient = twilio(config.twilioAccountSid, config.twilioAuthToken);
-              await twClient.calls(this.callSid).update({ twiml });
-              console.log(`[FUNCIÓN] escalar_humano: transferida llamada ${this.callSid} a ${transferTo}`);
+              const updated = await twClient.calls(this.callSid).update({ twiml });
+              console.log(`[FUNCIÓN] escalar_humano: Twilio status=${updated.status} → ${transferTo}`);
               return { ok: true, mensaje: "Te conecto con un asesor, no cuelgues." };
-            } catch (e) {
-              console.error("[FUNCIÓN] escalar_humano: fallo al transferir, sigo con mensaje normal:", e);
+            } catch (e: any) {
+              console.error("[FUNCIÓN] escalar_humano: fallo al transferir:", e?.message || e, e?.code ? `(code=${e.code})` : "");
             }
           }
 
