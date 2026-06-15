@@ -592,12 +592,38 @@ export class PipelineLlamada {
             }),
             signal: AbortSignal.timeout(8000),
           });
+
+          // El endpoint /api/voice/escalar puede devolver { transferTo: "+52…" }
+          // cuando el dueño configuró un número de transferencia en el panel
+          // de Xambee y el tipo de escalamiento es "directo" o "emergencia".
+          // Si está presente, transferimos la llamada al humano en lugar de
+          // solo decir "ya notifiqué al equipo".
+          let transferTo: string | null = null;
           if (!respEscalar.ok) {
             const errBody = await respEscalar.text().catch(() => "");
             console.error(`[FUNCIÓN] escalar_humano → HTTP ${respEscalar.status}: ${errBody}`);
           } else {
             console.log(`[FUNCIÓN] escalar_humano → HTTP ${respEscalar.status} OK`);
+            const data = (await respEscalar.json().catch(() => ({}))) as { transferTo?: string };
+            transferTo = typeof data?.transferTo === "string" ? data.transferTo : null;
           }
+
+          if (transferTo && this.callSid) {
+            try {
+              const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice" language="es-MX">Te conecto con un asesor, un momento por favor.</Say>
+  <Dial timeout="25">${transferTo}</Dial>
+</Response>`;
+              const twClient = twilio(config.twilioAccountSid, config.twilioAuthToken);
+              await twClient.calls(this.callSid).update({ twiml });
+              console.log(`[FUNCIÓN] escalar_humano: transferida llamada ${this.callSid} a ${transferTo}`);
+              return { ok: true, mensaje: "Te conecto con un asesor, no cuelgues." };
+            } catch (e) {
+              console.error("[FUNCIÓN] escalar_humano: fallo al transferir, sigo con mensaje normal:", e);
+            }
+          }
+
           const mensajes: Record<string, string> = {
             directo: "Listo, ya notifiqué al equipo. Alguien te contactará pronto.",
             emergencia: "Entendido. El equipo fue notificado de inmediato.",
