@@ -32,6 +32,15 @@ interface HabilidadesActivas {
   solicitud_reserva?: boolean;
 }
 
+// Método de pago que el negocio comunica al cliente para reservas con anticipo.
+interface MetodoPagoNegocio {
+  tipo: "transferencia" | "paypal" | "mercadopago" | "otro";
+  datos: string;
+  modalidad: "completo" | "anticipo";
+  porcentajeAnticipo?: number;
+  instrucciones?: string;
+}
+
 interface ItemCatalogo {
   id: string;
   nombre: string;
@@ -64,6 +73,11 @@ export interface ConfigNegocio {
   horarioDetallado?: HorarioDetallado[];
   citasCliente?: CitaCliente[];
   habilidadesActivas?: HabilidadesActivas;
+  // Reservas: si true (solo hospedaje), el agente verifica disponibilidad por
+  // unidad/fechas antes de mandar la solicitud al admin. Si hay metodoPago,
+  // además solicita el pago/anticipo y solo escala cuando el cliente confirma.
+  verificarDisponibilidadReserva?: boolean;
+  metodoPago?: MetodoPagoNegocio | null;
 }
 
 interface TurnoHistorial {
@@ -126,27 +140,53 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
   }
 
   if (solicitudReservaActiva) {
-    herramientas.push({
-      type: "function",
-      name: "solicitar_reserva",
-      description: "Envía una solicitud de reserva al negocio para que un humano la valide y confirme. Úsalo cuando el cliente quiera reservar (habitación, mesa, evento, etc.). NO confirmas tú la reserva — solo recolectas los datos y los mandas. Despídete del cliente diciendo que el negocio le confirmará en breve por WhatsApp.",
-      parameters: {
-        type: "object",
-        properties: {
-          detalles: {
-            type: "string",
-            description: "Resumen completo y claro de lo que pide el cliente (qué quiere reservar, fechas, cantidad de personas, preferencias). Escribe esto como si fuera un mensaje a un recepcionista humano.",
+    const verificarDisp = cfg.verificarDisponibilidadReserva === true;
+    if (verificarDisp) {
+      // Modo hospedaje con verificación: la tool recibe fechas estructuradas y
+      // el ID de la unidad. El resultado le dice al modelo qué responder
+      // (disponibilidad, datos de pago, o escalamiento por pago confirmado).
+      herramientas.push({
+        type: "function",
+        name: "solicitar_reserva",
+        description: "Verifica disponibilidad de una reserva de hospedaje y, según el caso, pide el pago o avisa al negocio. NO confirmas tú la reserva — el resultado de esta función te dice EXACTAMENTE qué decirle al cliente (úsalo como tu respuesta). Llama esta función cuando el cliente ya te dio la unidad y las fechas. Si el negocio pide pago, vuelve a llamarla con pagoReportado=true SOLO cuando el cliente diga que ya pagó.",
+        parameters: {
+          type: "object",
+          properties: {
+            detalles: { type: "string", description: "Resumen claro para el negocio (unidad, fechas, personas, preferencias)." },
+            fechaEntrada: { type: "string", description: "Fecha de entrada en formato YYYY-MM-DD." },
+            fechaSalida: { type: "string", description: "Fecha de salida (checkout, exclusiva) en formato YYYY-MM-DD. 1 noche = entrada día X, salida día X+1." },
+            servicioId: { type: "string", description: "ID exacto de la habitación/unidad (de tu lista). Omítelo si el cliente no eligió una específica." },
+            personas: { type: "number", description: "Número de personas si aplica." },
+            itemNombre: { type: "string", description: "Nombre de la unidad para el negocio, si aplica." },
+            pagoReportado: { type: "boolean", description: "false la primera vez (verificar disponibilidad). true SOLO cuando el cliente confirma que ya hizo el pago/transferencia." },
           },
-          fechaSolicitada: {
-            type: "string",
-            description: "Fecha o rango de fechas que pidió el cliente (formato libre: '15 de mayo', 'del 10 al 12', 'mañana a las 8pm')",
-          },
-          personas: { type: "number", description: "Número de personas si aplica" },
-          itemNombre: { type: "string", description: "Habitación, mesa, servicio o ítem específico que pidió, si aplica" },
+          required: ["detalles", "fechaEntrada", "fechaSalida"],
         },
-        required: ["detalles"],
-      },
-    });
+      });
+    } else {
+      // Modo legacy: solo recolecta y manda al admin, sin verificar nada.
+      herramientas.push({
+        type: "function",
+        name: "solicitar_reserva",
+        description: "Envía una solicitud de reserva al negocio para que un humano la valide y confirme. Úsalo cuando el cliente quiera reservar (habitación, mesa, evento, etc.). NO confirmas tú la reserva — solo recolectas los datos y los mandas. Despídete del cliente diciendo que el negocio le confirmará en breve por WhatsApp.",
+        parameters: {
+          type: "object",
+          properties: {
+            detalles: {
+              type: "string",
+              description: "Resumen completo y claro de lo que pide el cliente (qué quiere reservar, fechas, cantidad de personas, preferencias). Escribe esto como si fuera un mensaje a un recepcionista humano.",
+            },
+            fechaSolicitada: {
+              type: "string",
+              description: "Fecha o rango de fechas que pidió el cliente (formato libre: '15 de mayo', 'del 10 al 12', 'mañana a las 8pm')",
+            },
+            personas: { type: "number", description: "Número de personas si aplica" },
+            itemNombre: { type: "string", description: "Habitación, mesa, servicio o ítem específico que pidió, si aplica" },
+          },
+          required: ["detalles"],
+        },
+      });
+    }
   }
 
   if (escalamientoActivo) {
@@ -219,6 +259,9 @@ function buildSystemPrompt(cfg: ConfigNegocio): string {
 
   const agendaActiva = cfg.habilidadesActivas?.agenda_citas ?? cfg.habilidades.includes("agenda_citas");
   const escalamientoActivo = cfg.habilidadesActivas?.escalamiento ?? cfg.habilidades.includes("escalamiento");
+  const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
+  const verificarDispReserva = cfg.verificarDisponibilidadReserva === true && solicitudReservaActiva;
+  const metodoPago = cfg.metodoPago || null;
 
   // Catálogo adaptado al vertical: muestra el inventario con la etiqueta
   // correcta para que el agente hable con naturalidad ("habitaciones" vs
@@ -234,6 +277,14 @@ function buildSystemPrompt(cfg: ConfigNegocio): string {
   const habitacionesTexto = vertical === "hospedaje" && itemsHospedaje.length > 0
     ? itemsHospedaje.map((h) =>
         `- ${h.nombre}${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}`
+      ).join("\n")
+    : null;
+
+  // Cuando se verifica disponibilidad, el modelo necesita el ID de cada unidad
+  // para pasarlo a solicitar_reserva. Esta variante incluye [ID:...].
+  const habitacionesConId = itemsHospedaje.length > 0
+    ? itemsHospedaje.map((h) =>
+        `- ${h.nombre} [ID:${h.id}]${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}`
       ).join("\n")
     : null;
 
@@ -283,7 +334,7 @@ ${cfg.telefono ? `- Teléfono: ${cfg.telefono}` : ""}
 
 ${cfg.conocimiento ? `BASE DE CONOCIMIENTO (esta es TODA la información que tienes, no existe más):\n${cfg.conocimiento}` : "NO TIENES BASE DE CONOCIMIENTO. No tienes información adicional sobre este negocio."}
 ${serviciosTexto ? `\nCATÁLOGO DE SERVICIOS Y PRODUCTOS:\n${serviciosTexto}` : ""}
-${habitacionesTexto ? `\nHABITACIONES DISPONIBLES:\n${habitacionesTexto}\n(Cuando hables con el cliente di "habitaciones", no "servicios". Para reservar usa la función solicitar_reserva — el agente NO confirma disponibilidad, solo recolecta y manda la solicitud.)` : ""}
+${habitacionesTexto ? `\nHABITACIONES DISPONIBLES:\n${verificarDispReserva && habitacionesConId ? habitacionesConId : habitacionesTexto}\n(Cuando hables con el cliente di "habitaciones", no "servicios". Para reservar usa la función solicitar_reserva — el agente NO confirma disponibilidad, solo recolecta y manda la solicitud.${verificarDispReserva ? " Los [ID:...] son internos: NUNCA los digas en voz alta." : ""})` : ""}
 ${menuTexto ? `\nMENÚ:\n${menuTexto}\n(Cuando hables del menú di "platillos" o el nombre de cada uno, no "servicios".)` : ""}
 ${productosTexto ? `\nPRODUCTOS:\n${productosTexto}` : ""}
 
@@ -352,6 +403,21 @@ PROCEDIMIENTO:
 2. Usa el campo "mensaje" que devuelve la función como tu respuesta al cliente
 3. NO improvises ni digas nada antes de recibir el resultado de la función` : ""}
 
+${verificarDispReserva ? `
+=== RESERVAS DE HOSPEDAJE (CON VERIFICACIÓN DE DISPONIBILIDAD) ===
+${habitacionesConId ? `Las unidades y sus IDs están en HABITACIONES DISPONIBLES de arriba.` : "El negocio aún no tiene unidades cargadas; recolecta los datos sin ID."}
+
+CÓMO FUNCIONA (tú NUNCA confirmas la reserva — la confirma el negocio):
+1. Pregunta al cliente: qué unidad quiere, fecha de entrada, fecha de salida y cuántas personas. Convierte las fechas a formato YYYY-MM-DD usando la fecha actual (la salida es el día de checkout).
+2. Cuando tengas la unidad y las DOS fechas, llama a solicitar_reserva con pagoReportado=false.
+3. La función te devuelve un "mensaje" — dilo TAL CUAL al cliente (puede ser que no hay disponibilidad${metodoPago ? ", o los datos de pago" : ""}, o que el equipo le confirmará).
+${metodoPago ? `4. Si el cliente, DESPUÉS de que le diste los datos de pago, dice que ya pagó o transfirió, llama a solicitar_reserva OTRA VEZ con los mismos datos y pagoReportado=true. Di el "mensaje" que devuelva.` : ""}
+
+REGLAS:
+- NUNCA inventes disponibilidad, precios${metodoPago ? " ni datos de pago" : ""}. Eso lo da la función.
+- NUNCA digas que la reserva ya quedó confirmada. Solo el equipo confirma.
+- NUNCA digas los [ID:...] en voz alta — son internos.
+` : ""}
 === CONOCIMIENTO FALTANTE — ACCIÓN OBLIGATORIA ===
 REGLA CRÍTICA: Cuando el cliente pregunta algo que NO está en tu base de conocimiento, DEBES llamar a registrar_pregunta ANTES de responder. La función confirma el registro y te da el mensaje para el cliente.
 
@@ -404,6 +470,22 @@ async function fetchConfigConRetry(url: string, timeoutMs: number = 10000): Prom
     }
   }
   return null;
+}
+
+// Mensaje hablado con los datos de pago. Igual al de Odin (lib/reservas.ts)
+// para que WhatsApp y voz suenen idénticos. Usa "por ciento" en vez de "%"
+// para que el TTS lo lea bien.
+function mensajeDatosPagoVoz(mp: MetodoPagoNegocio): string {
+  const modal = mp.modalidad === "anticipo"
+    ? `un anticipo del ${mp.porcentajeAnticipo || 30} por ciento`
+    : "el pago completo";
+  const via =
+    mp.tipo === "transferencia" ? "transferencia"
+    : mp.tipo === "paypal" ? "PayPal"
+    : mp.tipo === "mercadopago" ? "Mercado Pago"
+    : "el método indicado";
+  const extra = mp.instrucciones ? ` ${mp.instrucciones}` : "";
+  return `Sí tenemos disponibilidad. Para apartar tu reserva necesitas hacer ${modal} por ${via}: ${mp.datos}.${extra} Avísame cuando hayas hecho el pago para confirmarlo con el equipo.`;
 }
 
 export class PipelineLlamada {
@@ -558,6 +640,8 @@ export class PipelineLlamada {
         }
 
         case "solicitar_reserva": {
+          const verificarDisponibilidad = this.configNegocio.verificarDisponibilidadReserva === true;
+          const pagoReportado = args.pagoReportado === true;
           const resp = await fetch(`${odinUrl}/api/voice/reservar`, {
             method: "POST",
             headers: { "Content-Type": "application/json", ...odinAuth() },
@@ -567,15 +651,46 @@ export class PipelineLlamada {
               telefonoCliente: callerNumber || "desconocido",
               detalles: args.detalles,
               fechaSolicitada: args.fechaSolicitada,
+              fechaEntrada: args.fechaEntrada,
+              fechaSalida: args.fechaSalida,
+              servicioId: args.servicioId,
               personas: args.personas,
               itemNombre: args.itemNombre,
+              verificarDisponibilidad,
+              pagoReportado,
               canal: "voz",
             }),
             signal: AbortSignal.timeout(8000),
           });
+          const data = (await resp.json().catch(() => ({}))) as {
+            disponible?: boolean;
+            esperandoPago?: boolean;
+            noDisponible?: boolean;
+            metodoPago?: MetodoPagoNegocio;
+          };
+
           if (!resp.ok) {
-            return { ok: false, mensaje: "No pude enviar tu solicitud. Por favor intenta más tarde." };
+            // 409 = sin disponibilidad: queremos que el agente lo diga, no que
+            // lo trate como error técnico. Por eso ok:true con mensaje honesto.
+            if (data.noDisponible || resp.status === 409) {
+              return { ok: true, mensaje: "Verifiqué y no tenemos disponibilidad para esas fechas. ¿Quieres que revise otras fechas?" };
+            }
+            return { ok: false, mensaje: "No pude procesar tu reserva. Por favor intenta más tarde." };
           }
+
+          // Hay disponibilidad pero falta el pago: dar los datos al cliente.
+          if (data.esperandoPago && data.metodoPago) {
+            return { ok: true, mensaje: mensajeDatosPagoVoz(data.metodoPago) };
+          }
+          // El cliente ya reportó el pago: el backend avisó al equipo.
+          if (pagoReportado) {
+            return { ok: true, mensaje: "Perfecto, ya avisé al equipo para que verifique tu pago. Te confirman la reserva en breve. ¿Algo más?" };
+          }
+          // Disponible y sin método de pago configurado.
+          if (data.disponible) {
+            return { ok: true, mensaje: "Sí tenemos disponibilidad para esas fechas. El equipo te confirma la reserva en breve. ¿Algo más?" };
+          }
+          // Legacy (verificar disponibilidad apagado): solo se mandó al admin.
           return { ok: true, mensaje: "Listo, tu solicitud quedó registrada. El negocio te confirmará en breve por WhatsApp. ¿Hay algo más?" };
         }
 
