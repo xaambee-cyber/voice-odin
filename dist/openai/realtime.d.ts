@@ -28,6 +28,7 @@ export declare class OpenAIRealtime {
     private esperaInterrumpida;
     private markFraseTimeout;
     private onEnviarMark;
+    private respuestaTimer;
     constructor(systemPrompt: string, tools?: HerramientaVoz[], voz?: string);
     abrirConexion(): Promise<void>;
     configurarSesion(prompt: string, tools?: HerramientaVoz[], voz?: string): void;
@@ -38,6 +39,8 @@ export declare class OpenAIRealtime {
     private intentarHablarResultado;
     marcaReproducida(nombre: string): void;
     private crearRespuesta;
+    private cancelarDebounceRespuesta;
+    private programarRespuestaUsuario;
     private reproducirFraseEspera;
     enviarAudio(base64Audio: string): void;
     cancelarRespuesta(): void;

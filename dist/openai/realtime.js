@@ -53,6 +53,11 @@ function fraseEspera(nombre, args) {
 // espera. Twilio nos lo devuelve cuando termina de REPRODUCIRLA (no solo de
 // generarla), y recién entonces decimos el mensaje real — así no se enciman.
 const MARK_FIN_FRASE = "fin_frase";
+// Silencio (ms) tras el último fragmento de habla del cliente antes de que el
+// agente responda. Sirve para AGRUPAR varios fragmentos cortos ("ok"… "ok"…) en
+// una sola respuesta en vez de contestar a cada uno. Cada vez que el cliente
+// (re)empieza a hablar, este temporizador se reinicia.
+const DEBOUNCE_RESPUESTA_MS = 600;
 class OpenAIRealtime {
     ws = null;
     onAudioDelta = null;
@@ -91,6 +96,9 @@ class OpenAIRealtime {
     // Callback para mandar un "mark" por el WebSocket de Twilio (lo conecta el
     // PipelineLlamada). Twilio lo devuelve cuando termina de reproducir el audio.
     onEnviarMark = null;
+    // Debounce para agrupar la entrada del cliente en una sola respuesta. Se
+    // reinicia cada vez que el cliente (re)empieza a hablar.
+    respuestaTimer = null;
     constructor(systemPrompt, tools = [], voz = VOZ_DEFAULT) {
         this.systemPrompt = systemPrompt;
         this.tools = tools;
@@ -164,7 +172,12 @@ class OpenAIRealtime {
                         // Reduce las interrupciones falsas por eco/ruido que cortaban al agente
                         // a media frase. Cuesta un pelín de reactividad al barge-in real.
                         eagerness: "low",
-                        create_response: true,
+                        // create_response:false → NOSOTROS creamos la respuesta, no OpenAI.
+                        // Así agrupamos TODO lo que el cliente dijo (aunque lo diga en varios
+                        // fragmentos cortos como "ok"… "ok"…) en UNA sola respuesta, en vez de
+                        // contestar a cada fragmento. La disparamos tras un breve silencio
+                        // (debounce) en speech_stopped — ver programarRespuestaUsuario().
+                        create_response: false,
                         // NO dejar que OpenAI cancele respuestas automáticamente.
                         // Nosotros lo manejamos en speech_started para sincronizar con Twilio.
                         interrupt_response: false,
@@ -258,6 +271,9 @@ class OpenAIRealtime {
                 }
                 break;
             case "input_audio_buffer.speech_started":
+                // El cliente (vuelve a) hablar → reinicia el debounce para AGRUPAR todo lo
+                // que diga en una sola respuesta (no contestar fragmento por fragmento).
+                this.cancelarDebounceRespuesta();
                 // NO cancelar mientras se generan los argumentos de una función: cancelar
                 // truncaría el JSON y la acción (p. ej. la reserva) se mandaría vacía.
                 if (this.funcionActual)
@@ -275,6 +291,9 @@ class OpenAIRealtime {
                 }
                 break;
             case "input_audio_buffer.speech_stopped":
+                // El cliente terminó (por ahora). Espera un poco por si sigue hablando y
+                // recién entonces responde UNA sola vez con todo lo que dijo.
+                this.programarRespuestaUsuario();
                 break;
             case "response.created":
                 this.respondiendo = true;
@@ -462,6 +481,28 @@ class OpenAIRealtime {
         this.respondiendo = true;
         this.ws.send(JSON.stringify({ type: "response.create" }));
     }
+    cancelarDebounceRespuesta() {
+        if (this.respuestaTimer) {
+            clearTimeout(this.respuestaTimer);
+            this.respuestaTimer = null;
+        }
+    }
+    // Programa (con debounce) la respuesta del agente al cliente. Como el cliente
+    // puede decir varias cosas seguidas, esperamos un breve silencio: si vuelve a
+    // hablar antes, se reinicia y TODO se agrupa en una sola respuesta. No responde
+    // si hay una función o frase de espera en curso (esas manejan su propia
+    // respuesta) ni si ya hay otra respuesta activa.
+    programarRespuestaUsuario() {
+        this.cancelarDebounceRespuesta();
+        this.respuestaTimer = setTimeout(() => {
+            this.respuestaTimer = null;
+            if (this.funcionActual || this.funcionLentaPendiente || this.esperandoFinFrase)
+                return;
+            if (this.respondiendo)
+                return;
+            this.crearRespuesta();
+        }, DEBOUNCE_RESPUESTA_MS);
+    }
     // Hace que el agente diga UNA frase de espera con su propia voz mientras corre
     // el fetch. Es una respuesta fuera de banda (conversation:"none"): se oye pero
     // NO entra al historial ni rompe la adyacencia function_call → function_call_output.
@@ -508,6 +549,7 @@ class OpenAIRealtime {
             clearTimeout(this.markFraseTimeout);
             this.markFraseTimeout = null;
         }
+        this.cancelarDebounceRespuesta();
         if (this.ws) {
             try {
                 this.ws.close();
