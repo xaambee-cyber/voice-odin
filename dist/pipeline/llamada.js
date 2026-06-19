@@ -69,11 +69,11 @@ function construirHerramientas(cfg) {
                 parameters: {
                     type: "object",
                     properties: {
-                        detalles: { type: "string", description: "Resumen claro para el negocio (unidad, fechas, personas, preferencias)." },
-                        fechaEntrada: { type: "string", description: "Fecha de entrada en formato YYYY-MM-DD." },
-                        fechaSalida: { type: "string", description: "Fecha de salida (checkout, exclusiva) en formato YYYY-MM-DD. 1 noche = entrada día X, salida día X+1." },
-                        servicioId: { type: "string", description: "ID exacto de la habitación/unidad (de tu lista). Omítelo si el cliente no eligió una específica." },
-                        personas: { type: "number", description: "Número de personas si aplica." },
+                        detalles: { type: "string", description: "Resumen claro para el negocio (unidad, fechas, personas si las hay)." },
+                        fechaEntrada: { type: "string", description: "Primer día de uso en formato YYYY-MM-DD." },
+                        fechaSalida: { type: "string", description: "Último día de uso (inclusive) en formato YYYY-MM-DD. Si es un solo día, igual a fechaEntrada." },
+                        servicioId: { type: "string", description: "ID exacto de la unidad (de tu lista). Omítelo si el cliente no eligió una específica." },
+                        personas: { type: "number", description: "Número de personas. OPCIONAL — omítelo si el cliente no lo menciona (en terrazas/salones puede no aplicar)." },
                         itemNombre: { type: "string", description: "Nombre de la unidad para el negocio, si aplica." },
                         pagoReportado: { type: "boolean", description: "false la primera vez (verificar disponibilidad). true SOLO cuando el cliente confirma que ya hizo el pago/transferencia." },
                     },
@@ -231,7 +231,7 @@ ${cfg.telefono ? `- Teléfono: ${cfg.telefono}` : ""}
 
 ${cfg.conocimiento ? `BASE DE CONOCIMIENTO (esta es TODA la información que tienes, no existe más):\n${cfg.conocimiento}` : "NO TIENES BASE DE CONOCIMIENTO. No tienes información adicional sobre este negocio."}
 ${serviciosTexto ? `\nCATÁLOGO DE SERVICIOS Y PRODUCTOS:\n${serviciosTexto}` : ""}
-${habitacionesTexto ? `\nHABITACIONES DISPONIBLES:\n${verificarDispReserva && habitacionesConId ? habitacionesConId : habitacionesTexto}\n(Cuando hables con el cliente di "habitaciones", no "servicios". Para reservar usa la función solicitar_reserva — el agente NO confirma disponibilidad, solo recolecta y manda la solicitud.${verificarDispReserva ? " Los [ID:...] son internos: NUNCA los digas en voz alta." : ""})` : ""}
+${habitacionesTexto ? `\nLUGARES Y HABITACIONES DISPONIBLES:\n${verificarDispReserva && habitacionesConId ? habitacionesConId : habitacionesTexto}\n(Refiérete a cada uno por su NOMBRE; no digas "servicios" ni asumas que todo es "habitación" — puede ser terraza, salón o cabaña. Para reservar usa la función solicitar_reserva — el agente NO confirma disponibilidad, solo recolecta y manda la solicitud.${verificarDispReserva ? " Los [ID:...] son internos: NUNCA los digas en voz alta." : ""})` : ""}
 ${menuTexto ? `\nMENÚ:\n${menuTexto}\n(Cuando hables del menú di "platillos" o el nombre de cada uno, no "servicios".)` : ""}
 ${productosTexto ? `\nPRODUCTOS:\n${productosTexto}` : ""}
 
@@ -305,10 +305,11 @@ ${verificarDispReserva ? `
 ${habitacionesConId ? `Las unidades y sus IDs están en HABITACIONES DISPONIBLES de arriba.` : "El negocio aún no tiene unidades cargadas; recolecta los datos sin ID."}
 
 CÓMO FUNCIONA (tú NUNCA confirmas la reserva — la confirma el negocio):
-1. Pregunta al cliente: qué unidad quiere, fecha de entrada, fecha de salida y cuántas personas. Convierte las fechas a formato YYYY-MM-DD usando la fecha actual (la salida es el día de checkout).
-2. Cuando tengas la unidad y las DOS fechas, llama a solicitar_reserva con pagoReportado=false.
+1. Pregunta al cliente: qué unidad quiere, primer día y último día de uso (ambos inclusive; si es un solo día, son el mismo). El número de personas es OPCIONAL — no insistas si no lo menciona. Convierte las fechas a formato YYYY-MM-DD usando la fecha actual.
+2. Cuando tengas la unidad y las fechas, llama a solicitar_reserva con pagoReportado=false.
 3. La función te devuelve un "mensaje" — dilo TAL CUAL al cliente (puede ser que no hay disponibilidad${metodoPago ? ", o los datos de pago" : ""}, o que el equipo le confirmará).
-${metodoPago ? `4. Si el cliente, DESPUÉS de que le diste los datos de pago, dice que ya pagó o transfirió, llama a solicitar_reserva OTRA VEZ con los mismos datos y pagoReportado=true. Di el "mensaje" que devuelva.` : ""}
+${metodoPago ? `4. Como es una llamada y los datos de pago (números de cuenta, links) son difíciles de dictar, dile al cliente que se los ENVIARÁS POR WHATSAPP a este mismo número para que los tenga por escrito.
+5. Si el cliente, DESPUÉS de los datos de pago, dice que ya pagó o transfirió, llama a solicitar_reserva OTRA VEZ con los mismos datos y pagoReportado=true. Di el "mensaje" que devuelva, y aclara que el equipo verificará el pago y le confirmará por WhatsApp.` : `4. Aclara siempre que la confirmación del equipo le llegará por WhatsApp a este mismo número.`}
 
 REGLAS:
 - NUNCA inventes disponibilidad, precios${metodoPago ? " ni datos de pago" : ""}. Eso lo da la función.
@@ -370,17 +371,25 @@ async function fetchConfigConRetry(url, timeoutMs = 10000) {
 }
 // Mensaje hablado con los datos de pago. Igual al de Odin (lib/reservas.ts)
 // para que WhatsApp y voz suenen idénticos. Usa "por ciento" en vez de "%"
-// para que el TTS lo lea bien.
-function mensajeDatosPagoVoz(mp) {
-    const modal = mp.modalidad === "anticipo"
-        ? `un anticipo del ${mp.porcentajeAnticipo || 30} por ciento`
-        : "el pago completo";
+// y "pesos" para que el TTS lo lea bien.
+function mensajeDatosPagoVoz(mp, info) {
     const via = mp.tipo === "transferencia" ? "transferencia"
         : mp.tipo === "paypal" ? "PayPal"
             : mp.tipo === "mercadopago" ? "Mercado Pago"
                 : "el método indicado";
     const extra = mp.instrucciones ? ` ${mp.instrucciones}` : "";
-    return `Sí tenemos disponibilidad. Para apartar tu reserva necesitas hacer ${modal} por ${via}: ${mp.datos}.${extra} Avísame cuando hayas hecho el pago para confirmarlo con el equipo.`;
+    const nochesTxt = info ? `${info.noches} ${info.noches === 1 ? "noche" : "noches"}` : "";
+    if (mp.modalidad === "anticipo") {
+        const pct = mp.porcentajeAnticipo || 30;
+        if (info) {
+            return `Sí tenemos disponibilidad. El total son ${info.precioTotal.toLocaleString("es-MX")} pesos por ${nochesTxt}. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento, que son ${info.montoPago.toLocaleString("es-MX")} pesos, por ${via}: ${mp.datos}.${extra} Avísame cuando hayas hecho el pago para confirmarlo con el equipo.`;
+        }
+        return `Sí tenemos disponibilidad. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento por ${via}: ${mp.datos}.${extra} Avísame cuando hayas hecho el pago para confirmarlo con el equipo.`;
+    }
+    if (info) {
+        return `Sí tenemos disponibilidad. El total son ${info.montoPago.toLocaleString("es-MX")} pesos por ${nochesTxt}. Para apartar tu reserva realiza el pago por ${via}: ${mp.datos}.${extra} Avísame cuando hayas pagado para confirmarlo con el equipo.`;
+    }
+    return `Sí tenemos disponibilidad. Para apartar tu reserva realiza el pago por ${via}: ${mp.datos}.${extra} Avísame cuando hayas pagado para confirmarlo con el equipo.`;
 }
 class PipelineLlamada {
     ws;
@@ -557,7 +566,7 @@ class PipelineLlamada {
                     }
                     // Hay disponibilidad pero falta el pago: dar los datos al cliente.
                     if (data.esperandoPago && data.metodoPago) {
-                        return { ok: true, mensaje: mensajeDatosPagoVoz(data.metodoPago) };
+                        return { ok: true, mensaje: mensajeDatosPagoVoz(data.metodoPago, data.pagoInfo) };
                     }
                     // El cliente ya reportó el pago: el backend avisó al equipo.
                     if (pagoReportado) {
