@@ -23,11 +23,8 @@ export declare class OpenAIRealtime {
     private funcionLentaPendiente;
     private funcionLentaArgs;
     private fillerActivo;
-    private esperandoFinFrase;
     private resultadoPendiente;
     private esperaInterrumpida;
-    private markFraseTimeout;
-    private onEnviarMark;
     private respuestaTimer;
     constructor(systemPrompt: string, tools?: HerramientaVoz[], voz?: string);
     abrirConexion(): Promise<void>;
@@ -37,7 +34,6 @@ export declare class OpenAIRealtime {
     private handleMessage;
     private alResolverFuncion;
     private intentarHablarResultado;
-    marcaReproducida(nombre: string): void;
     private crearRespuesta;
     private cancelarDebounceRespuesta;
     private programarRespuestaUsuario;
@@ -49,7 +45,6 @@ export declare class OpenAIRealtime {
     setOnItemCreated(callback: (itemId: string) => void): void;
     setOnInterrupcion(callback: () => void): void;
     setOnFunctionCall(callback: (name: string, args: any, callId: string) => Promise<any>): void;
-    setOnEnviarMark(callback: (nombre: string) => void): void;
     cerrar(): void;
     get estaConectado(): boolean;
 }

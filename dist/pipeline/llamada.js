@@ -713,7 +713,6 @@ class PipelineLlamada {
     registrarCallbacks() {
         this.realtime.setOnAudioDelta((b) => this.enviarAudioTwilio(b));
         this.realtime.setOnInterrupcion(() => this.limpiarAudioTwilio());
-        this.realtime.setOnEnviarMark((nombre) => this.enviarMarkTwilio(nombre));
         this.realtime.setOnFunctionCall((nombre, args, callId) => this.manejarFuncion(nombre, args, callId));
         this.realtime.setOnItemCreated((itemId) => {
             this.historialOrdenado.push({ role: "user", content: "", itemId, pending: true });
@@ -821,13 +820,6 @@ class PipelineLlamada {
                 if (mensaje.media?.payload)
                     this.realtime.enviarAudio(mensaje.media.payload);
                 break;
-            case "mark":
-                // Twilio confirma que terminó de REPRODUCIR el audio hasta este mark.
-                // Lo usamos para soltar el mensaje real solo cuando la frase de espera
-                // ya se oyó completa (no encimada).
-                if (mensaje.mark?.name)
-                    this.realtime.marcaReproducida(mensaje.mark.name);
-                break;
             case "stop":
                 console.log("[TWILIO] Stream detenido");
                 this.finalizarLlamada();
@@ -840,18 +832,6 @@ class PipelineLlamada {
                 event: "media",
                 streamSid: this.streamSid,
                 media: { payload: base64Audio },
-            }));
-        }
-    }
-    // Manda un "mark" a Twilio. Twilio lo devuelve (evento "mark") cuando termina
-    // de reproducir todo el audio enviado hasta este punto. Así el agente sabe
-    // cuándo una frase de espera terminó de oírse.
-    enviarMarkTwilio(nombre) {
-        if (this.ws.readyState === ws_1.default.OPEN && this.streamSid) {
-            this.ws.send(JSON.stringify({
-                event: "mark",
-                streamSid: this.streamSid,
-                mark: { name: nombre },
             }));
         }
     }
