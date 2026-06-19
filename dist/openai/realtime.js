@@ -13,6 +13,40 @@ const MODELO = "gpt-realtime";
 // Formato de audio para Twilio: G.711 μ-law a 8kHz.
 // En GA la API espera objeto con `type`, valor "audio/pcmu" (codec estándar).
 const FORMATO_AUDIO_TWILIO = { type: "audio/pcmu" };
+// Funciones pesadas que hacen un fetch a Odin y tardan (verificación de
+// disponibilidad, búsqueda de slots, creación en BD, cold start de Vercel).
+// Mientras se resuelven, el agente dice una frase de espera para no dejar la
+// línea en silencio — igual que hacen Retell/Vapi con sus "filler words".
+//
+// NO incluimos escalar_humano (ya dice "te paso con un asesor" y tiene una
+// transferencia cronometrada que una frase de espera descuadraría) ni
+// registrar_pregunta (se llama en casi cada pregunta sin respuesta; un filler
+// ahí haría sentir lento al agente en la conversación normal).
+const FUNCIONES_CON_ESPERA = new Set([
+    "agendar_cita",
+    "cancelar_cita",
+    "reagendar_cita",
+    "solicitar_reserva",
+]);
+// Frase de espera específica por situación (la PRIMERA que se dice). Se le pasa
+// al modelo para que la diga con su propia voz Realtime, así no hay corte de voz.
+function fraseEspera(nombre) {
+    switch (nombre) {
+        case "agendar_cita":
+        case "reagendar_cita":
+            return "Permíteme un momento, déjame revisar la agenda.";
+        case "cancelar_cita":
+            return "Permíteme un momento mientras reviso tu cita.";
+        case "solicitar_reserva":
+            return "Claro, déjame verificar la disponibilidad. Un momento, no cuelgues por favor.";
+        default:
+            return "Permíteme un momento, por favor.";
+    }
+}
+// Si la función tarda más que la primera frase, se dice esta de refuerzo (una
+// sola vez) para que el cliente sepa que seguimos en línea trabajando.
+const FRASE_ESPERA_REFUERZO = "Gracias por tu paciencia, en un momento te confirmo.";
+const MAX_FILLERS = 2;
 class OpenAIRealtime {
     ws = null;
     onAudioDelta = null;
@@ -30,6 +64,20 @@ class OpenAIRealtime {
     cancelacionEnCurso = false;
     // Acumulador de argumentos de la función en curso
     funcionActual = null;
+    // === Estado de las frases de espera (filler) durante funciones lentas ===
+    // funcionLentaPendiente: nombre de la función cuyo fetch sigue en curso (o null
+    //   cuando ya resolvió). Sirve para decidir si encadenar frases de espera.
+    // fillerActivo: true mientras suena una frase de espera.
+    // fillersReproducidos: cuántas frases de espera van en ESTA función (cap MAX_FILLERS).
+    // resultadoListoParaHablar: el resultado ya llegó y su item ya se envió a la API;
+    //   solo falta el response.create para hablarlo, en cuanto termine la frase actual.
+    // esperaInterrumpida: el cliente habló durante la espera → no hablar el resultado
+    //   por encima de él; el siguiente turno (semantic_vad) lo aprovechará.
+    funcionLentaPendiente = null;
+    fillerActivo = false;
+    fillersReproducidos = 0;
+    resultadoListoParaHablar = false;
+    esperaInterrumpida = false;
     constructor(systemPrompt, tools = [], voz = VOZ_DEFAULT) {
         this.systemPrompt = systemPrompt;
         this.tools = tools;
@@ -180,6 +228,9 @@ class OpenAIRealtime {
                 break;
             case "response.output_audio_transcript.done":
             case "response.audio_transcript.done":
+                // Las frases de espera no van al historial: son relleno, no contenido.
+                if (this.fillerActivo)
+                    break;
                 if (msg.transcript && this.onTranscript) {
                     this.onTranscript(msg.transcript, "assistant");
                 }
@@ -205,22 +256,57 @@ class OpenAIRealtime {
                 this.respondiendo = true;
                 this.cancelacionEnCurso = false;
                 break;
-            case "response.done":
+            case "response.done": {
                 this.respondiendo = false;
                 this.cancelacionEnCurso = false;
-                if (msg.response?.status === "cancelled") {
+                const cancelada = msg.response?.status === "cancelled";
+                const eraFiller = this.fillerActivo;
+                this.fillerActivo = false;
+                if (cancelada) {
                     console.log("[REALTIME] Respuesta cancelada");
+                    // El cliente interrumpió: dejar de encadenar frases de espera. Si el
+                    // resultado estaba por hablarse, no lo decimos por encima de él.
+                    if (eraFiller || this.funcionLentaPendiente || this.resultadoListoParaHablar) {
+                        this.esperaInterrumpida = true;
+                    }
+                    this.funcionLentaPendiente = null;
+                    this.resultadoListoParaHablar = false;
+                    break;
+                }
+                // 1) El resultado real ya llegó y esperaba a que terminara la frase de
+                //    espera en curso. Ahora sí: que el agente lo diga.
+                if (this.resultadoListoParaHablar) {
+                    this.resultadoListoParaHablar = false;
+                    this.crearRespuesta();
+                    break;
+                }
+                // 2) Sigue corriendo el fetch de una función lenta (acaba de terminar el
+                //    function_call o una frase de espera previa): di otra frase de espera
+                //    para no dejar la línea en silencio, hasta el tope MAX_FILLERS.
+                if (this.funcionLentaPendiente && this.fillersReproducidos < MAX_FILLERS) {
+                    this.reproducirFraseEspera(this.funcionLentaPendiente);
                 }
                 break;
+            }
             // === FUNCTION CALLING ===
             case "response.output_item.added":
                 if (msg.item?.type === "function_call") {
+                    const nombreFn = msg.item.name || "";
                     this.funcionActual = {
                         callId: msg.item.call_id || "",
-                        name: msg.item.name || "",
+                        name: nombreFn,
                         args: "",
                     };
-                    console.log(`[REALTIME] Función iniciada: ${msg.item.name}`);
+                    // Si la función tira a la red (puede tardar), prepárate para decir una
+                    // frase de espera cuando termine de emitirse el function_call. Reset del
+                    // estado de espera para arrancar limpio en cada función.
+                    if (FUNCIONES_CON_ESPERA.has(nombreFn)) {
+                        this.funcionLentaPendiente = nombreFn;
+                        this.fillersReproducidos = 0;
+                        this.resultadoListoParaHablar = false;
+                        this.esperaInterrumpida = false;
+                    }
+                    console.log(`[REALTIME] Función iniciada: ${nombreFn}`);
                 }
                 break;
             case "response.function_call_arguments.delta":
@@ -240,15 +326,20 @@ class OpenAIRealtime {
                     }
                     catch { }
                     this.onFunctionCall(name, args, callId)
-                        .then((resultado) => this.enviarResultadoFuncion(callId, resultado))
+                        .then((resultado) => this.alResolverFuncion(callId, resultado))
                         .catch((err) => {
                         console.error("[REALTIME] Error en función:", err);
-                        this.enviarResultadoFuncion(callId, { error: "Error procesando la acción" });
+                        this.alResolverFuncion(callId, { error: "Error procesando la acción" });
                     });
                 }
                 break;
             case "error":
                 if (msg.error?.code === "response_cancel_not_active")
+                    break;
+                // Carrera benigna: intentamos crear una respuesta mientras otra seguía
+                // activa (p. ej. una frase de espera). La ignoramos; el flujo se resincroniza
+                // solo en el siguiente response.done.
+                if (msg.error?.code === "conversation_already_has_active_response")
                     break;
                 console.error("[REALTIME] Error:", JSON.stringify(msg.error));
                 break;
@@ -256,7 +347,14 @@ class OpenAIRealtime {
                 break;
         }
     }
-    enviarResultadoFuncion(callId, resultado) {
+    // El fetch de la función terminó. Mete el resultado como function_call_output
+    // (esto es seguro en cualquier momento). Luego decide cuándo hablarlo:
+    //   - si el cliente interrumpió la espera → no hablar encima de él (el siguiente
+    //     turno usará el resultado que ya quedó en contexto);
+    //   - si todavía suena una frase de espera → diferir hasta su response.done;
+    //   - si no hay nada sonando → hablar de inmediato.
+    alResolverFuncion(callId, resultado) {
+        this.funcionLentaPendiente = null;
         if (!this.ws || !this.conectado)
             return;
         this.ws.send(JSON.stringify({
@@ -267,8 +365,50 @@ class OpenAIRealtime {
                 output: JSON.stringify(resultado),
             },
         }));
+        console.log(`[REALTIME] Resultado función listo (callId=${callId}):`, resultado);
+        if (this.esperaInterrumpida) {
+            this.esperaInterrumpida = false;
+            return; // el cliente está hablando; no le ganamos el turno
+        }
+        if (this.respondiendo) {
+            this.resultadoListoParaHablar = true; // hay una frase de espera sonando
+            return;
+        }
+        this.crearRespuesta();
+    }
+    // Pide a la API que genere la respuesta hablada con el contexto actual.
+    // Marca respondiendo=true de forma optimista para cerrar la ventana de carrera
+    // entre el resultado del fetch y el fin de una frase de espera.
+    crearRespuesta() {
+        if (!this.ws || !this.conectado)
+            return;
+        this.respondiendo = true;
         this.ws.send(JSON.stringify({ type: "response.create" }));
-        console.log(`[REALTIME] Resultado función enviado (callId=${callId}):`, resultado);
+    }
+    // Hace que el agente diga una frase de espera con su propia voz mientras corre
+    // el fetch. Es una respuesta fuera de banda (conversation:"none"): se oye pero
+    // NO entra al historial ni rompe la adyacencia function_call → function_call_output.
+    reproducirFraseEspera(nombreFuncion) {
+        if (!this.ws || !this.conectado)
+            return;
+        const frase = this.fillersReproducidos === 0
+            ? fraseEspera(nombreFuncion)
+            : FRASE_ESPERA_REFUERZO;
+        this.fillerActivo = true;
+        this.fillersReproducidos++;
+        this.respondiendo = true; // optimista: evita doble response.create simultáneo
+        // Pequeña gracia para que un eco/ruido no cancele la frase apenas empieza.
+        this.graceUntil = Date.now() + 600;
+        this.ws.send(JSON.stringify({
+            type: "response.create",
+            response: {
+                conversation: "none",
+                output_modalities: ["audio"],
+                instructions: `Di EXACTAMENTE esta frase en español mexicano, sin agregar ni cambiar nada, sin llamar a ninguna función: "${frase}"`,
+                tool_choice: "none",
+            },
+        }));
+        console.log(`[REALTIME] Frase de espera (${this.fillersReproducidos}/${MAX_FILLERS}): "${frase}"`);
     }
     enviarAudio(base64Audio) {
         if (this.ws && this.conectado) {
