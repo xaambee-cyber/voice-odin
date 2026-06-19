@@ -83,6 +83,7 @@ export declare class PipelineLlamada {
     iniciar(): Promise<void>;
     recibirMensajeTwilio(mensaje: any): void;
     private enviarAudioTwilio;
+    private enviarMarkTwilio;
     private limpiarAudioTwilio;
     interrumpir(): void;
     private finalizarLlamada;

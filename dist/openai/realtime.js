@@ -28,25 +28,31 @@ const FUNCIONES_CON_ESPERA = new Set([
     "reagendar_cita",
     "solicitar_reserva",
 ]);
-// Frase de espera específica por situación (la PRIMERA que se dice). Se le pasa
-// al modelo para que la diga con su propia voz Realtime, así no hay corte de voz.
-function fraseEspera(nombre) {
+// UNA sola frase de espera por situación. Se le pasa al modelo para que la diga
+// con su propia voz Realtime (sin corte de voz). Cortas a propósito: entre menos
+// audio suene, menos riesgo de que el eco/ruido la corte o se encime con el
+// mensaje real.
+function fraseEspera(nombre, args) {
     switch (nombre) {
         case "agendar_cita":
         case "reagendar_cita":
-            return "Permíteme un momento, déjame revisar la agenda.";
+            return "Permíteme, reviso la agenda.";
         case "cancelar_cita":
-            return "Permíteme un momento mientras reviso tu cita.";
+            return "Permíteme, reviso tu cita.";
         case "solicitar_reserva":
-            return "Claro, déjame verificar la disponibilidad. Un momento, no cuelgues por favor.";
+            // En la confirmación de pago NO se verifica disponibilidad → frase distinta,
+            // para no decir "déjame verificar la disponibilidad" cuando ya hubo pago.
+            return args?.pagoReportado === true
+                ? "Permíteme, estoy validando tu pago."
+                : "Claro, déjame verificar la disponibilidad, un momento.";
         default:
-            return "Permíteme un momento, por favor.";
+            return "Permíteme un momento.";
     }
 }
-// Si la función tarda más que la primera frase, se dice esta de refuerzo (una
-// sola vez) para que el cliente sepa que seguimos en línea trabajando.
-const FRASE_ESPERA_REFUERZO = "Gracias por tu paciencia, en un momento te confirmo.";
-const MAX_FILLERS = 2;
+// Nombre del "mark" que mandamos a Twilio al terminar de generar la frase de
+// espera. Twilio nos lo devuelve cuando termina de REPRODUCIRLA (no solo de
+// generarla), y recién entonces decimos el mensaje real — así no se enciman.
+const MARK_FIN_FRASE = "fin_frase";
 class OpenAIRealtime {
     ws = null;
     onAudioDelta = null;
@@ -64,20 +70,27 @@ class OpenAIRealtime {
     cancelacionEnCurso = false;
     // Acumulador de argumentos de la función en curso
     funcionActual = null;
-    // === Estado de las frases de espera (filler) durante funciones lentas ===
-    // funcionLentaPendiente: nombre de la función cuyo fetch sigue en curso (o null
-    //   cuando ya resolvió). Sirve para decidir si encadenar frases de espera.
-    // fillerActivo: true mientras suena una frase de espera.
-    // fillersReproducidos: cuántas frases de espera van en ESTA función (cap MAX_FILLERS).
-    // resultadoListoParaHablar: el resultado ya llegó y su item ya se envió a la API;
-    //   solo falta el response.create para hablarlo, en cuanto termine la frase actual.
-    // esperaInterrumpida: el cliente habló durante la espera → no hablar el resultado
-    //   por encima de él; el siguiente turno (semantic_vad) lo aprovechará.
+    // === Frase de espera + sincronización con la reproducción real en Twilio ===
+    // funcionLentaPendiente: nombre de la función cuyo fetch sigue en curso (o null).
+    // funcionLentaArgs: args parseados de esa función (para elegir la frase correcta).
+    // fillerActivo: true mientras se genera la frase de espera.
+    // esperandoFinFrase: true tras pedir la frase, hasta que Twilio confirma (mark)
+    //   que terminó de REPRODUCIRLA. Mientras tanto NO se dice el mensaje real ni se
+    //   corta por eco → evita el "muy seguidas" y el "cortado".
+    // resultadoPendiente: resultado del fetch ya listo (su item ya se mandó); falta
+    //   que el agente lo diga cuando la frase de espera haya terminado de oírse.
+    // esperaInterrumpida: el cliente habló durante la espera → no hablar encima de él.
+    // markFraseTimeout: red de seguridad por si Twilio nunca devuelve el mark.
     funcionLentaPendiente = null;
+    funcionLentaArgs = null;
     fillerActivo = false;
-    fillersReproducidos = 0;
-    resultadoListoParaHablar = false;
+    esperandoFinFrase = false;
+    resultadoPendiente = null;
     esperaInterrumpida = false;
+    markFraseTimeout = null;
+    // Callback para mandar un "mark" por el WebSocket de Twilio (lo conecta el
+    // PipelineLlamada). Twilio lo devuelve cuando termina de reproducir el audio.
+    onEnviarMark = null;
     constructor(systemPrompt, tools = [], voz = VOZ_DEFAULT) {
         this.systemPrompt = systemPrompt;
         this.tools = tools;
@@ -147,7 +160,10 @@ class OpenAIRealtime {
                     transcription: { model: "whisper-1", language: "es" },
                     turn_detection: {
                         type: "semantic_vad",
-                        eagerness: "medium",
+                        // "low": el VAD es más conservador para decidir que el cliente habló.
+                        // Reduce las interrupciones falsas por eco/ruido que cortaban al agente
+                        // a media frase. Cuesta un pelín de reactividad al barge-in real.
+                        eagerness: "low",
                         create_response: true,
                         // NO dejar que OpenAI cancele respuestas automáticamente.
                         // Nosotros lo manejamos en speech_started para sincronizar con Twilio.
@@ -242,6 +258,14 @@ class OpenAIRealtime {
                 }
                 break;
             case "input_audio_buffer.speech_started":
+                // NO cancelar mientras se generan los argumentos de una función: cancelar
+                // truncaría el JSON y la acción (p. ej. la reserva) se mandaría vacía.
+                if (this.funcionActual)
+                    break;
+                // NO cortar la frase de espera mientras se está reproduciendo: es corta y
+                // el cliente está esperando; cortarla por eco es justo lo que molestaba.
+                if (this.esperandoFinFrase)
+                    break;
                 if (this.respondiendo && this.ws && this.conectado && Date.now() > this.graceUntil && !this.cancelacionEnCurso) {
                     this.cancelacionEnCurso = true;
                     if (this.onInterrupcion)
@@ -264,28 +288,48 @@ class OpenAIRealtime {
                 this.fillerActivo = false;
                 if (cancelada) {
                     console.log("[REALTIME] Respuesta cancelada");
-                    // El cliente interrumpió: dejar de encadenar frases de espera. Si el
-                    // resultado estaba por hablarse, no lo decimos por encima de él.
-                    if (eraFiller || this.funcionLentaPendiente || this.resultadoListoParaHablar) {
+                    // El cliente interrumpió: no encadenar ni hablar el resultado encima de él.
+                    if (eraFiller || this.funcionLentaPendiente || this.resultadoPendiente || this.esperandoFinFrase) {
                         this.esperaInterrumpida = true;
                     }
                     this.funcionLentaPendiente = null;
-                    this.resultadoListoParaHablar = false;
+                    this.funcionLentaArgs = null;
+                    this.esperandoFinFrase = false;
+                    this.resultadoPendiente = null;
+                    if (this.markFraseTimeout) {
+                        clearTimeout(this.markFraseTimeout);
+                        this.markFraseTimeout = null;
+                    }
                     break;
                 }
-                // 1) El resultado real ya llegó y esperaba a que terminara la frase de
-                //    espera en curso. Ahora sí: que el agente lo diga.
-                if (this.resultadoListoParaHablar) {
-                    this.resultadoListoParaHablar = false;
-                    this.crearRespuesta();
+                if (eraFiller) {
+                    // La frase de espera terminó de GENERARSE. Pedimos a Twilio que avise
+                    // cuando termine de REPRODUCIRLA (mark) y recién ahí decimos el resultado.
+                    if (this.onEnviarMark && this.esperandoFinFrase) {
+                        this.onEnviarMark(MARK_FIN_FRASE);
+                        // Red de seguridad: si el mark nunca vuelve, proceder igual a los 6s.
+                        if (this.markFraseTimeout)
+                            clearTimeout(this.markFraseTimeout);
+                        this.markFraseTimeout = setTimeout(() => {
+                            this.markFraseTimeout = null;
+                            this.esperandoFinFrase = false;
+                            this.intentarHablarResultado();
+                        }, 6000);
+                    }
+                    else {
+                        this.esperandoFinFrase = false;
+                        this.intentarHablarResultado();
+                    }
                     break;
                 }
-                // 2) Sigue corriendo el fetch de una función lenta (acaba de terminar el
-                //    function_call o una frase de espera previa): di otra frase de espera
-                //    para no dejar la línea en silencio, hasta el tope MAX_FILLERS.
-                if (this.funcionLentaPendiente && this.fillersReproducidos < MAX_FILLERS) {
-                    this.reproducirFraseEspera(this.funcionLentaPendiente);
+                // Terminó la respuesta que contenía el function_call. Si el fetch sigue en
+                // curso y aún no hay resultado, di la (única) frase de espera.
+                if (this.funcionLentaPendiente && !this.resultadoPendiente) {
+                    this.reproducirFraseEspera(this.funcionLentaPendiente, this.funcionLentaArgs);
+                    break;
                 }
+                // El fetch ya había resuelto (rápido): habla el resultado ahora.
+                this.intentarHablarResultado();
                 break;
             }
             // === FUNCTION CALLING ===
@@ -297,13 +341,14 @@ class OpenAIRealtime {
                         name: nombreFn,
                         args: "",
                     };
-                    // Si la función tira a la red (puede tardar), prepárate para decir una
+                    // Si la función tira a la red (puede tardar), prepárate para decir la
                     // frase de espera cuando termine de emitirse el function_call. Reset del
-                    // estado de espera para arrancar limpio en cada función.
+                    // estado para arrancar limpio en cada función.
                     if (FUNCIONES_CON_ESPERA.has(nombreFn)) {
                         this.funcionLentaPendiente = nombreFn;
-                        this.fillersReproducidos = 0;
-                        this.resultadoListoParaHablar = false;
+                        this.funcionLentaArgs = null;
+                        this.resultadoPendiente = null;
+                        this.esperandoFinFrase = false;
                         this.esperaInterrumpida = false;
                     }
                     console.log(`[REALTIME] Función iniciada: ${nombreFn}`);
@@ -324,7 +369,13 @@ class OpenAIRealtime {
                     try {
                         args = JSON.parse(argsStr);
                     }
-                    catch { }
+                    catch (e) {
+                        console.warn(`[REALTIME] Args de ${name} no son JSON válido (posible truncado): ${argsStr}`);
+                    }
+                    // Guardamos los args para elegir la frase de espera correcta (p. ej.
+                    // distinguir verificación de disponibilidad vs confirmación de pago).
+                    if (this.funcionLentaPendiente === name)
+                        this.funcionLentaArgs = args;
                     this.onFunctionCall(name, args, callId)
                         .then((resultado) => this.alResolverFuncion(callId, resultado))
                         .catch((err) => {
@@ -348,13 +399,11 @@ class OpenAIRealtime {
         }
     }
     // El fetch de la función terminó. Mete el resultado como function_call_output
-    // (esto es seguro en cualquier momento). Luego decide cuándo hablarlo:
-    //   - si el cliente interrumpió la espera → no hablar encima de él (el siguiente
-    //     turno usará el resultado que ya quedó en contexto);
-    //   - si todavía suena una frase de espera → diferir hasta su response.done;
-    //   - si no hay nada sonando → hablar de inmediato.
+    // (esto es seguro en cualquier momento) y lo deja pendiente de hablar. El
+    // momento exacto en que se dice lo decide intentarHablarResultado().
     alResolverFuncion(callId, resultado) {
         this.funcionLentaPendiente = null;
+        this.funcionLentaArgs = null;
         if (!this.ws || !this.conectado)
             return;
         this.ws.send(JSON.stringify({
@@ -366,15 +415,43 @@ class OpenAIRealtime {
             },
         }));
         console.log(`[REALTIME] Resultado función listo (callId=${callId}):`, resultado);
+        this.resultadoPendiente = { callId, resultado };
+        this.intentarHablarResultado();
+    }
+    // Dice el resultado del fetch SOLO cuando se cumplen TODAS las condiciones:
+    //   - ya llegó el resultado;
+    //   - la frase de espera terminó de REPRODUCIRSE (mark de Twilio) — no encimar;
+    //   - no se está generando otra frase de espera;
+    //   - no hay otra respuesta activa.
+    // Si el cliente interrumpió la espera, descarta el habla (el item ya quedó en
+    // contexto y el siguiente turno lo aprovechará).
+    intentarHablarResultado() {
+        if (!this.resultadoPendiente)
+            return;
         if (this.esperaInterrumpida) {
             this.esperaInterrumpida = false;
-            return; // el cliente está hablando; no le ganamos el turno
-        }
-        if (this.respondiendo) {
-            this.resultadoListoParaHablar = true; // hay una frase de espera sonando
+            this.resultadoPendiente = null;
             return;
         }
+        if (this.esperandoFinFrase)
+            return; // Twilio aún reproduce la frase de espera
+        if (this.fillerActivo)
+            return; // la frase aún se está generando
+        if (this.respondiendo)
+            return; // otra respuesta sigue activa
+        this.resultadoPendiente = null;
         this.crearRespuesta();
+    }
+    // Twilio terminó de reproducir el audio hasta el mark indicado.
+    marcaReproducida(nombre) {
+        if (nombre !== MARK_FIN_FRASE)
+            return;
+        if (this.markFraseTimeout) {
+            clearTimeout(this.markFraseTimeout);
+            this.markFraseTimeout = null;
+        }
+        this.esperandoFinFrase = false;
+        this.intentarHablarResultado();
     }
     // Pide a la API que genere la respuesta hablada con el contexto actual.
     // Marca respondiendo=true de forma optimista para cerrar la ventana de carrera
@@ -385,20 +462,16 @@ class OpenAIRealtime {
         this.respondiendo = true;
         this.ws.send(JSON.stringify({ type: "response.create" }));
     }
-    // Hace que el agente diga una frase de espera con su propia voz mientras corre
+    // Hace que el agente diga UNA frase de espera con su propia voz mientras corre
     // el fetch. Es una respuesta fuera de banda (conversation:"none"): se oye pero
     // NO entra al historial ni rompe la adyacencia function_call → function_call_output.
-    reproducirFraseEspera(nombreFuncion) {
+    reproducirFraseEspera(nombreFuncion, args) {
         if (!this.ws || !this.conectado)
             return;
-        const frase = this.fillersReproducidos === 0
-            ? fraseEspera(nombreFuncion)
-            : FRASE_ESPERA_REFUERZO;
+        const frase = fraseEspera(nombreFuncion, args);
         this.fillerActivo = true;
-        this.fillersReproducidos++;
+        this.esperandoFinFrase = true; // esperaremos el mark de Twilio antes del resultado
         this.respondiendo = true; // optimista: evita doble response.create simultáneo
-        // Pequeña gracia para que un eco/ruido no cancele la frase apenas empieza.
-        this.graceUntil = Date.now() + 600;
         this.ws.send(JSON.stringify({
             type: "response.create",
             response: {
@@ -408,7 +481,7 @@ class OpenAIRealtime {
                 tool_choice: "none",
             },
         }));
-        console.log(`[REALTIME] Frase de espera (${this.fillersReproducidos}/${MAX_FILLERS}): "${frase}"`);
+        console.log(`[REALTIME] Frase de espera: "${frase}"`);
     }
     enviarAudio(base64Audio) {
         if (this.ws && this.conectado) {
@@ -429,7 +502,12 @@ class OpenAIRealtime {
     setOnItemCreated(callback) { this.onItemCreated = callback; }
     setOnInterrupcion(callback) { this.onInterrupcion = callback; }
     setOnFunctionCall(callback) { this.onFunctionCall = callback; }
+    setOnEnviarMark(callback) { this.onEnviarMark = callback; }
     cerrar() {
+        if (this.markFraseTimeout) {
+            clearTimeout(this.markFraseTimeout);
+            this.markFraseTimeout = null;
+        }
         if (this.ws) {
             try {
                 this.ws.close();

@@ -165,7 +165,7 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
             servicioId: { type: "string", description: "ID exacto de la unidad (de tu lista). Omítelo si el cliente no eligió una específica." },
             personas: { type: "number", description: "Número de personas. OPCIONAL — omítelo si el cliente no lo menciona (en terrazas/salones puede no aplicar)." },
             itemNombre: { type: "string", description: "Nombre de la unidad para el negocio, si aplica." },
-            pagoReportado: { type: "boolean", description: "false la primera vez (verificar disponibilidad). true SOLO cuando el cliente confirma que ya hizo el pago/transferencia." },
+            pagoReportado: { type: "boolean", description: "false la primera vez (verificar disponibilidad). Ponlo true ÚNICAMENTE cuando el cliente diga de forma EXPLÍCITA E INEQUÍVOCA que YA realizó el pago (por ejemplo: 'ya transferí', 'ya hice el depósito', 'ya pagué', 'ya te mandé el comprobante'). NUNCA lo pongas true por un 'gracias', 'ok', 'va', 'perfecto', 'ahí va', un silencio o ruido. Si tienes la más mínima duda de si ya pagó, déjalo en false y pregúntale: '¿Ya realizaste el pago?'." },
           },
           required: ["detalles", "fechaEntrada", "fechaSalida"],
         },
@@ -419,12 +419,14 @@ CÓMO FUNCIONA (tú NUNCA confirmas la reserva — la confirma el negocio):
 2. Cuando tengas la unidad y las fechas, llama a solicitar_reserva con pagoReportado=false.
 3. La función te devuelve un "mensaje" — dilo TAL CUAL al cliente (puede ser que no hay disponibilidad${metodoPago ? ", o los datos de pago" : ""}, o que el equipo le confirmará).
 ${metodoPago ? `4. Como es una llamada y los datos de pago (números de cuenta, links) son difíciles de dictar, dile al cliente que se los ENVIARÁS POR WHATSAPP a este mismo número para que los tenga por escrito.
-5. Si el cliente, DESPUÉS de los datos de pago, dice que ya pagó o transfirió, llama a solicitar_reserva OTRA VEZ con los mismos datos y pagoReportado=true. Di el "mensaje" que devuelva, y aclara que el equipo verificará el pago y le confirmará por WhatsApp.` : `4. Aclara siempre que la confirmación del equipo le llegará por WhatsApp a este mismo número.`}
+5. Llama a solicitar_reserva OTRA VEZ con pagoReportado=true SOLO si el cliente confirma de forma EXPLÍCITA E INEQUÍVOCA que YA hizo el pago ("ya transferí", "ya deposité", "ya pagué", "ya mandé el comprobante"). Recién entonces di el "mensaje" que devuelva.` : `4. Aclara siempre que la confirmación del equipo le llegará por WhatsApp a este mismo número.`}
 
 REGLAS:
 - NUNCA inventes disponibilidad, precios${metodoPago ? " ni datos de pago" : ""}. Eso lo da la función.
 - NUNCA digas que la reserva ya quedó confirmada. Solo el equipo confirma.
-- NUNCA digas los [ID:...] en voz alta — son internos.
+- NUNCA digas los [ID:...] en voz alta — son internos.${metodoPago ? `
+- NO asumas que el cliente ya pagó. Un "gracias", "ok", "va", "perfecto", "ahí va", un silencio o un ruido NO son confirmación de pago. Si dudas, deja pagoReportado en false y pregunta: "¿Ya realizaste el pago?".
+- Después de dar los datos de pago, NO vuelvas a llamar a solicitar_reserva hasta que el cliente diga claramente que ya pagó.` : ""}
 ` : ""}
 === CONOCIMIENTO FALTANTE — ACCIÓN OBLIGATORIA ===
 REGLA CRÍTICA: Cuando el cliente pregunta algo que NO está en tu base de conocimiento, DEBES llamar a registrar_pregunta ANTES de responder. La función confirma el registro y te da el mensaje para el cliente.
@@ -490,18 +492,22 @@ function mensajeDatosPagoVoz(mp: MetodoPagoNegocio, info?: PagoInfo): string {
     : mp.tipo === "mercadopago" ? "Mercado Pago"
     : "el método indicado";
   const extra = mp.instrucciones ? ` ${mp.instrucciones}` : "";
-  const nochesTxt = info ? `${info.noches} ${info.noches === 1 ? "noche" : "noches"}` : "";
+  // Defensa: si las noches no vienen (o vienen inválidas) NO decimos "undefined
+  // noches"; simplemente omitimos esa parte. El total sigue siendo correcto.
+  const noches = info && typeof info.noches === "number" && isFinite(info.noches) && info.noches > 0
+    ? info.noches : null;
+  const porNoches = noches ? ` por ${noches} ${noches === 1 ? "noche" : "noches"}` : "";
 
   if (mp.modalidad === "anticipo") {
     const pct = mp.porcentajeAnticipo || 30;
     if (info) {
-      return `Sí tenemos disponibilidad. El total son ${info.precioTotal.toLocaleString("es-MX")} pesos por ${nochesTxt}. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento, que son ${info.montoPago.toLocaleString("es-MX")} pesos, por ${via}: ${mp.datos}.${extra} Avísame cuando hayas hecho el pago para confirmarlo con el equipo.`;
+      return `Sí tenemos disponibilidad. El total son ${info.precioTotal.toLocaleString("es-MX")} pesos${porNoches}. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento, que son ${info.montoPago.toLocaleString("es-MX")} pesos, por ${via}: ${mp.datos}.${extra} Avísame cuando hayas hecho el pago para confirmarlo con el equipo.`;
     }
     return `Sí tenemos disponibilidad. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento por ${via}: ${mp.datos}.${extra} Avísame cuando hayas hecho el pago para confirmarlo con el equipo.`;
   }
 
   if (info) {
-    return `Sí tenemos disponibilidad. El total son ${info.montoPago.toLocaleString("es-MX")} pesos por ${nochesTxt}. Para apartar tu reserva realiza el pago por ${via}: ${mp.datos}.${extra} Avísame cuando hayas pagado para confirmarlo con el equipo.`;
+    return `Sí tenemos disponibilidad. El total son ${info.montoPago.toLocaleString("es-MX")} pesos${porNoches}. Para apartar tu reserva realiza el pago por ${via}: ${mp.datos}.${extra} Avísame cuando hayas pagado para confirmarlo con el equipo.`;
   }
   return `Sí tenemos disponibilidad. Para apartar tu reserva realiza el pago por ${via}: ${mp.datos}.${extra} Avísame cuando hayas pagado para confirmarlo con el equipo.`;
 }
@@ -699,7 +705,16 @@ export class PipelineLlamada {
 
           // Hay disponibilidad pero falta el pago: dar los datos al cliente.
           if (data.esperandoPago && data.metodoPago) {
-            return { ok: true, mensaje: mensajeDatosPagoVoz(data.metodoPago, data.pagoInfo) };
+            // Si Odin no mandó las noches (bug conocido: llega undefined), las
+            // calculamos desde las fechas para no perder ese dato en la voz.
+            let pagoInfo = data.pagoInfo;
+            const nochesOk = pagoInfo && typeof pagoInfo.noches === "number" && isFinite(pagoInfo.noches) && pagoInfo.noches > 0;
+            if (pagoInfo && !nochesOk && args.fechaEntrada && args.fechaSalida) {
+              const ms = Date.parse(args.fechaSalida) - Date.parse(args.fechaEntrada);
+              const n = Math.round(ms / 86400000);
+              if (Number.isFinite(n) && n > 0) pagoInfo = { ...pagoInfo, noches: n };
+            }
+            return { ok: true, mensaje: mensajeDatosPagoVoz(data.metodoPago, pagoInfo) };
           }
           // El cliente ya reportó el pago: el backend avisó al equipo.
           if (pagoReportado) {
@@ -833,6 +848,7 @@ export class PipelineLlamada {
   private registrarCallbacks() {
     this.realtime.setOnAudioDelta((b) => this.enviarAudioTwilio(b));
     this.realtime.setOnInterrupcion(() => this.limpiarAudioTwilio());
+    this.realtime.setOnEnviarMark((nombre) => this.enviarMarkTwilio(nombre));
     this.realtime.setOnFunctionCall((nombre, args, callId) => this.manejarFuncion(nombre, args, callId));
     this.realtime.setOnItemCreated((itemId) => {
       this.historialOrdenado.push({ role: "user", content: "", itemId, pending: true });
@@ -938,6 +954,12 @@ export class PipelineLlamada {
       case "media":
         if (mensaje.media?.payload) this.realtime.enviarAudio(mensaje.media.payload);
         break;
+      case "mark":
+        // Twilio confirma que terminó de REPRODUCIR el audio hasta este mark.
+        // Lo usamos para soltar el mensaje real solo cuando la frase de espera
+        // ya se oyó completa (no encimada).
+        if (mensaje.mark?.name) this.realtime.marcaReproducida(mensaje.mark.name);
+        break;
       case "stop":
         console.log("[TWILIO] Stream detenido");
         this.finalizarLlamada();
@@ -951,6 +973,19 @@ export class PipelineLlamada {
         event: "media",
         streamSid: this.streamSid,
         media: { payload: base64Audio },
+      }));
+    }
+  }
+
+  // Manda un "mark" a Twilio. Twilio lo devuelve (evento "mark") cuando termina
+  // de reproducir todo el audio enviado hasta este punto. Así el agente sabe
+  // cuándo una frase de espera terminó de oírse.
+  private enviarMarkTwilio(nombre: string) {
+    if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
+      this.ws.send(JSON.stringify({
+        event: "mark",
+        streamSid: this.streamSid,
+        mark: { name: nombre },
       }));
     }
   }
