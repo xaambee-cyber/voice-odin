@@ -34,7 +34,7 @@ interface HabilidadesActivas {
 
 // Método de pago que el negocio comunica al cliente para reservas con anticipo.
 interface MetodoPagoNegocio {
-  tipo: "transferencia" | "paypal" | "mercadopago" | "otro";
+  tipo: "transferencia" | "deposito" | "paypal" | "mercadopago" | "otro";
   datos: string;
   modalidad: "completo" | "anticipo";
   porcentajeAnticipo?: number;
@@ -309,6 +309,26 @@ function buildSystemPrompt(
   const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
   const verificarDispReserva = cfg.verificarDisponibilidadReserva === true && solicitudReservaActiva;
   const metodoPago = cfg.metodoPago || null;
+  // Lista completa de métodos. Si vienen, las usamos; si no, fallback al
+  // único método legacy.
+  const metodosPagoLista: MetodoPagoNegocio[] = cfg.metodosPago && cfg.metodosPago.length > 0
+    ? cfg.metodosPago
+    : (metodoPago ? [metodoPago] : []);
+  const TIPO_LABEL_PAGO_VOZ: Record<string, string> = {
+    transferencia: "transferencia bancaria",
+    deposito: "depósito en efectivo",
+    paypal: "PayPal",
+    mercadopago: "Mercado Pago",
+    otro: "otro método",
+  };
+  const metodosPagoTextoVoz = metodosPagoLista.length > 0
+    ? metodosPagoLista.map((m, i) => `${i + 1}. ${TIPO_LABEL_PAGO_VOZ[m.tipo] || m.tipo}: ${m.datos}${m.instrucciones ? ` (${m.instrucciones})` : ""}`).join("\n")
+    : null;
+  const modalidadPagoTextoVoz = metodoPago
+    ? (metodoPago.modalidad === "anticipo"
+        ? `anticipo del ${metodoPago.porcentajeAnticipo || 50}%`
+        : "pago completo")
+    : null;
 
   // Catálogo adaptado al vertical: muestra el inventario con la etiqueta
   // correcta para que el agente hable con naturalidad ("habitaciones" vs
@@ -427,6 +447,7 @@ ${serviciosTexto ? `\nCATÁLOGO DE SERVICIOS Y PRODUCTOS:\n${serviciosTexto}` : 
 ${habitacionesTexto ? `\nLUGARES Y HABITACIONES DISPONIBLES:\n${verificarDispReserva && habitacionesConId ? habitacionesConId : habitacionesTexto}\n(Refiérete a cada uno por su NOMBRE; no digas "servicios" ni asumas que todo es "habitación" — puede ser terraza, salón o cabaña. Para reservar usa la función solicitar_reserva — el agente NO confirma disponibilidad, solo recolecta y manda la solicitud.${verificarDispReserva ? " Los [ID:...] son internos: NUNCA los digas en voz alta." : ""})` : ""}
 ${menuTexto ? `\nMENÚ:\n${menuTexto}\n(Cuando hables del menú di "platillos" o el nombre de cada uno, no "servicios".)` : ""}
 ${productosTexto ? `\nPRODUCTOS:\n${productosTexto}` : ""}
+${metodosPagoTextoVoz ? `\nMÉTODOS DE PAGO QUE ACEPTA EL NEGOCIO (${modalidadPagoTextoVoz}):\n${metodosPagoTextoVoz}\n(Si te preguntan qué formas de pago aceptan ANTES de reservar, di los TIPOS hablados naturalmente — ej. "aceptamos transferencia bancaria y PayPal". NO dictes números de cuenta, CLABE ni links en voz: dile al cliente que te los envías por WhatsApp. La modalidad aplica a todos los métodos.)` : ""}
 
 FUNCIONES HABILITADAS (solo puedes hacer esto):
 ${habilidadesTexto}
@@ -595,6 +616,7 @@ function mensajeDatosPagoVoz(
 
   const viaDe = (m: MetodoPagoNegocio): string =>
     m.tipo === "transferencia" ? "transferencia"
+    : m.tipo === "deposito" ? "depósito"
     : m.tipo === "paypal" ? "PayPal"
     : m.tipo === "mercadopago" ? "Mercado Pago"
     : "otro método";
