@@ -87,9 +87,10 @@ wss.on("connection", (ws: WebSocket) => {
         const negocioId = String(params.negocioId || "");
         const numeroTwilio = String(params.numeroTwilio || "");
         const callerNumber = String(params.callerNumber || "");
+        const forwardedFrom = String(params.forwardedFrom || "");
         const configNegocio = obtenerConfig(negocioId || "default");
 
-        console.log(`[WS] Llamada ${callSid} → negocioId: ${negocioId || "(lookup)"}, numeroTwilio: ${numeroTwilio || "?"}, caller: ${callerNumber || "desconocido"}`);
+        console.log(`[WS] Llamada ${callSid} → negocioId: ${negocioId || "(lookup)"}, numeroTwilio: ${numeroTwilio || "?"}, caller: ${callerNumber || "desconocido"}${forwardedFrom ? `, forwardedFrom: ${forwardedFrom}` : ""}`);
 
         pipeline = new PipelineLlamada(
           ws,
@@ -98,6 +99,7 @@ wss.on("connection", (ws: WebSocket) => {
           callerNumber,
           numeroTwilio,
           callSid,
+          forwardedFrom,
         );
         // Registrar el streamSid ANTES de conectar a OpenAI para que el saludo no se descarte
         pipeline.recibirMensajeTwilio(mensaje);

@@ -48,6 +48,16 @@ interface PagoInfo {
   montoPago: number;
 }
 
+// Receptor configurado por el dueño (sucursal/persona a la que se puede
+// escalar). Lo provee Odin como receptoresEscalamiento en la config.
+interface ReceptorEscalamiento {
+  etiqueta: string;
+  numero: string;
+  operadora?: string;
+  canal: "llamada" | "whatsapp";
+  esPersonal?: boolean;
+}
+
 interface ItemCatalogo {
   id: string;
   nombre: string;
@@ -57,6 +67,9 @@ interface ItemCatalogo {
   duracionMinutos?: number | null;
   capacidad?: number | null;
   unidad?: string | null;
+  // Dirección específica del ítem (terraza/salón en otra ubicación). Si null,
+  // se usa la dirección general del negocio.
+  direccion?: string | null;
 }
 
 export interface ConfigNegocio {
@@ -85,6 +98,10 @@ export interface ConfigNegocio {
   // además solicita el pago/anticipo y solo escala cuando el cliente confirma.
   verificarDisponibilidadReserva?: boolean;
   metodoPago?: MetodoPagoNegocio | null;
+  // Lista de sucursales/personas a las que el agente puede escalar. Si hay
+  // varias, el agente le pregunta al cliente a cuál pasarlo. Si la llamada
+  // entró por desvío desde una sucursal específica, esa se asume por defecto.
+  receptoresEscalamiento?: ReceptorEscalamiento[];
 }
 
 interface TurnoHistorial {
@@ -200,7 +217,7 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
     herramientas.push({
       type: "function",
       name: "escalar_humano",
-      description: "Notifica al dueño del negocio para atención humana. Úsalo cuando: el cliente lo pida directamente, haya emergencia, o no puedas resolver el problema.",
+      description: "Notifica al dueño del negocio para atención humana. Úsalo cuando: el cliente lo pida directamente, haya emergencia, o no puedas resolver el problema. Si hay varias sucursales/personas configuradas, debes especificar cuál (sucursalEtiqueta) según lo que diga el cliente.",
       parameters: {
         type: "object",
         properties: {
@@ -210,6 +227,10 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
             description: "directo=cliente pide persona, emergencia=urgencia médica o crítica, no_sabe=agente no puede ayudar",
           },
           resumen: { type: "string", description: "Breve descripción de la situación para el dueño" },
+          sucursalEtiqueta: {
+            type: "string",
+            description: "Etiqueta EXACTA de la sucursal o persona a la que pasar (debe coincidir con una de las opciones de la lista del sistema). Opcional — si solo hay una, omitir; si hay varias, preguntar al cliente y pasar la elegida.",
+          },
         },
         required: ["tipo", "resumen"],
       },
@@ -255,7 +276,13 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
   return herramientas;
 }
 
-function buildSystemPrompt(cfg: ConfigNegocio): string {
+function buildSystemPrompt(
+  cfg: ConfigNegocio,
+  contextoExtra?: {
+    receptorOrigen?: ReceptorEscalamiento | null;
+    esRebote?: boolean;
+  },
+): string {
   const tz = cfg.zonaHoraria || "America/Mexico_City";
   const ahora = new Date();
   const ahoraStr = ahora.toLocaleString("es-MX", {
@@ -283,7 +310,7 @@ function buildSystemPrompt(cfg: ConfigNegocio): string {
 
   const habitacionesTexto = vertical === "hospedaje" && itemsHospedaje.length > 0
     ? itemsHospedaje.map((h) =>
-        `- ${h.nombre}${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}`
+        `- ${h.nombre}${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}`
       ).join("\n")
     : null;
 
@@ -291,7 +318,7 @@ function buildSystemPrompt(cfg: ConfigNegocio): string {
   // para pasarlo a solicitar_reserva. Esta variante incluye [ID:...].
   const habitacionesConId = itemsHospedaje.length > 0
     ? itemsHospedaje.map((h) =>
-        `- ${h.nombre} [ID:${h.id}]${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}`
+        `- ${h.nombre} [ID:${h.id}]${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}`
       ).join("\n")
     : null;
 
@@ -323,6 +350,35 @@ function buildSystemPrompt(cfg: ConfigNegocio): string {
   habilidadesLista.push("- aprendizaje");
   const habilidadesTexto = habilidadesLista.join("\n");
 
+  // Bloque dinámico al inicio del prompt: si la llamada es un rebote o llegó
+  // por desvío desde una sucursal específica, el agente se comporta distinto.
+  const bloqueContextoLlamada = (() => {
+    if (!contextoExtra) return "";
+    if (contextoExtra.esRebote) {
+      return `
+🚨 CONTEXTO CRÍTICO — ESTA LLAMADA ES UN REBOTE:
+El cliente acaba de pedir atención humana. Su llamada fue desviada al humano, pero NO contestó y la llamada rebotó hacia ti. NO saludes como sesión nueva. NO te presentes otra vez. Di directamente:
+"Disculpa, parece que el equipo no pudo tomar tu llamada en este momento. ¿Quieres que tome tu recado o prefieres que yo te ayude con tu duda?"
+Luego escucha y actúa. NO intentes escalar de nuevo en la misma llamada — el humano ya no contestó.
+`;
+    }
+    if (contextoExtra.receptorOrigen) {
+      const r = contextoExtra.receptorOrigen;
+      return `
+CONTEXTO DE ESTA LLAMADA:
+El cliente marcó al número de "${r.etiqueta}" y la llamada se desvió hacia ti porque ahí no contestaron. Menciona "${r.etiqueta}" si aplica para que el cliente se ubique. Si pide hablar con un humano, sugiere primero "${r.etiqueta}" como opción por defecto (pero no insistas si quiere otra).
+`;
+    }
+    return "";
+  })();
+
+  // Lista de receptores para que el agente sepa entre cuáles puede elegir
+  // al escalar. La pone como contexto separado, no como dato del negocio.
+  const receptores = cfg.receptoresEscalamiento || [];
+  const receptoresTexto = receptores.length > 0
+    ? receptores.map((r) => `- ${r.etiqueta}${r.canal === "whatsapp" ? " (solo por WhatsApp)" : " (por llamada)"}`).join("\n")
+    : null;
+
   return `Eres ${cfg.nombreAgente} de ${cfg.nombreNegocio} (${cfg.tipoNegocio}).
 ${cfg.personalidad}.${cfg.tonoAdicional ? ` ${cfg.tonoAdicional}` : ""}
 
@@ -333,6 +389,7 @@ FORMATO OBLIGATORIO — ESTÁS EN UNA LLAMADA TELEFÓNICA:
 - Máximo 2 oraciones por respuesta. Directo y natural.
 
 FECHA Y HORA ACTUAL: ${ahoraStr}
+${bloqueContextoLlamada}
 
 DATOS DEL NEGOCIO (solo estos existen):
 ${cfg.horario ? `- Horario general: ${cfg.horario}` : ""}
@@ -404,9 +461,16 @@ Situaciones que ACTIVAN escalar_humano:
 1. tipo="directo": El cliente pide explícitamente hablar con una persona, el dueño, un humano, el gerente, o atención personal.
 2. tipo="emergencia": Detectas urgencia médica, amenaza, agresión sostenida, demanda legal, o falla crítica de un servicio ya contratado.
 3. tipo="no_sabe": El cliente insiste en algo que ya registraste como pregunta sin respuesta y la situación requiere atención inmediata.
+${receptoresTexto ? `
+SUCURSALES O PERSONAS A LAS QUE PUEDES ESCALAR:
+${receptoresTexto}
+
+Si hay varias opciones, pregunta al cliente: "¿Con cuál sucursal/persona quieres hablar?". Si solo hay una, úsala sin preguntar.${contextoExtra?.receptorOrigen ? ` Si el cliente no especifica, usa "${contextoExtra.receptorOrigen.etiqueta}" porque fue al que él llamó originalmente.` : ""}
+Pasa la etiqueta EXACTA como parámetro "sucursalEtiqueta" en la función escalar_humano.
+` : ""}
 
 PROCEDIMIENTO:
-1. Llama a escalar_humano con tipo y resumen de la situación
+1. ${receptoresTexto ? "Pregunta sucursal (si hay varias)." : ""}Llama a escalar_humano con tipo, resumen${receptoresTexto ? " y sucursalEtiqueta" : ""}
 2. Usa el campo "mensaje" que devuelve la función como tu respuesta al cliente
 3. NO improvises ni digas nada antes de recibir el resultado de la función` : ""}
 
@@ -512,6 +576,20 @@ function mensajeDatosPagoVoz(mp: MetodoPagoNegocio, info?: PagoInfo): string {
   return `Sí tenemos disponibilidad. Para apartar tu reserva realiza el pago por ${via}: ${mp.datos}.${extra} Avísame cuando hayas pagado para confirmarlo con el equipo.`;
 }
 
+// Normaliza un número telefónico para comparación (solo dígitos, sin +).
+function digitosDe(s: string): string {
+  return String(s || "").replace(/[^\d]/g, "");
+}
+
+// Compara dos números telefónicos por sus últimos 10 dígitos (México).
+// Tolera diferencias en el código de país y el "+".
+function mismoNumero(a: string, b: string): boolean {
+  const da = digitosDe(a);
+  const db = digitosDe(b);
+  if (!da || !db) return false;
+  return da.slice(-10) === db.slice(-10);
+}
+
 export class PipelineLlamada {
   private ws: WebSocket;
   private realtime: OpenAIRealtime;
@@ -523,6 +601,17 @@ export class PipelineLlamada {
   private negocioId: string;
   private numeroTwilio: string;
   private callerNumber: string;
+  // Si la llamada llegó por desvío de Telcel/AT&T, ForwardedFrom dice el
+  // número original que marcó el cliente (la sucursal). Lo usamos para dar
+  // contexto al agente ("el cliente llamó a la Terraza A").
+  private forwardedFrom: string;
+  // Receptor que coincide con forwardedFrom (sucursal de origen). Si no hay
+  // match o no vino forwarded, queda null.
+  private receptorOrigen: ReceptorEscalamiento | null = null;
+  // Anti-loop: si el número que llamó (From) coincide con un receptor de la
+  // lista, asumimos que es un rebote del Dial que la IA acaba de hacer (el
+  // humano no contestó y la llamada volvió por desvío condicional).
+  private esRebote: boolean = false;
   private turnos: number = 0;
 
   constructor(
@@ -532,6 +621,7 @@ export class PipelineLlamada {
     callerNumber: string = "",
     numeroTwilio: string = "",
     callSid: string = "",
+    forwardedFrom: string = "",
   ) {
     this.ws = ws;
     this.negocioId = negocioId;
@@ -539,11 +629,37 @@ export class PipelineLlamada {
     this.callSid = callSid;
     this.configNegocio = configNegocio;
     this.callerNumber = callerNumber;
+    this.forwardedFrom = forwardedFrom;
     this.inicioLlamada = Date.now();
 
     const prompt = buildSystemPrompt(configNegocio);
     const herramientas = construirHerramientas(configNegocio);
     this.realtime = new OpenAIRealtime(prompt, herramientas, configNegocio.voz || "marin");
+  }
+
+  // Después de que llega la config completa, calculamos:
+  //  - receptorOrigen: la sucursal a la que originalmente llamó el cliente
+  //    (ForwardedFrom matchea un receptor) — para que el agente lo mencione.
+  //  - esRebote: la llamada entrante viene de uno de los humanos a los que
+  //    acabamos de escalar — el humano no contestó y la llamada rebotó.
+  //    En este caso el agente NO debe saludar como sesión nueva: el cliente
+  //    ya estaba esperando humano y necesita cierre (recado, otra opción).
+  private calcularContextoSucursal() {
+    const receptores = this.configNegocio.receptoresEscalamiento || [];
+    if (this.forwardedFrom) {
+      const match = receptores.find((r) => mismoNumero(r.numero, this.forwardedFrom));
+      if (match) {
+        this.receptorOrigen = match;
+        console.log(`[PIPELINE] Sucursal de origen detectada: ${match.etiqueta} (${match.numero})`);
+      }
+    }
+    if (this.callerNumber) {
+      const rebote = receptores.find((r) => mismoNumero(r.numero, this.callerNumber));
+      if (rebote) {
+        this.esRebote = true;
+        console.log(`[PIPELINE] Llamada detectada como REBOTE desde ${rebote.etiqueta} (${rebote.numero}) — el humano no contestó`);
+      }
+    }
   }
 
   private esTranscripcionValida(texto: string): boolean {
@@ -729,6 +845,30 @@ export class PipelineLlamada {
         }
 
         case "escalar_humano": {
+          // Anti-loop: si la llamada actual ya es un rebote (el humano ya no
+          // contestó la primera vez), no intentamos escalar otra vez. Solo
+          // notificamos por WhatsApp con el contexto.
+          if (this.esRebote) {
+            console.log("[FUNCIÓN] escalar_humano: llamada es rebote, no intentamos otro Dial");
+            // Aun así notificamos por WhatsApp al gerente para que sepa.
+            try {
+              await fetch(`${odinUrl}/api/voice/escalar`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", ...odinAuth() },
+                body: JSON.stringify({
+                  negocioId,
+                  tipo: args.tipo,
+                  resumen: `[REBOTE] ${args.resumen}`,
+                  telefonoCliente: callerNumber || "desconocido",
+                  nombreCliente: "Llamada entrante",
+                  sucursalEtiqueta: args.sucursalEtiqueta,
+                }),
+                signal: AbortSignal.timeout(8000),
+              });
+            } catch (e) { /* no bloquear */ }
+            return { ok: true, mensaje: "Ya quedó registrado. Avisé al equipo con el contexto de tu llamada para que te contacten." };
+          }
+
           const respEscalar = await fetch(`${odinUrl}/api/voice/escalar`, {
             method: "POST",
             headers: { "Content-Type": "application/json", ...odinAuth() },
@@ -738,23 +878,39 @@ export class PipelineLlamada {
               resumen: args.resumen,
               telefonoCliente: callerNumber || "desconocido",
               nombreCliente: "Llamada entrante",
+              sucursalEtiqueta: args.sucursalEtiqueta,
             }),
             signal: AbortSignal.timeout(8000),
           });
 
-          // El endpoint /api/voice/escalar puede devolver { transferTo: "+52…" }
-          // cuando el dueño configuró un número de transferencia en el panel
-          // de Xambee y el tipo de escalamiento es "directo" o "emergencia".
-          // Si está presente, transferimos la llamada al humano en lugar de
-          // solo decir "ya notifiqué al equipo".
+          // El endpoint puede devolver:
+          //  - transferTo: número al que hacer <Dial> (cuando receptor.canal=llamada)
+          //  - canalReceptor: "llamada" | "whatsapp" | null
+          //  - receptorEtiqueta: nombre de la sucursal/persona avisada
           let transferTo: string | null = null;
+          let canalReceptor: "llamada" | "whatsapp" | null = null;
+          let receptorEtiqueta: string | null = null;
           if (!respEscalar.ok) {
             const errBody = await respEscalar.text().catch(() => "");
             console.error(`[FUNCIÓN] escalar_humano → HTTP ${respEscalar.status}: ${errBody}`);
           } else {
             console.log(`[FUNCIÓN] escalar_humano → HTTP ${respEscalar.status} OK`);
-            const data = (await respEscalar.json().catch(() => ({}))) as { transferTo?: string };
+            const data = (await respEscalar.json().catch(() => ({}))) as {
+              transferTo?: string;
+              canalReceptor?: "llamada" | "whatsapp";
+              receptorEtiqueta?: string;
+            };
             transferTo = typeof data?.transferTo === "string" ? data.transferTo : null;
+            canalReceptor = data?.canalReceptor || null;
+            receptorEtiqueta = data?.receptorEtiqueta || null;
+          }
+
+          // Si el receptor elegido fue por WhatsApp (ej. el dueño marcó su
+          // número como personal), NO hacemos Dial — el resumen ya se mandó
+          // por WhatsApp con la sucursal incluida. Le decimos al cliente.
+          if (canalReceptor === "whatsapp" && !transferTo) {
+            const a = receptorEtiqueta ? `con ${receptorEtiqueta}` : "con el equipo";
+            return { ok: true, mensaje: `Listo, ya le mandé un mensaje detallado a ${a} por WhatsApp con tu solicitud. Te van a contactar en breve. ¿Algo más en lo que te pueda ayudar?` };
           }
 
           if (transferTo && this.callSid) {
@@ -917,11 +1073,15 @@ export class PipelineLlamada {
       this.configNegocio = { ...this.configNegocio, ...configRapida };
       if (configRapida.negocioId) this.negocioId = configRapida.negocioId;
       if (vozRegistrada) this.configNegocio.voz = vozRegistrada;
+      this.calcularContextoSucursal();
 
-      const prompt = buildSystemPrompt(this.configNegocio);
+      const prompt = buildSystemPrompt(this.configNegocio, {
+        receptorOrigen: this.receptorOrigen,
+        esRebote: this.esRebote,
+      });
       const tools = construirHerramientas(this.configNegocio);
       this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin");
-      console.log(`[PIPELINE] Saludo con memoria + voz=${this.configNegocio.voz || "marin"} — ${this.configNegocio.nombreNegocio}`);
+      console.log(`[PIPELINE] Saludo con memoria + voz=${this.configNegocio.voz || "marin"} — ${this.configNegocio.nombreNegocio}${this.receptorOrigen ? ` (origen=${this.receptorOrigen.etiqueta})` : ""}${this.esRebote ? " (REBOTE)" : ""}`);
     } else {
       const prompt = buildSystemPrompt(this.configNegocio);
       const tools = construirHerramientas(this.configNegocio);
@@ -935,11 +1095,15 @@ export class PipelineLlamada {
         }
         this.configNegocio = { ...this.configNegocio, ...configCompleta };
         if (configCompleta.negocioId) this.negocioId = configCompleta.negocioId;
+        this.calcularContextoSucursal();
 
-        const promptC = buildSystemPrompt(this.configNegocio);
+        const promptC = buildSystemPrompt(this.configNegocio, {
+          receptorOrigen: this.receptorOrigen,
+          esRebote: this.esRebote,
+        });
         const toolsC = construirHerramientas(this.configNegocio);
         this.realtime.actualizarConfiguracion(promptC, toolsC);
-        console.log(`[PIPELINE] Memoria del negocio aplicada (post-saludo): ${configCompleta.nombreNegocio}`);
+        console.log(`[PIPELINE] Memoria del negocio aplicada (post-saludo): ${configCompleta.nombreNegocio}${this.receptorOrigen ? ` (origen=${this.receptorOrigen.etiqueta})` : ""}${this.esRebote ? " (REBOTE)" : ""}`);
       });
     }
   }

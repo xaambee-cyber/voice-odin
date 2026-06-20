@@ -30,6 +30,13 @@ interface MetodoPagoNegocio {
     porcentajeAnticipo?: number;
     instrucciones?: string;
 }
+interface ReceptorEscalamiento {
+    etiqueta: string;
+    numero: string;
+    operadora?: string;
+    canal: "llamada" | "whatsapp";
+    esPersonal?: boolean;
+}
 interface ItemCatalogo {
     id: string;
     nombre: string;
@@ -39,6 +46,7 @@ interface ItemCatalogo {
     duracionMinutos?: number | null;
     capacidad?: number | null;
     unidad?: string | null;
+    direccion?: string | null;
 }
 export interface ConfigNegocio {
     nombreAgente: string;
@@ -62,6 +70,7 @@ export interface ConfigNegocio {
     habilidadesActivas?: HabilidadesActivas;
     verificarDisponibilidadReserva?: boolean;
     metodoPago?: MetodoPagoNegocio | null;
+    receptoresEscalamiento?: ReceptorEscalamiento[];
 }
 export declare class PipelineLlamada {
     private ws;
@@ -74,8 +83,12 @@ export declare class PipelineLlamada {
     private negocioId;
     private numeroTwilio;
     private callerNumber;
+    private forwardedFrom;
+    private receptorOrigen;
+    private esRebote;
     private turnos;
-    constructor(ws: WebSocket, negocioId: string, configNegocio: ConfigNegocio, callerNumber?: string, numeroTwilio?: string, callSid?: string);
+    constructor(ws: WebSocket, negocioId: string, configNegocio: ConfigNegocio, callerNumber?: string, numeroTwilio?: string, callSid?: string, forwardedFrom?: string);
+    private calcularContextoSucursal;
     private esTranscripcionValida;
     private colgarTwilioCall;
     private manejarFuncion;

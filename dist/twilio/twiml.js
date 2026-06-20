@@ -14,6 +14,11 @@ function handleIncomingCall(req, res) {
     // Twilio manda el número que llamó (From) y el número Twilio que recibió (To)
     const callerNumber = String(req.body?.From || req.body?.Caller || "").replace("+", "");
     const numeroTwilio = String(req.body?.To || req.body?.Called || "");
+    // Si la llamada llegó por desvío, Twilio incluye ForwardedFrom con el
+    // número que originalmente fue marcado (ej. el número de la terraza/sucursal
+    // antes de que rebotara al Twilio). Lo usamos para detectar de qué sucursal
+    // viene el cliente y dar contexto al agente.
+    const forwardedFrom = String(req.body?.ForwardedFrom || "").replace("+", "");
     const wsUrl = config_1.config.voiceServerUrl.replace("wss://", "").replace("ws://", "").replace("https://", "").replace("http://", "");
     // Si el WebSocket falla o se cierra, Twilio ejecuta el <Say> como fallback
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -23,6 +28,7 @@ function handleIncomingCall(req, res) {
       <Parameter name="negocioId" value="${negocioId}" />
       <Parameter name="numeroTwilio" value="${escapeXml(numeroTwilio)}" />
       <Parameter name="callerNumber" value="${escapeXml(callerNumber)}" />
+      <Parameter name="forwardedFrom" value="${escapeXml(forwardedFrom)}" />
     </Stream>
   </Connect>
   <Say language="es-MX" voice="Polly.Mia">Lo sentimos, hubo un problema con el asistente. Por favor intente de nuevo en unos momentos.</Say>
@@ -30,7 +36,7 @@ function handleIncomingCall(req, res) {
 </Response>`;
     res.type("text/xml");
     res.send(twiml);
-    console.log(`[TWILIO] Llamada entrante → numeroTwilio: ${numeroTwilio || "?"}, negocioId(query): ${negocioId || "(ninguno, lookup por número)"}, caller: ${callerNumber || "desconocido"}`);
+    console.log(`[TWILIO] Llamada entrante → numeroTwilio: ${numeroTwilio || "?"}, negocioId(query): ${negocioId || "(ninguno, lookup por número)"}, caller: ${callerNumber || "desconocido"}${forwardedFrom ? `, forwardedFrom: ${forwardedFrom}` : ""}`);
 }
 // TwiML de fallback cuando el server no está disponible
 function handleFallback(req, res) {
