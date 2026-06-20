@@ -43,9 +43,15 @@ interface MetodoPagoNegocio {
 
 // Cálculo de costo de la reserva (lo provee Odin: precio unidad × noches).
 interface PagoInfo {
-  noches: number;
+  // El backend manda `dias` (días inclusive). Mantenemos `noches` como alias
+  // para retrocompat — si llega cualquiera de los dos, lo usamos.
+  noches?: number;
+  dias?: number;
   precioTotal: number;
   montoPago: number;
+  // Unidad del item (ej. "por noche", "por día", "por hora"). Se usa para
+  // que el agente hable con el wording correcto en voz.
+  unidad?: string | null;
 }
 
 // Receptor configurado por el dueño (sucursal/persona a la que se puede
@@ -70,6 +76,9 @@ interface ItemCatalogo {
   // Dirección específica del ítem (terraza/salón en otra ubicación). Si null,
   // se usa la dirección general del negocio.
   direccion?: string | null;
+  // Precios por día de la semana (0=Dom...6=Sáb). Si un día no está, se cobra
+  // el precio base. El agente debe poder cotizar con esto.
+  preciosPorDia?: Record<string, number> | null;
 }
 
 export interface ConfigNegocio {
@@ -98,6 +107,10 @@ export interface ConfigNegocio {
   // además solicita el pago/anticipo y solo escala cuando el cliente confirma.
   verificarDisponibilidadReserva?: boolean;
   metodoPago?: MetodoPagoNegocio | null;
+  // Todos los métodos de pago configurados (puede haber varios). Si vienen, el
+  // agente los menciona todos al cobrar. `metodoPago` se mantiene para
+  // retrocompat (es el primero del array).
+  metodosPago?: MetodoPagoNegocio[];
   // Lista de sucursales/personas a las que el agente puede escalar. Si hay
   // varias, el agente le pregunta al cliente a cuál pasarlo. Si la llamada
   // entró por desvío desde una sucursal específica, esa se asume por defecto.
@@ -308,9 +321,22 @@ function buildSystemPrompt(
 
   const formatearMoneda = (n: number) => `$${n.toLocaleString("es-MX")} MXN`;
 
+  // Anota precios por día de la semana si difieren del base. El agente lo
+  // dice tal cual cuando el cliente pregunta el costo de fechas específicas.
+  const DIAS_CORTOS = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+  const formatearPreciosPorDia = (precios: Record<string, number> | null | undefined, base: number): string => {
+    if (!precios || typeof precios !== "object") return "";
+    const parts: string[] = [];
+    for (let i = 0; i < 7; i++) {
+      const p = Number(precios[String(i)]);
+      if (Number.isFinite(p) && p > 0) parts.push(`${DIAS_CORTOS[i]} ${formatearMoneda(p)}`);
+    }
+    return parts.length > 0 ? ` — Precios por día: ${parts.join(", ")} (días sin valor cobran el precio base)` : "";
+  };
+
   const habitacionesTexto = vertical === "hospedaje" && itemsHospedaje.length > 0
     ? itemsHospedaje.map((h) =>
-        `- ${h.nombre}${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}`
+        `- ${h.nombre}${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}${formatearPreciosPorDia(h.preciosPorDia, h.precio)}`
       ).join("\n")
     : null;
 
@@ -318,7 +344,7 @@ function buildSystemPrompt(
   // para pasarlo a solicitar_reserva. Esta variante incluye [ID:...].
   const habitacionesConId = itemsHospedaje.length > 0
     ? itemsHospedaje.map((h) =>
-        `- ${h.nombre} [ID:${h.id}]${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}`
+        `- ${h.nombre} [ID:${h.id}]${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}${formatearPreciosPorDia(h.preciosPorDia, h.precio)}`
       ).join("\n")
     : null;
 
@@ -488,7 +514,8 @@ ${metodoPago ? `4. Como es una llamada y los datos de pago (números de cuenta, 
 REGLAS:
 - NUNCA inventes disponibilidad, precios${metodoPago ? " ni datos de pago" : ""}. Eso lo da la función.
 - NUNCA digas que la reserva ya quedó confirmada. Solo el equipo confirma.
-- NUNCA digas los [ID:...] en voz alta — son internos.${metodoPago ? `
+- NUNCA digas los [ID:...] en voz alta — son internos.
+- PRECIOS POR DÍA: si una unidad tiene "Precios por día" anotados arriba (Lun, Vie, Sáb, etc.), úsalos cuando el cliente pregunte el costo de un día específico ("¿cuánto cuesta el viernes?"). Días sin valor anotado cobran el PRECIO BASE. Si te piden el total de varios días, suma día por día con su precio correspondiente. El backend hace ese cálculo cuando llamas a solicitar_reserva, así que tu trabajo es solo informarlo bien si te lo preguntan ANTES de reservar.${metodoPago ? `
 - NO asumas que el cliente ya pagó. Un "gracias", "ok", "va", "perfecto", "ahí va", un silencio o un ruido NO son confirmación de pago. Si dudas, deja pagoReportado en false y pregunta: "¿Ya realizaste el pago?".
 - Después de dar los datos de pago, NO vuelvas a llamar a solicitar_reserva hasta que el cliente diga claramente que ya pagó.` : ""}
 ` : ""}
@@ -549,31 +576,52 @@ async function fetchConfigConRetry(url: string, timeoutMs: number = 10000): Prom
 // Mensaje hablado con los datos de pago. Igual al de Odin (lib/reservas.ts)
 // para que WhatsApp y voz suenen idénticos. Usa "por ciento" en vez de "%"
 // y "pesos" para que el TTS lo lea bien.
-function mensajeDatosPagoVoz(mp: MetodoPagoNegocio, info?: PagoInfo): string {
-  const via =
-    mp.tipo === "transferencia" ? "transferencia"
-    : mp.tipo === "paypal" ? "PayPal"
-    : mp.tipo === "mercadopago" ? "Mercado Pago"
-    : "el método indicado";
-  const extra = mp.instrucciones ? ` ${mp.instrucciones}` : "";
-  // Defensa: si las noches no vienen (o vienen inválidas) NO decimos "undefined
-  // noches"; simplemente omitimos esa parte. El total sigue siendo correcto.
-  const noches = info && typeof info.noches === "number" && isFinite(info.noches) && info.noches > 0
-    ? info.noches : null;
-  const porNoches = noches ? ` por ${noches} ${noches === 1 ? "noche" : "noches"}` : "";
+function mensajeDatosPagoVoz(
+  mp: MetodoPagoNegocio | MetodoPagoNegocio[],
+  info?: PagoInfo,
+): string {
+  const lista = Array.isArray(mp) ? mp : [mp];
+  if (lista.length === 0) return "";
+  const primero = lista[0];
+  const cantidad = info?.dias ?? info?.noches ?? 0;
+  const cantidadValida = typeof cantidad === "number" && isFinite(cantidad) && cantidad > 0 ? cantidad : null;
+  const palabraUnidad = (() => {
+    const u = (info?.unidad || "").toLowerCase();
+    if (u.includes("noche")) return cantidadValida === 1 ? "noche" : "noches";
+    if (u.includes("hora")) return cantidadValida === 1 ? "hora" : "horas";
+    return cantidadValida === 1 ? "día" : "días";
+  })();
+  const porDias = cantidadValida ? ` por ${cantidadValida} ${palabraUnidad}` : "";
 
-  if (mp.modalidad === "anticipo") {
-    const pct = mp.porcentajeAnticipo || 30;
-    if (info) {
-      return `Sí tenemos disponibilidad. El total son ${info.precioTotal.toLocaleString("es-MX")} pesos${porNoches}. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento, que son ${info.montoPago.toLocaleString("es-MX")} pesos, por ${via}: ${mp.datos}.${extra} Avísame cuando hayas hecho el pago para confirmarlo con el equipo.`;
-    }
-    return `Sí tenemos disponibilidad. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento por ${via}: ${mp.datos}.${extra} Avísame cuando hayas hecho el pago para confirmarlo con el equipo.`;
+  const viaDe = (m: MetodoPagoNegocio): string =>
+    m.tipo === "transferencia" ? "transferencia"
+    : m.tipo === "paypal" ? "PayPal"
+    : m.tipo === "mercadopago" ? "Mercado Pago"
+    : "otro método";
+
+  // Encabezado con monto (igual que antes pero sin método específico).
+  let encabezado = "";
+  if (primero.modalidad === "anticipo") {
+    const pct = primero.porcentajeAnticipo || 30;
+    encabezado = info
+      ? `Sí tenemos disponibilidad. El total son ${info.precioTotal.toLocaleString("es-MX")} pesos${porDias}. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento, que son ${info.montoPago.toLocaleString("es-MX")} pesos.`
+      : `Sí tenemos disponibilidad. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento.`;
+  } else {
+    encabezado = info
+      ? `Sí tenemos disponibilidad. El total son ${info.montoPago.toLocaleString("es-MX")} pesos${porDias}.`
+      : `Sí tenemos disponibilidad.`;
   }
 
-  if (info) {
-    return `Sí tenemos disponibilidad. El total son ${info.montoPago.toLocaleString("es-MX")} pesos${porNoches}. Para apartar tu reserva realiza el pago por ${via}: ${mp.datos}.${extra} Avísame cuando hayas pagado para confirmarlo con el equipo.`;
+  if (lista.length === 1) {
+    const m = lista[0];
+    const via = viaDe(m);
+    const extra = m.instrucciones ? ` ${m.instrucciones}` : "";
+    return `${encabezado} Puedes pagarlo por ${via}: ${m.datos}.${extra} Te paso los datos por WhatsApp. Avísame cuando hayas pagado para confirmarlo con el equipo.`;
   }
-  return `Sí tenemos disponibilidad. Para apartar tu reserva realiza el pago por ${via}: ${mp.datos}.${extra} Avísame cuando hayas pagado para confirmarlo con el equipo.`;
+
+  // Varios métodos: enumerar como opciones (en voz, sin números de cuenta).
+  const opciones = lista.map(viaDe).join(", o ");
+  return `${encabezado} Aceptamos varias formas de pago: ${opciones}. Te paso los datos completos por WhatsApp para que elijas la que prefieras. Avísame cuando hayas pagado para confirmarlo con el equipo.`;
 }
 
 // Normaliza un número telefónico para comparación (solo dígitos, sin +).
@@ -653,12 +701,21 @@ export class PipelineLlamada {
         console.log(`[PIPELINE] Sucursal de origen detectada: ${match.etiqueta} (${match.numero})`);
       }
     }
-    if (this.callerNumber) {
-      const rebote = receptores.find((r) => mismoNumero(r.numero, this.callerNumber));
-      if (rebote) {
-        this.esRebote = true;
-        console.log(`[PIPELINE] Llamada detectada como REBOTE desde ${rebote.etiqueta} (${rebote.numero}) — el humano no contestó`);
-      }
+    // Anti-rebote: cuando hacemos <Dial> al humano usamos callerId=numeroTwilio.
+    // Si ese humano tiene desvío condicional al Twilio y NO contesta, la llamada
+    // rebota: entra una NUEVA llamada al Twilio cuyo `From` es el propio Twilio
+    // number (porque el callerId del Dial era el Twilio). Esa es la firma
+    // inequívoca del rebote. ForwardedFrom adicional confirma que vino por
+    // desvío desde un receptor de la lista.
+    if (
+      this.callerNumber &&
+      this.numeroTwilio &&
+      mismoNumero(this.callerNumber, this.numeroTwilio) &&
+      this.forwardedFrom
+    ) {
+      this.esRebote = true;
+      const r = this.receptorOrigen;
+      console.log(`[PIPELINE] Llamada detectada como REBOTE${r ? ` desde ${r.etiqueta} (${r.numero})` : ` (forwardedFrom=${this.forwardedFrom})`} — el humano no contestó al Dial`);
     }
   }
 
@@ -807,6 +864,7 @@ export class PipelineLlamada {
             esperandoPago?: boolean;
             noDisponible?: boolean;
             metodoPago?: MetodoPagoNegocio;
+            metodosPago?: MetodoPagoNegocio[];
             pagoInfo?: PagoInfo;
           };
 
@@ -820,7 +878,10 @@ export class PipelineLlamada {
           }
 
           // Hay disponibilidad pero falta el pago: dar los datos al cliente.
-          if (data.esperandoPago && data.metodoPago) {
+          const metodosListados = data.metodosPago && data.metodosPago.length > 0
+            ? data.metodosPago
+            : (data.metodoPago ? [data.metodoPago] : []);
+          if (data.esperandoPago && metodosListados.length > 0) {
             // Si Odin no mandó las noches (bug conocido: llega undefined), las
             // calculamos desde las fechas para no perder ese dato en la voz.
             let pagoInfo = data.pagoInfo;
@@ -830,7 +891,7 @@ export class PipelineLlamada {
               const n = Math.round(ms / 86400000);
               if (Number.isFinite(n) && n > 0) pagoInfo = { ...pagoInfo, noches: n };
             }
-            return { ok: true, mensaje: mensajeDatosPagoVoz(data.metodoPago, pagoInfo) };
+            return { ok: true, mensaje: mensajeDatosPagoVoz(metodosListados, pagoInfo) };
           }
           // El cliente ya reportó el pago: el backend avisó al equipo.
           if (pagoReportado) {
