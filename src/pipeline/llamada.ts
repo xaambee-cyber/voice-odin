@@ -115,6 +115,15 @@ export interface ConfigNegocio {
   // varias, el agente le pregunta al cliente a cuál pasarlo. Si la llamada
   // entró por desvío desde una sucursal específica, esa se asume por defecto.
   receptoresEscalamiento?: ReceptorEscalamiento[];
+  // Saludo inicial personalizado que dice el agente al contestar. Vacío = usa
+  // el saludo genérico.
+  saludoInicial?: string;
+  // Temas/frases que disparan transferencia INMEDIATA a un humano: si el
+  // cliente menciona alguno, el agente NO intenta resolver, llama directo a
+  // escalar_humano.
+  temasTransferencia?: string[];
+  // URL de Google Maps del negocio (para reenviar por WhatsApp en la llamada).
+  ubicacionUrl?: string;
 }
 
 interface TurnoHistorial {
@@ -285,6 +294,27 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
     },
   });
 
+  // Enviar ubicación por WhatsApp — solo si el negocio tiene Maps/dirección.
+  // En una llamada no se puede "pasar" un link, así que lo mandamos al WhatsApp
+  // del cliente.
+  if (cfg.ubicacionUrl || cfg.direccion) {
+    herramientas.push({
+      type: "function",
+      name: "enviar_ubicacion",
+      description: "Envía la ubicación (link de Google Maps / dirección) al WhatsApp del cliente. Úsalo cuando el cliente pida la ubicación o cómo llegar. Avísale que se la mandas por WhatsApp al número desde el que llama.",
+      parameters: {
+        type: "object",
+        properties: {
+          itemNombre: {
+            type: "string",
+            description: "Nombre de la terraza/sucursal específica si el cliente preguntó por una con dirección propia. Opcional.",
+          },
+        },
+        required: [],
+      },
+    });
+  }
+
   console.log(`[PIPELINE] Herramientas cargadas: ${herramientas.map((h) => h.name).join(", ") || "(ninguna)"}`);
   return herramientas;
 }
@@ -425,6 +455,10 @@ El cliente marcó al número de "${r.etiqueta}" y la llamada se desvió hacia ti
     ? receptores.map((r) => `- ${r.etiqueta}${r.canal === "whatsapp" ? " (solo por WhatsApp)" : " (por llamada)"}`).join("\n")
     : null;
 
+  // Temas que disparan transferencia INMEDIATA a humano (ej. servicio urgente).
+  const temas = (cfg.temasTransferencia || []).filter((t) => typeof t === "string" && t.trim());
+  const temasTexto = temas.length > 0 ? temas.map((t) => `- "${t}"`).join("\n") : null;
+
   return `Eres ${cfg.nombreAgente} de ${cfg.nombreNegocio} (${cfg.tipoNegocio}).
 ${cfg.personalidad}.${cfg.tonoAdicional ? ` ${cfg.tonoAdicional}` : ""}
 
@@ -433,6 +467,10 @@ FORMATO OBLIGATORIO — ESTÁS EN UNA LLAMADA TELEFÓNICA:
 - ABSOLUTAMENTE PROHIBIDO: asteriscos, guiones de lista, negritas (**texto**), numeración (1. 2. 3.), markdown de cualquier tipo.
 - Si tienes varios servicios, dícelos como en una conversación: "tenemos limpieza, radiografía y valoración" — no en lista.
 - Máximo 2 oraciones por respuesta. Directo y natural.
+${cfg.saludoInicial && cfg.saludoInicial.trim() ? `
+SALUDO INICIAL OBLIGATORIO:
+Tu PRIMER mensaje de la llamada debe transmitir esto (dilo natural, hablado, sin leerlo robótico): "${cfg.saludoInicial.trim()}"
+` : ""}
 
 FECHA Y HORA ACTUAL: ${ahoraStr}
 ${bloqueContextoLlamada}
@@ -449,6 +487,7 @@ ${menuTexto ? `\nMENÚ:\n${menuTexto}\n(Cuando hables del menú di "platillos" o
 ${productosTexto ? `\nPRODUCTOS:\n${productosTexto}` : ""}
 ${metodosPagoTextoVoz ? `\nMÉTODOS DE PAGO QUE ACEPTA EL NEGOCIO (${modalidadPagoTextoVoz}):\n${metodosPagoTextoVoz}\n(Si te preguntan qué formas de pago aceptan ANTES de reservar, di los TIPOS hablados naturalmente — ej. "aceptamos transferencia bancaria y PayPal". NO dictes números de cuenta, CLABE ni links en voz: dile al cliente que te los envías por WhatsApp. La modalidad aplica a todos los métodos.)` : ""}
 
+${(cfg.ubicacionUrl || cfg.direccion) ? `\nUBICACIÓN:\nSi el cliente pide la ubicación, dirección o cómo llegar, usa la función enviar_ubicacion para mandársela por WhatsApp al número desde el que llama. NO dictes el link de Google Maps por voz (no sirve hablado). Dile algo como "te la mando por WhatsApp ahorita".\n` : ""}
 FUNCIONES HABILITADAS (solo puedes hacer esto):
 ${habilidadesTexto}
 
@@ -508,6 +547,11 @@ Situaciones que ACTIVAN escalar_humano:
 1. tipo="directo": El cliente pide explícitamente hablar con una persona, el dueño, un humano, el gerente, o atención personal.
 2. tipo="emergencia": Detectas urgencia médica, amenaza, agresión sostenida, demanda legal, o falla crítica de un servicio ya contratado.
 3. tipo="no_sabe": El cliente insiste en algo que ya registraste como pregunta sin respuesta y la situación requiere atención inmediata.
+${temasTexto ? `
+TRANSFERENCIA INMEDIATA POR TEMA — MÁXIMA PRIORIDAD:
+Si el cliente menciona cualquiera de estos temas/situaciones, NO intentes resolverlo, NO pidas datos, NO ofrezcas reservar: llama a escalar_humano (tipo="directo") DE INMEDIATO y dile que lo comunicas con una persona ahora mismo.
+${temasTexto}
+` : ""}
 ${receptoresTexto ? `
 SUCURSALES O PERSONAS A LAS QUE PUEDES ESCALAR:
 ${receptoresTexto}
@@ -925,6 +969,34 @@ export class PipelineLlamada {
           }
           // Legacy (verificar disponibilidad apagado): solo se mandó al admin.
           return { ok: true, mensaje: "Listo, tu solicitud quedó registrada. El negocio te confirmará en breve por WhatsApp. ¿Hay algo más?" };
+        }
+
+        case "enviar_ubicacion": {
+          if (!callerNumber) {
+            return { ok: false, mensaje: "No tengo tu número para mandártela por WhatsApp. ¿Me lo puedes dictar?" };
+          }
+          // Si preguntó por una terraza/sucursal puntual, resolvemos su id para
+          // mandar la dirección específica de ese ítem.
+          let servicioId: string | undefined;
+          const catalogo = this.configNegocio.catalogo;
+          if (args.itemNombre && Array.isArray(catalogo)) {
+            const item = catalogo.find(
+              (it) => it.nombre && it.nombre.toLowerCase().includes(String(args.itemNombre).toLowerCase()),
+            );
+            if (item && (item as { id?: string }).id) servicioId = (item as { id?: string }).id;
+          }
+          try {
+            const respUbic = await fetch(`${odinUrl}/api/voice/enviar-ubicacion`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", ...odinAuth() },
+              body: JSON.stringify({ negocioId, numero: callerNumber, servicioId }),
+              signal: AbortSignal.timeout(8000),
+            });
+            if (respUbic.ok) {
+              return { ok: true, mensaje: "Listo, te acabo de mandar la ubicación por WhatsApp. ¿Algo más?" };
+            }
+          } catch (e) { /* cae al mensaje de abajo */ }
+          return { ok: false, mensaje: "Tuve un problema al mandártela por WhatsApp, pero con gusto te ayudo con otra cosa." };
         }
 
         case "escalar_humano": {
