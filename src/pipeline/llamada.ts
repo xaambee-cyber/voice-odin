@@ -4,12 +4,24 @@ import { OpenAIRealtime, HerramientaVoz } from "../openai/realtime";
 import { config } from "../utils/config";
 import { obtenerVozPorNumero } from "../api/registro-voz";
 
+// Campo adicional que el negocio definió para agendar un servicio concreto
+// (ej. "Dirección de recolección"). La llave que se manda al backend es `id`
+// (ej. "c1"), nunca el `label`.
+interface CampoAgenda {
+  id: string;
+  label: string;
+  requerido: boolean;
+}
+
 interface Servicio {
   id: string;
   nombre: string;
   duracionMinutos: number;
   precio: number;
   descripcion?: string;
+  // Campos personalizados que hay que recolectar ANTES de agendar este
+  // servicio. Puede venir vacío o ausente: en ese caso se agenda como siempre.
+  camposAgenda?: CampoAgenda[];
 }
 
 interface HorarioDetallado {
@@ -145,12 +157,17 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
     herramientas.push({
       type: "function",
       name: "agendar_cita",
-      description: "Agenda una nueva cita para el cliente. Llama esta función solo cuando el cliente haya confirmado el servicio, la fecha y la hora exacta.",
+      description: "Agenda una nueva cita para el cliente. Llama esta función solo cuando el cliente haya confirmado el servicio, la fecha y la hora exacta. Si el servicio elegido tiene CAMPOS ADICIONALES (los verás en tu lista de servicios), antes de llamar a esta función debes haber recolectado al menos todos los campos obligatorios y pasarlos en camposAgenda.",
       parameters: {
         type: "object",
         properties: {
           servicioId: { type: "string", description: "ID exacto del servicio (usa los que aparecen en tu lista de servicios)" },
           fechaInicio: { type: "string", description: "Fecha y hora de inicio en formato ISO: YYYY-MM-DDTHH:MM:00" },
+          camposAgenda: {
+            type: "object",
+            description: "Datos adicionales que pide el servicio elegido. Las LLAVES deben ser los IDs de campo (ej. \"c1\", \"c2\"), NUNCA las etiquetas largas; los valores son lo que dijo el cliente. Inclúyelo SOLO si el servicio tiene campos adicionales; OMÍTELO por completo si el servicio no tiene ninguno.",
+            additionalProperties: { type: "string" },
+          },
         },
         required: ["servicioId", "fechaInicio"],
       },
@@ -406,9 +423,21 @@ function buildSystemPrompt(
     ? itemsProductos.map((p) => `- ${p.nombre} — ${formatearMoneda(p.precio)}${p.descripcion ? ` (${p.descripcion})` : ""}`).join("\n")
     : null;
 
+  // Línea de campos adicionales de un servicio. Vacía si el servicio no pide
+  // nada extra (se agenda como siempre). El [campo:ID] es el dato que va como
+  // llave en camposAgenda — el cliente NUNCA debe escuchar el ID ni la palabra
+  // "campo": el agente pregunta usando la etiqueta de forma natural.
+  const formatearCamposAgenda = (campos: CampoAgenda[] | undefined): string => {
+    if (!campos || campos.length === 0) return "";
+    const parts = campos.map(
+      (c) => `${c.label} [campo:${c.id}, ${c.requerido ? "OBLIGATORIO" : "opcional"}]`,
+    );
+    return `\n    Datos a recolectar antes de agendar: ${parts.join("; ")}`;
+  };
+
   const serviciosTexto = cfg.servicios && cfg.servicios.length > 0
     ? cfg.servicios.map((s) =>
-        `- ${s.nombre} [ID:${s.id}]${s.duracionMinutos ? ` — ${s.duracionMinutos} min` : ""}${s.precio ? ` — $${s.precio.toLocaleString("es-MX")} MXN` : ""}${s.descripcion ? ` (${s.descripcion})` : ""}`
+        `- ${s.nombre} [ID:${s.id}]${s.duracionMinutos ? ` — ${s.duracionMinutos} min` : ""}${s.precio ? ` — $${s.precio.toLocaleString("es-MX")} MXN` : ""}${s.descripcion ? ` (${s.descripcion})` : ""}${formatearCamposAgenda(s.camposAgenda)}`
       ).join("\n")
     : null;
 
@@ -528,6 +557,12 @@ INSTRUCCIONES PARA CITAS:
    - Si el sistema responde que el horario está ocupado, informa los horarios disponibles y pregunta cuál prefiere.
    - Solo agenda dentro del horario de atención: ${horariosTexto || "No especificado"}
    - Usa la fecha y hora actual para calcular fechas relativas ("mañana", "el martes")
+   - DATOS ADICIONALES DEL SERVICIO: algunos servicios de tu lista tienen una línea "Datos a recolectar antes de agendar". Si el servicio elegido la tiene:
+     · ANTES de llamar a agendar_cita, recolecta conversando TODOS los campos marcados OBLIGATORIO. Pregunta de forma natural usando la etiqueta del campo (ej. para "Dirección de recolección" pregunta "¿En qué dirección recogemos?"). NUNCA digas el ID ni la palabra "campo".
+     · Los campos "opcional" pregúntalos solo si fluye natural; si el cliente no los da, omítelos sin insistir.
+     · Pasa lo recolectado en el parámetro camposAgenda usando como LLAVE el ID entre [campo:...] (ej. "c1"), nunca la etiqueta. Omite los campos opcionales que el cliente no haya dado.
+     · Si el servicio NO tiene esa línea, agenda igual que siempre: NO mandes camposAgenda.
+   - REGLA DE ORO: NUNCA confirmes la cita al cliente hasta que agendar_cita responda con éxito. Si la función te dice que faltan datos, pídeselos al cliente exactamente y vuelve a llamar a agendar_cita; no des la cita por hecha mientras falten.
 
 2. CANCELAR: Confirma explícitamente con el cliente antes de llamar a cancelar_cita. El cliente debe pedir cancelar de forma clara y directa. Si hay ambigüedad, pregunta: "¿Quieres cancelar tu cita?"
 
@@ -841,20 +876,59 @@ export class PipelineLlamada {
     try {
       switch (nombre) {
         case "agendar_cita": {
+          const body: Record<string, any> = {
+            negocioId,
+            servicioId: args.servicioId,
+            fechaInicio: args.fechaInicio,
+            clienteNombre: "Llamada entrante",
+            clienteTelefono: callerNumber || "desconocido",
+          };
+          // Campos personalizados del servicio: solo los mandamos si el modelo
+          // recolectó al menos uno. La llave es el id del campo (c1, c2…),
+          // nunca la etiqueta. Servicios sin camposAgenda → no mandamos la
+          // llave y el backend se comporta como siempre.
+          if (
+            args.camposAgenda &&
+            typeof args.camposAgenda === "object" &&
+            !Array.isArray(args.camposAgenda)
+          ) {
+            const entradas = Object.entries(args.camposAgenda).filter(
+              ([, v]) => v != null && String(v).trim().length > 0,
+            );
+            if (entradas.length > 0) {
+              body.camposAgenda = Object.fromEntries(
+                entradas.map(([k, v]) => [k, String(v)]),
+              );
+            }
+          }
+
           const resp = await fetch(`${odinUrl}/api/voice/citas`, {
             method: "POST",
             headers: { "Content-Type": "application/json", ...odinAuth() },
-            body: JSON.stringify({
-              negocioId,
-              servicioId: args.servicioId,
-              fechaInicio: args.fechaInicio,
-              clienteNombre: "Llamada entrante",
-              clienteTelefono: callerNumber || "desconocido",
-            }),
+            body: JSON.stringify(body),
             signal: AbortSignal.timeout(8000),
           });
-          const data = await resp.json() as { slotsDisponibles?: string[]; citaId?: string };
+          const data = (await resp.json().catch(() => ({}))) as {
+            error?: string;
+            faltantes?: string[];
+            slotsDisponibles?: string[];
+            citaId?: string;
+          };
           if (!resp.ok) {
+            // 400 FALTAN_CAMPOS: faltó un dato obligatorio del servicio. El
+            // backend manda las ETIQUETAS de lo que falta en `faltantes`. Se
+            // las pedimos al cliente y el modelo reintentará agendar_cita.
+            if (
+              data.error === "FALTAN_CAMPOS" &&
+              Array.isArray(data.faltantes) &&
+              data.faltantes.length > 0
+            ) {
+              return {
+                ok: false,
+                mensaje: `Antes de agendar necesito un par de datos más: ${data.faltantes.join(", ")}. ¿Me los puedes dar?`,
+              };
+            }
+            // 409 Horario ocupado: ofrecer los horarios disponibles.
             if (data.slotsDisponibles) {
               return {
                 ok: false,
@@ -863,6 +937,7 @@ export class PipelineLlamada {
             }
             return { ok: false, mensaje: "No pude registrar la cita. Por favor intenta con otro horario." };
           }
+          // 201 ok: la cita quedó agendada. Recién aquí confirmamos al cliente.
           return { ok: true, citaId: data.citaId, mensaje: `Tu cita quedó registrada para ${args.fechaInicio.replace("T", " a las ")}. ¿Hay algo más en lo que te pueda ayudar?` };
         }
 
