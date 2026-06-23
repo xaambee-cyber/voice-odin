@@ -556,6 +556,7 @@ INSTRUCCIONES PARA CITAS:
 1. AGENDAR: El cliente debe confirmar servicio + fecha + hora EXACTA antes de que llames a agendar_cita.
    - Si el sistema responde que el horario está ocupado, informa los horarios disponibles y pregunta cuál prefiere.
    - Solo agenda dentro del horario de atención: ${horariosTexto || "No especificado"}
+   - INTERPRETACIÓN AM/PM: por teléfono la gente dice la hora en formato de 12h sin "am/pm". Interpreta SIEMPRE la hora que cae dentro del horario de atención. Ej.: si atiendes de 9 a 6 y el cliente dice "a las 3", es 15:00 (3 de la tarde), NO 03:00. Si la hora cabe en ambos turnos y es ambigua, pregunta "¿a las [hora] de la mañana o de la tarde?" antes de agendar. A agendar_cita la hora va SIEMPRE en formato 24h (THH:MM); cuando le confirmes la hora al cliente, dila con "de la mañana/tarde/noche" para que no haya confusión.
    - Usa la fecha y hora actual para calcular fechas relativas ("mañana", "el martes")
    - DATOS ADICIONALES DEL SERVICIO: algunos servicios de tu lista tienen una línea "Datos a recolectar antes de agendar". Si el servicio elegido la tiene:
      · ANTES de llamar a agendar_cita, recolecta conversando TODOS los campos marcados OBLIGATORIO. Pregunta de forma natural usando la etiqueta del campo (ej. para "Dirección de recolección" pregunta "¿En qué dirección recogemos?"). NUNCA digas el ID ni la palabra "campo".

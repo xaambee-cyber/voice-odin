@@ -1,10 +1,16 @@
 import WebSocket from "ws";
+interface CampoAgenda {
+    id: string;
+    label: string;
+    requerido: boolean;
+}
 interface Servicio {
     id: string;
     nombre: string;
     duracionMinutos: number;
     precio: number;
     descripcion?: string;
+    camposAgenda?: CampoAgenda[];
 }
 interface HorarioDetallado {
     diaSemana: number;
@@ -24,7 +30,7 @@ interface HabilidadesActivas {
     solicitud_reserva?: boolean;
 }
 interface MetodoPagoNegocio {
-    tipo: "transferencia" | "paypal" | "mercadopago" | "otro";
+    tipo: "transferencia" | "deposito" | "paypal" | "mercadopago" | "otro";
     datos: string;
     modalidad: "completo" | "anticipo";
     porcentajeAnticipo?: number;
@@ -47,6 +53,7 @@ interface ItemCatalogo {
     capacidad?: number | null;
     unidad?: string | null;
     direccion?: string | null;
+    preciosPorDia?: Record<string, number> | null;
 }
 export interface ConfigNegocio {
     nombreAgente: string;
@@ -70,7 +77,11 @@ export interface ConfigNegocio {
     habilidadesActivas?: HabilidadesActivas;
     verificarDisponibilidadReserva?: boolean;
     metodoPago?: MetodoPagoNegocio | null;
+    metodosPago?: MetodoPagoNegocio[];
     receptoresEscalamiento?: ReceptorEscalamiento[];
+    saludoInicial?: string;
+    temasTransferencia?: string[];
+    ubicacionUrl?: string;
 }
 export declare class PipelineLlamada {
     private ws;

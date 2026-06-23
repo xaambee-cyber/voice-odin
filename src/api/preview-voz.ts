@@ -25,7 +25,7 @@ export async function previewVoz(req: Request, res: Response) {
     let wav = cache.get(voz);
     if (!wav) {
       const mulaw = await generarPreview(voz);
-      wav = construirWAV(mulaw);
+      wav = construirWAV(decodificarMulaw(mulaw));
       cache.set(voz, wav);
       console.log(`[PREVIEW] Generado y cacheado preview de "${voz}" (${wav.length} bytes)`);
     } else {
@@ -127,11 +127,31 @@ function generarPreview(voz: string): Promise<Buffer> {
   });
 }
 
-// Envuelve audio mu-law (G.711) crudo en un contenedor WAV que cualquier
-// navegador moderno reproduce nativamente. 8kHz mono — calidad telefónica
-// (es exactamente lo que el cliente escucha en la llamada real).
-function construirWAV(mulawData: Buffer): Buffer {
-  const dataSize = mulawData.length;
+// Decodifica audio mu-law (G.711) a PCM lineal de 16 bits. El WAV mu-law
+// (audioFormat 7) NO lo reproducen muchos navegadores móviles (Safari iOS,
+// Chrome Android), que es justo donde el dueño prueba la voz — por eso "no se
+// podían probar". PCM16 (audioFormat 1) lo decodifica cualquier navegador.
+function decodificarMulaw(mulawData: Buffer): Buffer {
+  const BIAS = 0x84;
+  const pcm = Buffer.alloc(mulawData.length * 2);
+  for (let i = 0; i < mulawData.length; i++) {
+    let u = ~mulawData[i] & 0xff;
+    const sign = u & 0x80;
+    const exponent = (u >> 4) & 0x07;
+    const mantissa = u & 0x0f;
+    let sample = ((mantissa << 3) + BIAS) << exponent;
+    sample -= BIAS;
+    if (sign !== 0) sample = -sample;
+    pcm.writeInt16LE(sample, i * 2);
+  }
+  return pcm;
+}
+
+// Envuelve PCM lineal de 16 bits en un contenedor WAV que cualquier navegador
+// moderno reproduce nativamente. 8kHz mono — la misma fuente telefónica, ya
+// convertida a un formato universalmente soportado.
+function construirWAV(pcmData: Buffer): Buffer {
+  const dataSize = pcmData.length;
   const header = Buffer.alloc(44);
 
   let o = 0;
@@ -140,14 +160,14 @@ function construirWAV(mulawData: Buffer): Buffer {
   header.write("WAVE", o); o += 4;
   header.write("fmt ", o); o += 4;
   header.writeUInt32LE(16, o); o += 4;       // fmt chunk size
-  header.writeUInt16LE(7, o);  o += 2;       // audioFormat: 7 = mu-law
+  header.writeUInt16LE(1, o);  o += 2;       // audioFormat: 1 = PCM
   header.writeUInt16LE(1, o);  o += 2;       // channels: mono
   header.writeUInt32LE(8000, o); o += 4;     // sampleRate: 8 kHz
-  header.writeUInt32LE(8000, o); o += 4;     // byteRate
-  header.writeUInt16LE(1, o);  o += 2;       // blockAlign
-  header.writeUInt16LE(8, o);  o += 2;       // bitsPerSample
+  header.writeUInt32LE(16000, o); o += 4;    // byteRate = sampleRate * blockAlign
+  header.writeUInt16LE(2, o);  o += 2;       // blockAlign = channels * bytesPerSample
+  header.writeUInt16LE(16, o); o += 2;       // bitsPerSample
   header.write("data", o); o += 4;
   header.writeUInt32LE(dataSize, o);
 
-  return Buffer.concat([header, mulawData]);
+  return Buffer.concat([header, pcmData]);
 }

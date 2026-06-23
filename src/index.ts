@@ -18,7 +18,7 @@ function originPermitido(origin: string | undefined): boolean {
   if (!origin) return false;
   try {
     const host = new URL(origin).hostname.toLowerCase();
-    return host.endsWith(".vercel.app") || host === "xambee.com" || host === "www.xambee.com";
+    return host.endsWith(".vercel.app") || host === "xambee.com" || host.endsWith(".xambee.com");
   } catch {
     return false;
   }

@@ -19,12 +19,17 @@ function construirHerramientas(cfg) {
         herramientas.push({
             type: "function",
             name: "agendar_cita",
-            description: "Agenda una nueva cita para el cliente. Llama esta función solo cuando el cliente haya confirmado el servicio, la fecha y la hora exacta.",
+            description: "Agenda una nueva cita para el cliente. Llama esta función solo cuando el cliente haya confirmado el servicio, la fecha y la hora exacta. Si el servicio elegido tiene CAMPOS ADICIONALES (los verás en tu lista de servicios), antes de llamar a esta función debes haber recolectado al menos todos los campos obligatorios y pasarlos en camposAgenda.",
             parameters: {
                 type: "object",
                 properties: {
                     servicioId: { type: "string", description: "ID exacto del servicio (usa los que aparecen en tu lista de servicios)" },
                     fechaInicio: { type: "string", description: "Fecha y hora de inicio en formato ISO: YYYY-MM-DDTHH:MM:00" },
+                    camposAgenda: {
+                        type: "object",
+                        description: "Datos adicionales que pide el servicio elegido. Las LLAVES deben ser los IDs de campo (ej. \"c1\", \"c2\"), NUNCA las etiquetas largas; los valores son lo que dijo el cliente. Inclúyelo SOLO si el servicio tiene campos adicionales; OMÍTELO por completo si el servicio no tiene ninguno.",
+                        additionalProperties: { type: "string" },
+                    },
                 },
                 required: ["servicioId", "fechaInicio"],
             },
@@ -162,6 +167,26 @@ function construirHerramientas(cfg) {
             required: ["despedida"],
         },
     });
+    // Enviar ubicación por WhatsApp — solo si el negocio tiene Maps/dirección.
+    // En una llamada no se puede "pasar" un link, así que lo mandamos al WhatsApp
+    // del cliente.
+    if (cfg.ubicacionUrl || cfg.direccion) {
+        herramientas.push({
+            type: "function",
+            name: "enviar_ubicacion",
+            description: "Envía la ubicación (link de Google Maps / dirección) al WhatsApp del cliente. Úsalo cuando el cliente pida la ubicación o cómo llegar. Avísale que se la mandas por WhatsApp al número desde el que llama.",
+            parameters: {
+                type: "object",
+                properties: {
+                    itemNombre: {
+                        type: "string",
+                        description: "Nombre de la terraza/sucursal específica si el cliente preguntó por una con dirección propia. Opcional.",
+                    },
+                },
+                required: [],
+            },
+        });
+    }
     console.log(`[PIPELINE] Herramientas cargadas: ${herramientas.map((h) => h.name).join(", ") || "(ninguna)"}`);
     return herramientas;
 }
@@ -178,6 +203,26 @@ function buildSystemPrompt(cfg, contextoExtra) {
     const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
     const verificarDispReserva = cfg.verificarDisponibilidadReserva === true && solicitudReservaActiva;
     const metodoPago = cfg.metodoPago || null;
+    // Lista completa de métodos. Si vienen, las usamos; si no, fallback al
+    // único método legacy.
+    const metodosPagoLista = cfg.metodosPago && cfg.metodosPago.length > 0
+        ? cfg.metodosPago
+        : (metodoPago ? [metodoPago] : []);
+    const TIPO_LABEL_PAGO_VOZ = {
+        transferencia: "transferencia bancaria",
+        deposito: "depósito en efectivo",
+        paypal: "PayPal",
+        mercadopago: "Mercado Pago",
+        otro: "otro método",
+    };
+    const metodosPagoTextoVoz = metodosPagoLista.length > 0
+        ? metodosPagoLista.map((m, i) => `${i + 1}. ${TIPO_LABEL_PAGO_VOZ[m.tipo] || m.tipo}: ${m.datos}${m.instrucciones ? ` (${m.instrucciones})` : ""}`).join("\n")
+        : null;
+    const modalidadPagoTextoVoz = metodoPago
+        ? (metodoPago.modalidad === "anticipo"
+            ? `anticipo del ${metodoPago.porcentajeAnticipo || 50}%`
+            : "pago completo")
+        : null;
     // Catálogo adaptado al vertical: muestra el inventario con la etiqueta
     // correcta para que el agente hable con naturalidad ("habitaciones" vs
     // "servicios" vs "platillos"). Es aditivo al prompt original.
@@ -187,13 +232,27 @@ function buildSystemPrompt(cfg, contextoExtra) {
     const itemsPlatillos = catalogo.filter((i) => i.tipo === "platillo");
     const itemsProductos = catalogo.filter((i) => i.tipo === "producto");
     const formatearMoneda = (n) => `$${n.toLocaleString("es-MX")} MXN`;
+    // Anota precios por día de la semana si difieren del base. El agente lo
+    // dice tal cual cuando el cliente pregunta el costo de fechas específicas.
+    const DIAS_CORTOS = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+    const formatearPreciosPorDia = (precios, base) => {
+        if (!precios || typeof precios !== "object")
+            return "";
+        const parts = [];
+        for (let i = 0; i < 7; i++) {
+            const p = Number(precios[String(i)]);
+            if (Number.isFinite(p) && p > 0)
+                parts.push(`${DIAS_CORTOS[i]} ${formatearMoneda(p)}`);
+        }
+        return parts.length > 0 ? ` — Precios por día: ${parts.join(", ")} (días sin valor cobran el precio base)` : "";
+    };
     const habitacionesTexto = vertical === "hospedaje" && itemsHospedaje.length > 0
-        ? itemsHospedaje.map((h) => `- ${h.nombre}${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}`).join("\n")
+        ? itemsHospedaje.map((h) => `- ${h.nombre}${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}${formatearPreciosPorDia(h.preciosPorDia, h.precio)}`).join("\n")
         : null;
     // Cuando se verifica disponibilidad, el modelo necesita el ID de cada unidad
     // para pasarlo a solicitar_reserva. Esta variante incluye [ID:...].
     const habitacionesConId = itemsHospedaje.length > 0
-        ? itemsHospedaje.map((h) => `- ${h.nombre} [ID:${h.id}]${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}`).join("\n")
+        ? itemsHospedaje.map((h) => `- ${h.nombre} [ID:${h.id}]${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}${formatearPreciosPorDia(h.preciosPorDia, h.precio)}`).join("\n")
         : null;
     const menuTexto = vertical === "restaurante" && itemsPlatillos.length > 0
         ? itemsPlatillos.map((p) => `- ${p.nombre} — ${formatearMoneda(p.precio)}${p.descripcion ? ` (${p.descripcion})` : ""}`).join("\n")
@@ -201,8 +260,18 @@ function buildSystemPrompt(cfg, contextoExtra) {
     const productosTexto = vertical === "tienda" && itemsProductos.length > 0
         ? itemsProductos.map((p) => `- ${p.nombre} — ${formatearMoneda(p.precio)}${p.descripcion ? ` (${p.descripcion})` : ""}`).join("\n")
         : null;
+    // Línea de campos adicionales de un servicio. Vacía si el servicio no pide
+    // nada extra (se agenda como siempre). El [campo:ID] es el dato que va como
+    // llave en camposAgenda — el cliente NUNCA debe escuchar el ID ni la palabra
+    // "campo": el agente pregunta usando la etiqueta de forma natural.
+    const formatearCamposAgenda = (campos) => {
+        if (!campos || campos.length === 0)
+            return "";
+        const parts = campos.map((c) => `${c.label} [campo:${c.id}, ${c.requerido ? "OBLIGATORIO" : "opcional"}]`);
+        return `\n    Datos a recolectar antes de agendar: ${parts.join("; ")}`;
+    };
     const serviciosTexto = cfg.servicios && cfg.servicios.length > 0
-        ? cfg.servicios.map((s) => `- ${s.nombre} [ID:${s.id}]${s.duracionMinutos ? ` — ${s.duracionMinutos} min` : ""}${s.precio ? ` — $${s.precio.toLocaleString("es-MX")} MXN` : ""}${s.descripcion ? ` (${s.descripcion})` : ""}`).join("\n")
+        ? cfg.servicios.map((s) => `- ${s.nombre} [ID:${s.id}]${s.duracionMinutos ? ` — ${s.duracionMinutos} min` : ""}${s.precio ? ` — $${s.precio.toLocaleString("es-MX")} MXN` : ""}${s.descripcion ? ` (${s.descripcion})` : ""}${formatearCamposAgenda(s.camposAgenda)}`).join("\n")
         : null;
     const horariosTexto = cfg.horarioDetallado && cfg.horarioDetallado.length > 0
         ? cfg.horarioDetallado.map((h) => `${DIAS_ES[h.diaSemana]}: ${h.horaInicio}–${h.horaFin}`).join(", ")
@@ -245,6 +314,9 @@ El cliente marcó al número de "${r.etiqueta}" y la llamada se desvió hacia ti
     const receptoresTexto = receptores.length > 0
         ? receptores.map((r) => `- ${r.etiqueta}${r.canal === "whatsapp" ? " (solo por WhatsApp)" : " (por llamada)"}`).join("\n")
         : null;
+    // Temas que disparan transferencia INMEDIATA a humano (ej. servicio urgente).
+    const temas = (cfg.temasTransferencia || []).filter((t) => typeof t === "string" && t.trim());
+    const temasTexto = temas.length > 0 ? temas.map((t) => `- "${t}"`).join("\n") : null;
     return `Eres ${cfg.nombreAgente} de ${cfg.nombreNegocio} (${cfg.tipoNegocio}).
 ${cfg.personalidad}.${cfg.tonoAdicional ? ` ${cfg.tonoAdicional}` : ""}
 
@@ -253,6 +325,10 @@ FORMATO OBLIGATORIO — ESTÁS EN UNA LLAMADA TELEFÓNICA:
 - ABSOLUTAMENTE PROHIBIDO: asteriscos, guiones de lista, negritas (**texto**), numeración (1. 2. 3.), markdown de cualquier tipo.
 - Si tienes varios servicios, dícelos como en una conversación: "tenemos limpieza, radiografía y valoración" — no en lista.
 - Máximo 2 oraciones por respuesta. Directo y natural.
+${cfg.saludoInicial && cfg.saludoInicial.trim() ? `
+SALUDO INICIAL OBLIGATORIO:
+Tu PRIMER mensaje de la llamada debe transmitir esto (dilo natural, hablado, sin leerlo robótico): "${cfg.saludoInicial.trim()}"
+` : ""}
 
 FECHA Y HORA ACTUAL: ${ahoraStr}
 ${bloqueContextoLlamada}
@@ -267,7 +343,9 @@ ${serviciosTexto ? `\nCATÁLOGO DE SERVICIOS Y PRODUCTOS:\n${serviciosTexto}` : 
 ${habitacionesTexto ? `\nLUGARES Y HABITACIONES DISPONIBLES:\n${verificarDispReserva && habitacionesConId ? habitacionesConId : habitacionesTexto}\n(Refiérete a cada uno por su NOMBRE; no digas "servicios" ni asumas que todo es "habitación" — puede ser terraza, salón o cabaña. Para reservar usa la función solicitar_reserva — el agente NO confirma disponibilidad, solo recolecta y manda la solicitud.${verificarDispReserva ? " Los [ID:...] son internos: NUNCA los digas en voz alta." : ""})` : ""}
 ${menuTexto ? `\nMENÚ:\n${menuTexto}\n(Cuando hables del menú di "platillos" o el nombre de cada uno, no "servicios".)` : ""}
 ${productosTexto ? `\nPRODUCTOS:\n${productosTexto}` : ""}
+${metodosPagoTextoVoz ? `\nMÉTODOS DE PAGO QUE ACEPTA EL NEGOCIO (${modalidadPagoTextoVoz}):\n${metodosPagoTextoVoz}\n(Si te preguntan qué formas de pago aceptan ANTES de reservar, di los TIPOS hablados naturalmente — ej. "aceptamos transferencia bancaria y PayPal". NO dictes números de cuenta, CLABE ni links en voz: dile al cliente que te los envías por WhatsApp. La modalidad aplica a todos los métodos.)` : ""}
 
+${(cfg.ubicacionUrl || cfg.direccion) ? `\nUBICACIÓN:\nSi el cliente pide la ubicación, dirección o cómo llegar, usa la función enviar_ubicacion para mandársela por WhatsApp al número desde el que llama. NO dictes el link de Google Maps por voz (no sirve hablado). Dile algo como "te la mando por WhatsApp ahorita".\n` : ""}
 FUNCIONES HABILITADAS (solo puedes hacer esto):
 ${habilidadesTexto}
 
@@ -307,7 +385,14 @@ INSTRUCCIONES PARA CITAS:
 1. AGENDAR: El cliente debe confirmar servicio + fecha + hora EXACTA antes de que llames a agendar_cita.
    - Si el sistema responde que el horario está ocupado, informa los horarios disponibles y pregunta cuál prefiere.
    - Solo agenda dentro del horario de atención: ${horariosTexto || "No especificado"}
+   - INTERPRETACIÓN AM/PM: por teléfono la gente dice la hora en formato de 12h sin "am/pm". Interpreta SIEMPRE la hora que cae dentro del horario de atención. Ej.: si atiendes de 9 a 6 y el cliente dice "a las 3", es 15:00 (3 de la tarde), NO 03:00. Si la hora cabe en ambos turnos y es ambigua, pregunta "¿a las [hora] de la mañana o de la tarde?" antes de agendar. A agendar_cita la hora va SIEMPRE en formato 24h (THH:MM); cuando le confirmes la hora al cliente, dila con "de la mañana/tarde/noche" para que no haya confusión.
    - Usa la fecha y hora actual para calcular fechas relativas ("mañana", "el martes")
+   - DATOS ADICIONALES DEL SERVICIO: algunos servicios de tu lista tienen una línea "Datos a recolectar antes de agendar". Si el servicio elegido la tiene:
+     · ANTES de llamar a agendar_cita, recolecta conversando TODOS los campos marcados OBLIGATORIO. Pregunta de forma natural usando la etiqueta del campo (ej. para "Dirección de recolección" pregunta "¿En qué dirección recogemos?"). NUNCA digas el ID ni la palabra "campo".
+     · Los campos "opcional" pregúntalos solo si fluye natural; si el cliente no los da, omítelos sin insistir.
+     · Pasa lo recolectado en el parámetro camposAgenda usando como LLAVE el ID entre [campo:...] (ej. "c1"), nunca la etiqueta. Omite los campos opcionales que el cliente no haya dado.
+     · Si el servicio NO tiene esa línea, agenda igual que siempre: NO mandes camposAgenda.
+   - REGLA DE ORO: NUNCA confirmes la cita al cliente hasta que agendar_cita responda con éxito. Si la función te dice que faltan datos, pídeselos al cliente exactamente y vuelve a llamar a agendar_cita; no des la cita por hecha mientras falten.
 
 2. CANCELAR: Confirma explícitamente con el cliente antes de llamar a cancelar_cita. El cliente debe pedir cancelar de forma clara y directa. Si hay ambigüedad, pregunta: "¿Quieres cancelar tu cita?"
 
@@ -327,6 +412,11 @@ Situaciones que ACTIVAN escalar_humano:
 1. tipo="directo": El cliente pide explícitamente hablar con una persona, el dueño, un humano, el gerente, o atención personal.
 2. tipo="emergencia": Detectas urgencia médica, amenaza, agresión sostenida, demanda legal, o falla crítica de un servicio ya contratado.
 3. tipo="no_sabe": El cliente insiste en algo que ya registraste como pregunta sin respuesta y la situación requiere atención inmediata.
+${temasTexto ? `
+TRANSFERENCIA INMEDIATA POR TEMA — MÁXIMA PRIORIDAD:
+Si el cliente menciona cualquiera de estos temas/situaciones, NO intentes resolverlo, NO pidas datos, NO ofrezcas reservar: llama a escalar_humano (tipo="directo") DE INMEDIATO y dile que lo comunicas con una persona ahora mismo.
+${temasTexto}
+` : ""}
 ${receptoresTexto ? `
 SUCURSALES O PERSONAS A LAS QUE PUEDES ESCALAR:
 ${receptoresTexto}
@@ -354,7 +444,8 @@ ${metodoPago ? `4. Como es una llamada y los datos de pago (números de cuenta, 
 REGLAS:
 - NUNCA inventes disponibilidad, precios${metodoPago ? " ni datos de pago" : ""}. Eso lo da la función.
 - NUNCA digas que la reserva ya quedó confirmada. Solo el equipo confirma.
-- NUNCA digas los [ID:...] en voz alta — son internos.${metodoPago ? `
+- NUNCA digas los [ID:...] en voz alta — son internos.
+- PRECIOS POR DÍA: si una unidad tiene "Precios por día" anotados arriba (Lun, Vie, Sáb, etc.), úsalos cuando el cliente pregunte el costo de un día específico ("¿cuánto cuesta el viernes?"). Días sin valor anotado cobran el PRECIO BASE. Si te piden el total de varios días, suma día por día con su precio correspondiente. El backend hace ese cálculo cuando llamas a solicitar_reserva, así que tu trabajo es solo informarlo bien si te lo preguntan ANTES de reservar.${metodoPago ? `
 - NO asumas que el cliente ya pagó. Un "gracias", "ok", "va", "perfecto", "ahí va", un silencio o un ruido NO son confirmación de pago. Si dudas, deja pagoReportado en false y pregunta: "¿Ya realizaste el pago?".
 - Después de dar los datos de pago, NO vuelvas a llamar a solicitar_reserva hasta que el cliente diga claramente que ya pagó.` : ""}
 ` : ""}
@@ -415,27 +506,48 @@ async function fetchConfigConRetry(url, timeoutMs = 10000) {
 // para que WhatsApp y voz suenen idénticos. Usa "por ciento" en vez de "%"
 // y "pesos" para que el TTS lo lea bien.
 function mensajeDatosPagoVoz(mp, info) {
-    const via = mp.tipo === "transferencia" ? "transferencia"
-        : mp.tipo === "paypal" ? "PayPal"
-            : mp.tipo === "mercadopago" ? "Mercado Pago"
-                : "el método indicado";
-    const extra = mp.instrucciones ? ` ${mp.instrucciones}` : "";
-    // Defensa: si las noches no vienen (o vienen inválidas) NO decimos "undefined
-    // noches"; simplemente omitimos esa parte. El total sigue siendo correcto.
-    const noches = info && typeof info.noches === "number" && isFinite(info.noches) && info.noches > 0
-        ? info.noches : null;
-    const porNoches = noches ? ` por ${noches} ${noches === 1 ? "noche" : "noches"}` : "";
-    if (mp.modalidad === "anticipo") {
-        const pct = mp.porcentajeAnticipo || 30;
-        if (info) {
-            return `Sí tenemos disponibilidad. El total son ${info.precioTotal.toLocaleString("es-MX")} pesos${porNoches}. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento, que son ${info.montoPago.toLocaleString("es-MX")} pesos, por ${via}: ${mp.datos}.${extra} Avísame cuando hayas hecho el pago para confirmarlo con el equipo.`;
-        }
-        return `Sí tenemos disponibilidad. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento por ${via}: ${mp.datos}.${extra} Avísame cuando hayas hecho el pago para confirmarlo con el equipo.`;
+    const lista = Array.isArray(mp) ? mp : [mp];
+    if (lista.length === 0)
+        return "";
+    const primero = lista[0];
+    const cantidad = info?.dias ?? info?.noches ?? 0;
+    const cantidadValida = typeof cantidad === "number" && isFinite(cantidad) && cantidad > 0 ? cantidad : null;
+    const palabraUnidad = (() => {
+        const u = (info?.unidad || "").toLowerCase();
+        if (u.includes("noche"))
+            return cantidadValida === 1 ? "noche" : "noches";
+        if (u.includes("hora"))
+            return cantidadValida === 1 ? "hora" : "horas";
+        return cantidadValida === 1 ? "día" : "días";
+    })();
+    const porDias = cantidadValida ? ` por ${cantidadValida} ${palabraUnidad}` : "";
+    const viaDe = (m) => m.tipo === "transferencia" ? "transferencia"
+        : m.tipo === "deposito" ? "depósito"
+            : m.tipo === "paypal" ? "PayPal"
+                : m.tipo === "mercadopago" ? "Mercado Pago"
+                    : "otro método";
+    // Encabezado con monto (igual que antes pero sin método específico).
+    let encabezado = "";
+    if (primero.modalidad === "anticipo") {
+        const pct = primero.porcentajeAnticipo || 30;
+        encabezado = info
+            ? `Sí tenemos disponibilidad. El total son ${info.precioTotal.toLocaleString("es-MX")} pesos${porDias}. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento, que son ${info.montoPago.toLocaleString("es-MX")} pesos.`
+            : `Sí tenemos disponibilidad. Para apartar tu reserva necesitas un anticipo del ${pct} por ciento.`;
     }
-    if (info) {
-        return `Sí tenemos disponibilidad. El total son ${info.montoPago.toLocaleString("es-MX")} pesos${porNoches}. Para apartar tu reserva realiza el pago por ${via}: ${mp.datos}.${extra} Avísame cuando hayas pagado para confirmarlo con el equipo.`;
+    else {
+        encabezado = info
+            ? `Sí tenemos disponibilidad. El total son ${info.montoPago.toLocaleString("es-MX")} pesos${porDias}.`
+            : `Sí tenemos disponibilidad.`;
     }
-    return `Sí tenemos disponibilidad. Para apartar tu reserva realiza el pago por ${via}: ${mp.datos}.${extra} Avísame cuando hayas pagado para confirmarlo con el equipo.`;
+    if (lista.length === 1) {
+        const m = lista[0];
+        const via = viaDe(m);
+        const extra = m.instrucciones ? ` ${m.instrucciones}` : "";
+        return `${encabezado} Puedes pagarlo por ${via}: ${m.datos}.${extra} Te paso los datos por WhatsApp. Avísame cuando hayas pagado para confirmarlo con el equipo.`;
+    }
+    // Varios métodos: enumerar como opciones (en voz, sin números de cuenta).
+    const opciones = lista.map(viaDe).join(", o ");
+    return `${encabezado} Aceptamos varias formas de pago: ${opciones}. Te paso los datos completos por WhatsApp para que elijas la que prefieras. Avísame cuando hayas pagado para confirmarlo con el equipo.`;
 }
 // Normaliza un número telefónico para comparación (solo dígitos, sin +).
 function digitosDe(s) {
@@ -502,12 +614,19 @@ class PipelineLlamada {
                 console.log(`[PIPELINE] Sucursal de origen detectada: ${match.etiqueta} (${match.numero})`);
             }
         }
-        if (this.callerNumber) {
-            const rebote = receptores.find((r) => mismoNumero(r.numero, this.callerNumber));
-            if (rebote) {
-                this.esRebote = true;
-                console.log(`[PIPELINE] Llamada detectada como REBOTE desde ${rebote.etiqueta} (${rebote.numero}) — el humano no contestó`);
-            }
+        // Anti-rebote: cuando hacemos <Dial> al humano usamos callerId=numeroTwilio.
+        // Si ese humano tiene desvío condicional al Twilio y NO contesta, la llamada
+        // rebota: entra una NUEVA llamada al Twilio cuyo `From` es el propio Twilio
+        // number (porque el callerId del Dial era el Twilio). Esa es la firma
+        // inequívoca del rebote. ForwardedFrom adicional confirma que vino por
+        // desvío desde un receptor de la lista.
+        if (this.callerNumber &&
+            this.numeroTwilio &&
+            mismoNumero(this.callerNumber, this.numeroTwilio) &&
+            this.forwardedFrom) {
+            this.esRebote = true;
+            const r = this.receptorOrigen;
+            console.log(`[PIPELINE] Llamada detectada como REBOTE${r ? ` desde ${r.etiqueta} (${r.numero})` : ` (forwardedFrom=${this.forwardedFrom})`} — el humano no contestó al Dial`);
         }
     }
     esTranscripcionValida(texto) {
@@ -568,20 +687,45 @@ class PipelineLlamada {
         try {
             switch (nombre) {
                 case "agendar_cita": {
+                    const body = {
+                        negocioId,
+                        servicioId: args.servicioId,
+                        fechaInicio: args.fechaInicio,
+                        clienteNombre: "Llamada entrante",
+                        clienteTelefono: callerNumber || "desconocido",
+                    };
+                    // Campos personalizados del servicio: solo los mandamos si el modelo
+                    // recolectó al menos uno. La llave es el id del campo (c1, c2…),
+                    // nunca la etiqueta. Servicios sin camposAgenda → no mandamos la
+                    // llave y el backend se comporta como siempre.
+                    if (args.camposAgenda &&
+                        typeof args.camposAgenda === "object" &&
+                        !Array.isArray(args.camposAgenda)) {
+                        const entradas = Object.entries(args.camposAgenda).filter(([, v]) => v != null && String(v).trim().length > 0);
+                        if (entradas.length > 0) {
+                            body.camposAgenda = Object.fromEntries(entradas.map(([k, v]) => [k, String(v)]));
+                        }
+                    }
                     const resp = await fetch(`${odinUrl}/api/voice/citas`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json", ...odinAuth() },
-                        body: JSON.stringify({
-                            negocioId,
-                            servicioId: args.servicioId,
-                            fechaInicio: args.fechaInicio,
-                            clienteNombre: "Llamada entrante",
-                            clienteTelefono: callerNumber || "desconocido",
-                        }),
+                        body: JSON.stringify(body),
                         signal: AbortSignal.timeout(8000),
                     });
-                    const data = await resp.json();
+                    const data = (await resp.json().catch(() => ({})));
                     if (!resp.ok) {
+                        // 400 FALTAN_CAMPOS: faltó un dato obligatorio del servicio. El
+                        // backend manda las ETIQUETAS de lo que falta en `faltantes`. Se
+                        // las pedimos al cliente y el modelo reintentará agendar_cita.
+                        if (data.error === "FALTAN_CAMPOS" &&
+                            Array.isArray(data.faltantes) &&
+                            data.faltantes.length > 0) {
+                            return {
+                                ok: false,
+                                mensaje: `Antes de agendar necesito un par de datos más: ${data.faltantes.join(", ")}. ¿Me los puedes dar?`,
+                            };
+                        }
+                        // 409 Horario ocupado: ofrecer los horarios disponibles.
                         if (data.slotsDisponibles) {
                             return {
                                 ok: false,
@@ -590,6 +734,7 @@ class PipelineLlamada {
                         }
                         return { ok: false, mensaje: "No pude registrar la cita. Por favor intenta con otro horario." };
                     }
+                    // 201 ok: la cita quedó agendada. Recién aquí confirmamos al cliente.
                     return { ok: true, citaId: data.citaId, mensaje: `Tu cita quedó registrada para ${args.fechaInicio.replace("T", " a las ")}. ¿Hay algo más en lo que te pueda ayudar?` };
                 }
                 case "cancelar_cita": {
@@ -660,7 +805,10 @@ class PipelineLlamada {
                         return { ok: false, mensaje: "No pude procesar tu reserva. Por favor intenta más tarde." };
                     }
                     // Hay disponibilidad pero falta el pago: dar los datos al cliente.
-                    if (data.esperandoPago && data.metodoPago) {
+                    const metodosListados = data.metodosPago && data.metodosPago.length > 0
+                        ? data.metodosPago
+                        : (data.metodoPago ? [data.metodoPago] : []);
+                    if (data.esperandoPago && metodosListados.length > 0) {
                         // Si Odin no mandó las noches (bug conocido: llega undefined), las
                         // calculamos desde las fechas para no perder ese dato en la voz.
                         let pagoInfo = data.pagoInfo;
@@ -671,7 +819,7 @@ class PipelineLlamada {
                             if (Number.isFinite(n) && n > 0)
                                 pagoInfo = { ...pagoInfo, noches: n };
                         }
-                        return { ok: true, mensaje: mensajeDatosPagoVoz(data.metodoPago, pagoInfo) };
+                        return { ok: true, mensaje: mensajeDatosPagoVoz(metodosListados, pagoInfo) };
                     }
                     // El cliente ya reportó el pago: el backend avisó al equipo.
                     if (pagoReportado) {
@@ -683,6 +831,33 @@ class PipelineLlamada {
                     }
                     // Legacy (verificar disponibilidad apagado): solo se mandó al admin.
                     return { ok: true, mensaje: "Listo, tu solicitud quedó registrada. El negocio te confirmará en breve por WhatsApp. ¿Hay algo más?" };
+                }
+                case "enviar_ubicacion": {
+                    if (!callerNumber) {
+                        return { ok: false, mensaje: "No tengo tu número para mandártela por WhatsApp. ¿Me lo puedes dictar?" };
+                    }
+                    // Si preguntó por una terraza/sucursal puntual, resolvemos su id para
+                    // mandar la dirección específica de ese ítem.
+                    let servicioId;
+                    const catalogo = this.configNegocio.catalogo;
+                    if (args.itemNombre && Array.isArray(catalogo)) {
+                        const item = catalogo.find((it) => it.nombre && it.nombre.toLowerCase().includes(String(args.itemNombre).toLowerCase()));
+                        if (item && item.id)
+                            servicioId = item.id;
+                    }
+                    try {
+                        const respUbic = await fetch(`${odinUrl}/api/voice/enviar-ubicacion`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json", ...odinAuth() },
+                            body: JSON.stringify({ negocioId, numero: callerNumber, servicioId }),
+                            signal: AbortSignal.timeout(8000),
+                        });
+                        if (respUbic.ok) {
+                            return { ok: true, mensaje: "Listo, te acabo de mandar la ubicación por WhatsApp. ¿Algo más?" };
+                        }
+                    }
+                    catch (e) { /* cae al mensaje de abajo */ }
+                    return { ok: false, mensaje: "Tuve un problema al mandártela por WhatsApp, pero con gusto te ayudo con otra cosa." };
                 }
                 case "escalar_humano": {
                     // Anti-loop: si la llamada actual ya es un rebote (el humano ya no
