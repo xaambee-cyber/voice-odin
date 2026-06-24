@@ -42,6 +42,7 @@ interface HabilidadesActivas {
   agenda_citas: boolean;
   aprendizaje: boolean;
   solicitud_reserva?: boolean;
+  pedidos?: boolean;
 }
 
 // Método de pago que el negocio comunica al cliente para reservas con anticipo.
@@ -152,6 +153,7 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
   const agendaActiva = cfg.habilidadesActivas?.agenda_citas ?? cfg.habilidades.includes("agenda_citas");
   const escalamientoActivo = cfg.habilidadesActivas?.escalamiento ?? cfg.habilidades.includes("escalamiento");
   const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
+  const pedidosActiva = cfg.habilidadesActivas?.pedidos ?? cfg.habilidades.includes("pedidos");
 
   if (agendaActiva) {
     herramientas.push({
@@ -250,6 +252,35 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
         },
       });
     }
+  }
+
+  if (pedidosActiva) {
+    herramientas.push({
+      type: "function",
+      name: "crear_pedido",
+      description: "Registra un pedido de productos/platillos del catálogo. Llama esta función solo cuando el cliente confirmó qué quiere, las cantidades y si es a domicilio, para recoger o en mesa. Usa los IDs EXACTOS del catálogo. NO inventes productos ni precios: el sistema calcula el total.",
+      parameters: {
+        type: "object",
+        properties: {
+          items: {
+            type: "array",
+            description: "Lista de productos pedidos.",
+            items: {
+              type: "object",
+              properties: {
+                servicioId: { type: "string", description: "ID exacto del producto del catálogo" },
+                cantidad: { type: "number", description: "Cantidad pedida (entero >= 1)" },
+              },
+              required: ["servicioId", "cantidad"],
+            },
+          },
+          tipo: { type: "string", enum: ["domicilio", "recoger", "mesa"], description: "Modalidad de entrega" },
+          direccion: { type: "string", description: "Dirección de entrega (solo si es a domicilio)" },
+          notas: { type: "string", description: "Indicaciones especiales del cliente, si las hay" },
+        },
+        required: ["items", "tipo"],
+      },
+    });
   }
 
   if (escalamientoActivo) {
@@ -354,6 +385,7 @@ function buildSystemPrompt(
   const agendaActiva = cfg.habilidadesActivas?.agenda_citas ?? cfg.habilidades.includes("agenda_citas");
   const escalamientoActivo = cfg.habilidadesActivas?.escalamiento ?? cfg.habilidades.includes("escalamiento");
   const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
+  const pedidosActiva = cfg.habilidadesActivas?.pedidos ?? cfg.habilidades.includes("pedidos");
   const verificarDispReserva = cfg.verificarDisponibilidadReserva === true && solicitudReservaActiva;
   const metodoPago = cfg.metodoPago || null;
   // Lista completa de métodos. Si vienen, las usamos; si no, fallback al
@@ -1045,6 +1077,31 @@ export class PipelineLlamada {
           }
           // Legacy (verificar disponibilidad apagado): solo se mandó al admin.
           return { ok: true, mensaje: "Listo, tu solicitud quedó registrada. El negocio te confirmará en breve por WhatsApp. ¿Hay algo más?" };
+        }
+
+        case "crear_pedido": {
+          const items = Array.isArray(args.items)
+            ? args.items.map((x: any) => ({ servicioId: String(x?.servicioId || ""), cantidad: Number(x?.cantidad) || 1 }))
+            : [];
+          const resp = await fetch(`${odinUrl}/api/voice/pedidos`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...odinAuth() },
+            body: JSON.stringify({
+              negocioId,
+              items,
+              clienteNombre: "Llamada entrante",
+              clienteTelefono: callerNumber || "desconocido",
+              tipo: args.tipo,
+              direccion: args.direccion ?? null,
+              notas: args.notas ?? null,
+            }),
+            signal: AbortSignal.timeout(8000),
+          });
+          const data = (await resp.json().catch(() => ({}))) as { error?: string; total?: number; resumen?: string };
+          if (!resp.ok) {
+            return { ok: false, mensaje: "Tuve un problema registrando el pedido. ¿Me lo confirmas otra vez, por favor?" };
+          }
+          return { ok: true, mensaje: `Listo, registré tu pedido por un total de ${data.total} pesos. El negocio te lo confirma en seguida. ¿Algo más?` };
         }
 
         case "enviar_ubicacion": {

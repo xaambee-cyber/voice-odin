@@ -1,4 +1,5 @@
 import express from "express";
+import { timingSafeEqual } from "crypto";
 import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { config } from "./utils/config";
@@ -35,6 +36,23 @@ app.use((req, res, next) => {
   next();
 });
 
+// Guard de secreto compartido para endpoints internos (server-to-server).
+// Valida `Authorization: Bearer <VOICE_SERVER_SECRET>` con comparación de
+// tiempo constante. Si el secreto NO está configurado (dev local), no bloquea
+// para no romper el flujo de desarrollo. En prod VOICE_SERVER_SECRET es
+// obligatorio, así que sí protege.
+function requireSecret(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const secret = config.voiceServerSecret;
+  if (!secret) return next(); // dev sin secreto
+  const auth = req.headers.authorization || "";
+  const token = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  const a = Buffer.from(token);
+  const b = Buffer.from(secret);
+  const ok = a.length === b.length && timingSafeEqual(a, b);
+  if (!ok) return res.status(401).json({ error: "No autorizado" });
+  next();
+}
+
 // ═══ API REST ═══
 
 app.get("/", (req, res) => {
@@ -52,12 +70,14 @@ app.get("/twiml", handleIncomingCall);
 // Fallback si el WebSocket no conecta
 app.post("/twiml-fallback", handleFallback);
 
-// API para Odin
-app.post("/api/configurar", configurarNegocio);
-app.get("/api/estado/:negocioId", obtenerEstado);
-app.get("/api/negocios", listarNegocios);
+// API para Odin (server-to-server → requieren secreto compartido)
+app.post("/api/configurar", requireSecret, configurarNegocio);
+app.get("/api/estado/:negocioId", requireSecret, obtenerEstado);
+app.get("/api/negocios", requireSecret, listarNegocios);
+app.post("/api/set-voz", requireSecret, setVozHandler);
+// preview-voz lo llama el browser del panel (no puede portar el secreto);
+// se protege con allowlist de voces + cache (costo acotado).
 app.get("/api/preview-voz", previewVoz);
-app.post("/api/set-voz", setVozHandler);
 
 // ═══ WebSocket Server ═══
 
