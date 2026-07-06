@@ -584,11 +584,17 @@ SERVICIOS DISPONIBLES PARA CITAS (usa el ID exacto al agendar):
 ${serviciosTexto || "No hay servicios configurados"}
 ${citasClienteTexto ? `\nCITAS VIGENTES DEL CLIENTE:\n${citasClienteTexto}` : "\nEste cliente no tiene citas vigentes."}
 
+REGLAS AL HABLAR DE HORARIOS (obligatorias):
+- Di TODA hora en formato de 12 horas con am/pm: "3:00 p.m.", "11:30 a.m."; el mediodía es "12:00 p.m.". NUNCA digas la hora en formato de 24 horas ni la pongas entre paréntesis.
+- "El [día]" o "el próximo [día]" = la ocurrencia MÁS CERCANA de ese día. Si dudas, confirma repitiendo el día de la semana + el número antes de agendar (ej. "el martes 8, ¿correcto?").
+- NO inventes ni enlistes horarios: no sabes cuáles están ocupados. Si el cliente pregunta "¿qué horarios tienes?", pregúntale a qué hora le gustaría y valida esa hora agendando; el sistema te dirá si está libre o te dará las horas cercanas.
+- EN CUANTO el cliente diga una hora concreta, agéndala o reagéndala de inmediato; NO vuelvas a preguntar disponibilidad ni repitas la misma ventana (eso es un bucle).
+
 INSTRUCCIONES PARA CITAS:
 1. AGENDAR: El cliente debe confirmar servicio + fecha + hora EXACTA antes de que llames a agendar_cita.
-   - Si el sistema responde que el horario está ocupado, informa los horarios disponibles y pregunta cuál prefiere.
+   - Si el horario está ocupado (409), la función te devuelve un mensaje con SOLO las dos horas más cercanas en am/pm: ofréceselas tal cual ("te puedo a las 2:30 o a las 4, ¿cuál prefieres?"), máximo dos por frase. NUNCA recites listas de horarios. Solo si el cliente pide ver el panorama, menciona las ventanas libres como rangos ("tengo libre de 7 a 9 de la mañana"). Si la función no trae horas cercanas, pregúntale al cliente a qué otra hora le gustaría.
    - Solo agenda dentro del horario de atención: ${horariosTexto || "No especificado"}
-   - INTERPRETACIÓN AM/PM: por teléfono la gente dice la hora en formato de 12h sin "am/pm". Interpreta SIEMPRE la hora que cae dentro del horario de atención. Ej.: si atiendes de 9 a 6 y el cliente dice "a las 3", es 15:00 (3 de la tarde), NO 03:00. Si la hora cabe en ambos turnos y es ambigua, pregunta "¿a las [hora] de la mañana o de la tarde?" antes de agendar. A agendar_cita la hora va SIEMPRE en formato 24h (THH:MM); cuando le confirmes la hora al cliente, dila con "de la mañana/tarde/noche" para que no haya confusión.
+   - INTERPRETACIÓN AM/PM: por teléfono la gente dice la hora en formato de 12h sin "am/pm". Interpreta SIEMPRE la hora que cae dentro del horario de atención. Ej.: si atiendes de 9 a 6 y el cliente dice "a las 3", es 15:00 (3 de la tarde), NO 03:00. Si la hora cabe en ambos turnos y es ambigua, pregunta "¿a las [hora] de la mañana o de la tarde?" antes de agendar. IMPORTANTE: a la función agendar_cita la hora va SIEMPRE en formato 24h (THH:MM) — ese es un dato interno; pero cuando le HABLES al cliente, di la hora SIEMPRE en 12h con am/pm ("las 3:00 p.m."), nunca en 24h ni entre paréntesis.
    - Usa la fecha y hora actual para calcular fechas relativas ("mañana", "el martes")
    - DATOS ADICIONALES DEL SERVICIO: algunos servicios de tu lista tienen una línea "Datos a recolectar antes de agendar". Si el servicio elegido la tiene:
      · ANTES de llamar a agendar_cita, recolecta conversando TODOS los campos marcados OBLIGATORIO. Pregunta de forma natural usando la etiqueta del campo (ej. para "Dirección de recolección" pregunta "¿En qué dirección recogemos?"). NUNCA digas el ID ni la palabra "campo".
@@ -772,6 +778,79 @@ function mismoNumero(a: string, b: string): boolean {
   return da.slice(-10) === db.slice(-10);
 }
 
+// Convierte una hora en 24h ("15:00", "07:15") a 12h con am/pm en español
+// ("3:00 p.m.", "7:15 a.m."). Mediodía → "12:00 p.m.", medianoche → "12:00 a.m.".
+// Si el valor no es parseable lo regresa tal cual (defensivo: nunca truena).
+function hora24aAmPm(hhmm: string): string {
+  const m = /^(\d{1,2}):(\d{2})/.exec(String(hhmm ?? "").trim());
+  if (!m) return String(hhmm ?? "");
+  const h = Number(m[1]);
+  const min = m[2];
+  if (!Number.isFinite(h) || h < 0 || h > 23) return String(hhmm ?? "");
+  const sufijo = h < 12 ? "a.m." : "p.m.";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${min} ${sufijo}`;
+}
+
+const MESES_ES = [
+  "enero", "febrero", "marzo", "abril", "mayo", "junio",
+  "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+];
+
+// Formatea un "YYYY-MM-DDTHH:MM" (formato interno de fechaInicio) a algo hablable
+// en 12h: "el 8 de julio a las 3:00 p.m.". Nunca dice la fecha ISO ni la hora en
+// 24h. Si no matchea el patrón, cae a un reemplazo suave para no perder el dato.
+function fechaHoraNatural(iso: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{1,2}:\d{2})/.exec(String(iso ?? "").trim());
+  if (!m) return String(iso ?? "").replace("T", " a las ");
+  const dia = Number(m[3]);
+  const mes = MESES_ES[Number(m[2]) - 1];
+  const hora = hora24aAmPm(m[4]);
+  return mes ? `el ${dia} de ${mes} a las ${hora}` : `a las ${hora}`;
+}
+
+type Recomendaciones = { antes?: string; despues?: string };
+type VentanaLibre = { desde?: string; hasta?: string };
+
+// Construye la respuesta de "horario ocupado" (409) para agendar/reagendar a
+// partir del nuevo contrato del backend. Regla de negocio: al hablar NO se
+// recitan listas (`slotsDisponibles` queda ignorado a propósito). Se ofrecen
+// SOLO las dos horas más cercanas (`recomendaciones`) ya convertidas a 12h;
+// las `ventanasLibres` se devuelven formateadas para que el modelo las use solo
+// si el cliente pide el panorama. Si no llegan recomendaciones (backend viejo o
+// sin cercanas), el fallback es preguntar la hora preferida.
+function respuestaHorarioOcupado(data: {
+  recomendaciones?: Recomendaciones;
+  ventanasLibres?: VentanaLibre[];
+}): { ok: false; mensaje: string; recomendaciones?: string[]; ventanasLibres?: string[] } {
+  const cercanas: string[] = [];
+  const antes = data?.recomendaciones?.antes;
+  const despues = data?.recomendaciones?.despues;
+  if (typeof antes === "string" && antes.trim()) cercanas.push(hora24aAmPm(antes));
+  if (typeof despues === "string" && despues.trim()) cercanas.push(hora24aAmPm(despues));
+
+  const ventanas = Array.isArray(data?.ventanasLibres)
+    ? data.ventanasLibres
+        .filter((v) => v && typeof v.desde === "string" && typeof v.hasta === "string")
+        .map((v) => `de ${hora24aAmPm(v.desde!)} a ${hora24aAmPm(v.hasta!)}`)
+    : [];
+
+  let mensaje: string;
+  if (cercanas.length === 2) {
+    mensaje = `Ese horario ya está ocupado. ¿Te puedo agendar a las ${cercanas[0]} o a las ${cercanas[1]}?`;
+  } else if (cercanas.length === 1) {
+    mensaje = `Ese horario ya está ocupado. ¿Te sirve a las ${cercanas[0]}, o prefieres otra hora?`;
+  } else {
+    // Sin horas cercanas: NO recitamos slots. Preguntamos la hora preferida.
+    mensaje = `Ese horario ya está ocupado. ¿A qué otra hora te gustaría? Yo reviso si está libre.`;
+  }
+
+  const out: { ok: false; mensaje: string; recomendaciones?: string[]; ventanasLibres?: string[] } = { ok: false, mensaje };
+  if (cercanas.length > 0) out.recomendaciones = cercanas;
+  if (ventanas.length > 0) out.ventanasLibres = ventanas;
+  return out;
+}
+
 export class PipelineLlamada {
   private ws: WebSocket;
   private realtime: OpenAIRealtime;
@@ -944,7 +1023,9 @@ export class PipelineLlamada {
           const data = (await resp.json().catch(() => ({}))) as {
             error?: string;
             faltantes?: string[];
-            slotsDisponibles?: string[];
+            slotsDisponibles?: string[];      // legacy: NO usar al hablar
+            recomendaciones?: Recomendaciones;
+            ventanasLibres?: VentanaLibre[];
             citaId?: string;
           };
           if (!resp.ok) {
@@ -961,24 +1042,28 @@ export class PipelineLlamada {
                 mensaje: `Antes de agendar necesito un par de datos más: ${data.faltantes.join(", ")}. ¿Me los puedes dar?`,
               };
             }
-            // 409 Horario ocupado: ofrecer los horarios disponibles.
-            if (data.slotsDisponibles) {
-              return {
-                ok: false,
-                mensaje: `Ese horario está ocupado. Los horarios disponibles ese día son: ${data.slotsDisponibles.join(", ")}. ¿Cuál te conviene?`,
-              };
+            // 409 Horario ocupado: ofrecemos SOLO las dos horas más cercanas
+            // (recomendaciones) en 12h. Ya NO recitamos slotsDisponibles.
+            if (resp.status === 409 || data.recomendaciones || data.ventanasLibres || data.slotsDisponibles) {
+              return respuestaHorarioOcupado(data);
             }
             return { ok: false, mensaje: "No pude registrar la cita. Por favor intenta con otro horario." };
           }
           // 201 ok: la cita quedó agendada. Recién aquí confirmamos al cliente.
-          return { ok: true, citaId: data.citaId, mensaje: `Tu cita quedó registrada para ${args.fechaInicio.replace("T", " a las ")}. ¿Hay algo más en lo que te pueda ayudar?` };
+          return { ok: true, citaId: data.citaId, mensaje: `Tu cita quedó registrada para ${fechaHoraNatural(args.fechaInicio)}. ¿Hay algo más en lo que te pueda ayudar?` };
         }
 
         case "cancelar_cita": {
           const resp = await fetch(`${odinUrl}/api/voice/citas`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json", ...odinAuth() },
-            body: JSON.stringify({ citaId: args.citaId, accion: "cancelar" }),
+            // clienteTelefono: el backend valida que la cita sea de ESTE
+            // llamante antes de cancelar (impide cancelar la cita de otro).
+            body: JSON.stringify({
+              citaId: args.citaId,
+              accion: "cancelar",
+              clienteTelefono: callerNumber || "desconocido",
+            }),
             signal: AbortSignal.timeout(8000),
           });
           if (!resp.ok) return { ok: false, mensaje: "No pude cancelar la cita. Por favor contacta al negocio directamente." };
@@ -994,16 +1079,21 @@ export class PipelineLlamada {
               accion: "reagendar",
               servicioId: args.servicioId,
               fechaInicio: args.fechaInicio,
+              // clienteTelefono: el backend valida que la cita sea de ESTE
+              // llamante antes de moverla (impide reagendar la cita de otro).
+              clienteTelefono: callerNumber || "desconocido",
             }),
             signal: AbortSignal.timeout(8000),
           });
-          const data = await resp.json() as { slotsDisponibles?: string[] };
+          const data = (await resp.json().catch(() => ({}))) as {
+            slotsDisponibles?: string[];      // legacy: NO usar al hablar
+            recomendaciones?: Recomendaciones;
+            ventanasLibres?: VentanaLibre[];
+          };
           if (!resp.ok) {
-            if (data.slotsDisponibles) {
-              return {
-                ok: false,
-                mensaje: `Ese horario está ocupado. Los horarios disponibles son: ${data.slotsDisponibles.join(", ")}. ¿Cuál prefieres?`,
-              };
+            // 409 Horario ocupado al reagendar: mismas dos horas cercanas en 12h.
+            if (resp.status === 409 || data.recomendaciones || data.ventanasLibres || data.slotsDisponibles) {
+              return respuestaHorarioOcupado(data);
             }
             return { ok: false, mensaje: "No pude modificar la cita. Por favor intenta con otro horario." };
           }
