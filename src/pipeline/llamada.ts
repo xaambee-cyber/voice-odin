@@ -124,6 +124,13 @@ export interface ConfigNegocio {
   // agente los menciona todos al cobrar. `metodoPago` se mantiene para
   // retrocompat (es el primero del array).
   metodosPago?: MetodoPagoNegocio[];
+  // CITAS con anticipo: si true, el negocio exige un depósito para APARTAR la
+  // cita. El agente NO debe prometerla como confirmada: al llamar a agendar_cita
+  // el backend la deja en `esperando_pago`, calcula el monto y manda los datos
+  // de pago por WhatsApp al número que llamó. `anticipoCitas` trae la modalidad
+  // y el % para que el agente pueda hablar del anticipo antes de cerrar.
+  requiereAnticipoCitas?: boolean;
+  anticipoCitas?: { modalidad: "completo" | "anticipo"; porcentaje?: number } | null;
   // Lista de sucursales/personas a las que el agente puede escalar. Si hay
   // varias, el agente le pregunta al cliente a cuál pasarlo. Si la llamada
   // entró por desvío desde una sucursal específica, esa se asume por defecto.
@@ -387,6 +394,16 @@ function buildSystemPrompt(
   const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
   const pedidosActiva = cfg.habilidadesActivas?.pedidos ?? cfg.habilidades.includes("pedidos");
   const verificarDispReserva = cfg.verificarDisponibilidadReserva === true && solicitudReservaActiva;
+  // CITAS con anticipo: el negocio exige depósito para apartar la cita. El
+  // agente pide el anticipo y NO promete la cita confirmada (ver AGENDA DE
+  // CITAS). El monto exacto lo calcula el backend al agendar.
+  const requiereAnticipoCitas = cfg.requiereAnticipoCitas === true && agendaActiva;
+  const anticipoCitasPctVoz =
+    requiereAnticipoCitas && cfg.anticipoCitas?.modalidad === "anticipo"
+      ? `anticipo del ${cfg.anticipoCitas.porcentaje || 50} por ciento`
+      : requiereAnticipoCitas
+        ? "pago completo por adelantado"
+        : null;
   const metodoPago = cfg.metodoPago || null;
   // Lista completa de métodos. Si vienen, las usamos; si no, fallback al
   // único método legacy.
@@ -601,7 +618,8 @@ INSTRUCCIONES PARA CITAS:
      · Los campos "opcional" pregúntalos solo si fluye natural; si el cliente no los da, omítelos sin insistir.
      · Pasa lo recolectado en el parámetro camposAgenda usando como LLAVE el ID entre [campo:...] (ej. "c1"), nunca la etiqueta. Omite los campos opcionales que el cliente no haya dado.
      · Si el servicio NO tiene esa línea, agenda igual que siempre: NO mandes camposAgenda.
-   - REGLA DE ORO: NUNCA confirmes la cita al cliente hasta que agendar_cita responda con éxito. Si la función te dice que faltan datos, pídeselos al cliente exactamente y vuelve a llamar a agendar_cita; no des la cita por hecha mientras falten.
+   - REGLA DE ORO: NUNCA confirmes la cita al cliente hasta que agendar_cita responda con éxito. Si la función te dice que faltan datos, pídeselos al cliente exactamente y vuelve a llamar a agendar_cita; no des la cita por hecha mientras falten.${requiereAnticipoCitas ? `
+   - ANTICIPO OBLIGATORIO PARA APARTAR: este negocio pide un ${anticipoCitasPctVoz} para reservar la cita. NO prometas la cita como confirmada. Recolecta servicio + fecha + hora y llama a agendar_cita como siempre; el sistema aparta el horario, calcula el monto del anticipo y manda los datos de pago por WhatsApp a este mismo número. La función te devuelve un "mensaje" con el monto — dilo TAL CUAL. Deja claro que la cita SOLO queda confirmada cuando el cliente realice el pago; NO dictes números de cuenta ni links en voz (van por WhatsApp).` : ""}
 
 2. CANCELAR: Confirma explícitamente con el cliente antes de llamar a cancelar_cita. El cliente debe pedir cancelar de forma clara y directa. Si hay ambigüedad, pregunta: "¿Quieres cancelar tu cita?"
 
@@ -762,6 +780,26 @@ function mensajeDatosPagoVoz(
   // Varios métodos: enumerar como opciones (en voz, sin números de cuenta).
   const opciones = lista.map(viaDe).join(", o ");
   return `${encabezado} Aceptamos varias formas de pago: ${opciones}. Te paso los datos completos por WhatsApp para que elijas la que prefieras. Avísame cuando hayas pagado para confirmarlo con el equipo.`;
+}
+
+// Mensaje hablado cuando una CITA queda apartada esperando el anticipo. En
+// llamada NO se dictan datos de pago: el backend (/api/voice/citas) ya los
+// mandó por WhatsApp al número que llamó. Aquí solo decimos el monto y que la
+// cita se confirma al pagar — NUNCA que ya quedó confirmada.
+function mensajeAnticipoCitaVoz(
+  monto: number | undefined,
+  esMercadoPago: boolean,
+  whatsappEnviado: boolean,
+): string {
+  const montoTxt =
+    typeof monto === "number" && isFinite(monto) && monto > 0
+      ? ` de ${monto.toLocaleString("es-MX")} pesos`
+      : "";
+  const via = esMercadoPago ? "un link de pago" : "los datos de pago";
+  const envio = whatsappEnviado
+    ? `Te acabo de enviar ${via} por WhatsApp a este mismo número.`
+    : `En un momento te llegan ${via} por WhatsApp a este mismo número.`;
+  return `Para apartar tu cita necesitas un anticipo${montoTxt}. ${envio} En cuanto lo realices, tu cita queda confirmada y el equipo te avisa. ¿Hay algo más en lo que te pueda ayudar?`;
 }
 
 // Normaliza un número telefónico para comparación (solo dígitos, sin +).
@@ -1027,6 +1065,13 @@ export class PipelineLlamada {
             recomendaciones?: Recomendaciones;
             ventanasLibres?: VentanaLibre[];
             citaId?: string;
+            // Camino ANTICIPO: el negocio exige depósito. El backend NO confirmó
+            // la cita; la apartó en `esperando_pago`, calculó el monto y mandó
+            // los datos de pago por WhatsApp al número que llamó.
+            esperandoPago?: boolean;
+            montoAnticipo?: number;
+            esMercadoPago?: boolean;
+            mensajeWhatsappEnviado?: boolean;
           };
           if (!resp.ok) {
             // 400 FALTAN_CAMPOS: faltó un dato obligatorio del servicio. El
@@ -1048,6 +1093,20 @@ export class PipelineLlamada {
               return respuestaHorarioOcupado(data);
             }
             return { ok: false, mensaje: "No pude registrar la cita. Por favor intenta con otro horario." };
+          }
+          // 201 con anticipo: la cita NO está confirmada, quedó apartada
+          // esperando el pago. Decimos el monto y que los datos van por WhatsApp
+          // (el backend ya los envió). NO la damos por confirmada.
+          if (data.esperandoPago) {
+            return {
+              ok: true,
+              citaId: data.citaId,
+              mensaje: mensajeAnticipoCitaVoz(
+                data.montoAnticipo,
+                data.esMercadoPago === true,
+                data.mensajeWhatsappEnviado === true,
+              ),
+            };
           }
           // 201 ok: la cita quedó agendada. Recién aquí confirmamos al cliente.
           return { ok: true, citaId: data.citaId, mensaje: `Tu cita quedó registrada para ${fechaHoraNatural(args.fechaInicio)}. ¿Hay algo más en lo que te pueda ayudar?` };
