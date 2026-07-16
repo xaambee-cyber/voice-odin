@@ -19,6 +19,7 @@ export declare class OpenAIRealtime {
     private graceUntil;
     private saludoEnviado;
     private cancelacionEnCurso;
+    private uso;
     private funcionActual;
     private funcionLentaPendiente;
     private funcionLentaArgs;
@@ -45,6 +46,17 @@ export declare class OpenAIRealtime {
     setOnItemCreated(callback: (itemId: string) => void): void;
     setOnInterrupcion(callback: () => void): void;
     setOnFunctionCall(callback: (name: string, args: any, callId: string) => Promise<any>): void;
+    private acumularUso;
+    costoUsdOpenAI(): number;
+    resumenUso(): {
+        costoUsd: number;
+        audioIn: number;
+        textIn: number;
+        cachedAudioIn: number;
+        cachedTextIn: number;
+        audioOut: number;
+        textOut: number;
+    };
     cerrar(): void;
     get estaConectado(): boolean;
 }

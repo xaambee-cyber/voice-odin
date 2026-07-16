@@ -15,6 +15,7 @@ function construirHerramientas(cfg) {
     const agendaActiva = cfg.habilidadesActivas?.agenda_citas ?? cfg.habilidades.includes("agenda_citas");
     const escalamientoActivo = cfg.habilidadesActivas?.escalamiento ?? cfg.habilidades.includes("escalamiento");
     const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
+    const pedidosActiva = cfg.habilidadesActivas?.pedidos ?? cfg.habilidades.includes("pedidos");
     if (agendaActiva) {
         herramientas.push({
             type: "function",
@@ -25,13 +26,14 @@ function construirHerramientas(cfg) {
                 properties: {
                     servicioId: { type: "string", description: "ID exacto del servicio (usa los que aparecen en tu lista de servicios)" },
                     fechaInicio: { type: "string", description: "Fecha y hora de inicio en formato ISO: YYYY-MM-DDTHH:MM:00" },
+                    clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural ANTES de agendar ('¿A nombre de quién agendo la cita?') si aún no lo ha dicho en la llamada. Si ya lo dijo, úsalo sin volver a preguntar. Si no lo quiere dar, pasa 'Cliente'." },
                     camposAgenda: {
                         type: "object",
                         description: "Datos adicionales que pide el servicio elegido. Las LLAVES deben ser los IDs de campo (ej. \"c1\", \"c2\"), NUNCA las etiquetas largas; los valores son lo que dijo el cliente. Inclúyelo SOLO si el servicio tiene campos adicionales; OMÍTELO por completo si el servicio no tiene ninguno.",
                         additionalProperties: { type: "string" },
                     },
                 },
-                required: ["servicioId", "fechaInicio"],
+                required: ["servicioId", "fechaInicio", "clienteNombre"],
             },
         });
         herramientas.push({
@@ -80,6 +82,7 @@ function construirHerramientas(cfg) {
                         servicioId: { type: "string", description: "ID exacto de la unidad (de tu lista). Omítelo si el cliente no eligió una específica." },
                         personas: { type: "number", description: "Número de personas. OPCIONAL — omítelo si el cliente no lo menciona (en terrazas/salones puede no aplicar)." },
                         itemNombre: { type: "string", description: "Nombre de la unidad para el negocio, si aplica." },
+                        clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural antes de reservar ('¿A nombre de quién hago la reserva?') si aún no lo dijo. Si ya lo dijo, úsalo sin volver a preguntar." },
                         pagoReportado: { type: "boolean", description: "false la primera vez (verificar disponibilidad). Ponlo true ÚNICAMENTE cuando el cliente diga de forma EXPLÍCITA E INEQUÍVOCA que YA realizó el pago (por ejemplo: 'ya transferí', 'ya hice el depósito', 'ya pagué', 'ya te mandé el comprobante'). NUNCA lo pongas true por un 'gracias', 'ok', 'va', 'perfecto', 'ahí va', un silencio o ruido. Si tienes la más mínima duda de si ya pagó, déjalo en false y pregúntale: '¿Ya realizaste el pago?'." },
                     },
                     required: ["detalles", "fechaEntrada", "fechaSalida"],
@@ -105,11 +108,41 @@ function construirHerramientas(cfg) {
                         },
                         personas: { type: "number", description: "Número de personas si aplica" },
                         itemNombre: { type: "string", description: "Habitación, mesa, servicio o ítem específico que pidió, si aplica" },
+                        clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural antes de enviar la solicitud ('¿A nombre de quién?') si aún no lo dijo." },
                     },
                     required: ["detalles"],
                 },
             });
         }
+    }
+    if (pedidosActiva) {
+        herramientas.push({
+            type: "function",
+            name: "crear_pedido",
+            description: "Registra un pedido de productos/platillos del catálogo. Llama esta función solo cuando el cliente confirmó qué quiere, las cantidades y si es a domicilio, para recoger o en mesa. Usa los IDs EXACTOS del catálogo. NO inventes productos ni precios: el sistema calcula el total.",
+            parameters: {
+                type: "object",
+                properties: {
+                    items: {
+                        type: "array",
+                        description: "Lista de productos pedidos.",
+                        items: {
+                            type: "object",
+                            properties: {
+                                servicioId: { type: "string", description: "ID exacto del producto del catálogo" },
+                                cantidad: { type: "number", description: "Cantidad pedida (entero >= 1)" },
+                            },
+                            required: ["servicioId", "cantidad"],
+                        },
+                    },
+                    tipo: { type: "string", enum: ["domicilio", "recoger", "mesa"], description: "Modalidad de entrega" },
+                    direccion: { type: "string", description: "Dirección de entrega (solo si es a domicilio)" },
+                    notas: { type: "string", description: "Indicaciones especiales del cliente, si las hay" },
+                    clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural antes de registrar el pedido ('¿A nombre de quién es el pedido?') si aún no lo dijo." },
+                },
+                required: ["items", "tipo"],
+            },
+        });
     }
     if (escalamientoActivo) {
         herramientas.push({
@@ -201,6 +234,7 @@ function buildSystemPrompt(cfg, contextoExtra) {
     const agendaActiva = cfg.habilidadesActivas?.agenda_citas ?? cfg.habilidades.includes("agenda_citas");
     const escalamientoActivo = cfg.habilidadesActivas?.escalamiento ?? cfg.habilidades.includes("escalamiento");
     const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
+    const pedidosActiva = cfg.habilidadesActivas?.pedidos ?? cfg.habilidades.includes("pedidos");
     const verificarDispReserva = cfg.verificarDisponibilidadReserva === true && solicitudReservaActiva;
     const metodoPago = cfg.metodoPago || null;
     // Lista completa de métodos. Si vienen, las usamos; si no, fallback al
@@ -373,6 +407,11 @@ REGLAS PARA LLAMADA TELEFÓNICA — CRÍTICAS:
 - Habla como una persona real mexicana por teléfono. Natural y directo.
 - Si te interrumpen, calla y escucha.
 - Si te preguntan quién eres: di tu nombre y el negocio. Nada más.
+
+NOMBRE DEL CLIENTE — IMPORTANTE:
+- Antes de agendar una cita, hacer una reserva o registrar un pedido, pregunta el nombre del cliente de forma natural ("¿A nombre de quién la agendo?") y pásalo en el parámetro clienteNombre de la función.
+- Si el cliente ya dijo su nombre en cualquier momento de la llamada, úsalo — NO lo vuelvas a preguntar.
+- Si no lo quiere dar, no insistas: usa "Cliente".
 ${agendaActiva ? `
 === AGENDA DE CITAS ===
 HORARIOS DE ATENCIÓN: ${horariosTexto || "No especificado"}
@@ -585,6 +624,13 @@ class PipelineLlamada {
     // humano no contestó y la llamada volvió por desvío condicional).
     esRebote = false;
     turnos = 0;
+    // Nombre del cliente recolectado durante la llamada (lo pide el agente al
+    // agendar/reservar/pedir). Reemplaza el "Llamada entrante" hardcodeado en
+    // citas, conversaciones y notificaciones al gerente.
+    nombreCliente = "";
+    // true = el negocio no tiene créditos: la llamada se rechazó con mensaje
+    // corto y NO se manda webhook de cierre (no hay nada que cobrar/guardar).
+    saldoBloqueado = false;
     constructor(ws, negocioId, configNegocio, callerNumber = "", numeroTwilio = "", callSid = "", forwardedFrom = "") {
         this.ws = ws;
         this.negocioId = negocioId;
@@ -679,11 +725,47 @@ class PipelineLlamada {
             catch { }
         }
     }
+    // GATE DE CRÉDITOS: el negocio no tiene saldo. Cortamos la llamada con un
+    // mensaje corto de Twilio (<Say>) en vez de atender gratis con OpenAI
+    // Realtime corriendo. Sin webhook de cierre (saldoBloqueado lo omite).
+    async rechazarPorSaldo() {
+        this.saldoBloqueado = true;
+        console.warn(`[PIPELINE] Negocio ${this.negocioId || "?"} SIN créditos — rechazando llamada ${this.callSid}`);
+        try {
+            this.realtime.cerrar();
+        }
+        catch { }
+        const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="es-MX" voice="Polly.Mia">Lo sentimos, por el momento no podemos atender su llamada. Por favor intente más tarde o escríbanos por WhatsApp.</Say>
+  <Hangup/>
+</Response>`;
+        try {
+            const client = (0, twilio_1.default)(config_1.config.twilioAccountSid, config_1.config.twilioAuthToken);
+            await client.calls(this.callSid).update({ twiml });
+        }
+        catch (e) {
+            console.error("[PIPELINE] No se pudo aplicar TwiML de rechazo:", e?.message || e);
+            try {
+                this.ws.close();
+            }
+            catch { }
+        }
+    }
     async manejarFuncion(nombre, args, callId) {
         const odinUrl = config_1.config.odinAppUrl;
         const negocioId = this.configNegocio.negocioId || this.negocioId;
         const callerNumber = this.callerNumber;
         console.log(`[FUNCIÓN] ${nombre}:`, args);
+        // Capturar el nombre del cliente venga de la función que venga: se usa en
+        // TODAS las llamadas a Odin y en el webhook de cierre (adiós "Llamada
+        // entrante"). "Cliente" es el placeholder cuando no lo quiso dar.
+        if (typeof args?.clienteNombre === "string" && args.clienteNombre.trim()) {
+            const nom = args.clienteNombre.trim().slice(0, 80);
+            if (nom.toLowerCase() !== "cliente")
+                this.nombreCliente = nom;
+        }
+        const nombreClienteFinal = this.nombreCliente || "Llamada entrante";
         try {
             switch (nombre) {
                 case "agendar_cita": {
@@ -691,7 +773,7 @@ class PipelineLlamada {
                         negocioId,
                         servicioId: args.servicioId,
                         fechaInicio: args.fechaInicio,
-                        clienteNombre: "Llamada entrante",
+                        clienteNombre: nombreClienteFinal,
                         clienteTelefono: callerNumber || "desconocido",
                     };
                     // Campos personalizados del servicio: solo los mandamos si el modelo
@@ -780,7 +862,7 @@ class PipelineLlamada {
                         headers: { "Content-Type": "application/json", ...odinAuth() },
                         body: JSON.stringify({
                             negocioId,
-                            nombreCliente: "Llamada entrante",
+                            nombreCliente: nombreClienteFinal,
                             telefonoCliente: callerNumber || "desconocido",
                             detalles: args.detalles,
                             fechaSolicitada: args.fechaSolicitada,
@@ -832,6 +914,30 @@ class PipelineLlamada {
                     // Legacy (verificar disponibilidad apagado): solo se mandó al admin.
                     return { ok: true, mensaje: "Listo, tu solicitud quedó registrada. El negocio te confirmará en breve por WhatsApp. ¿Hay algo más?" };
                 }
+                case "crear_pedido": {
+                    const items = Array.isArray(args.items)
+                        ? args.items.map((x) => ({ servicioId: String(x?.servicioId || ""), cantidad: Number(x?.cantidad) || 1 }))
+                        : [];
+                    const resp = await fetch(`${odinUrl}/api/voice/pedidos`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", ...odinAuth() },
+                        body: JSON.stringify({
+                            negocioId,
+                            items,
+                            clienteNombre: nombreClienteFinal,
+                            clienteTelefono: callerNumber || "desconocido",
+                            tipo: args.tipo,
+                            direccion: args.direccion ?? null,
+                            notas: args.notas ?? null,
+                        }),
+                        signal: AbortSignal.timeout(8000),
+                    });
+                    const data = (await resp.json().catch(() => ({})));
+                    if (!resp.ok) {
+                        return { ok: false, mensaje: "Tuve un problema registrando el pedido. ¿Me lo confirmas otra vez, por favor?" };
+                    }
+                    return { ok: true, mensaje: `Listo, registré tu pedido por un total de ${data.total} pesos. El negocio te lo confirma en seguida. ¿Algo más?` };
+                }
                 case "enviar_ubicacion": {
                     if (!callerNumber) {
                         return { ok: false, mensaje: "No tengo tu número para mandártela por WhatsApp. ¿Me lo puedes dictar?" };
@@ -875,7 +981,7 @@ class PipelineLlamada {
                                     tipo: args.tipo,
                                     resumen: `[REBOTE] ${args.resumen}`,
                                     telefonoCliente: callerNumber || "desconocido",
-                                    nombreCliente: "Llamada entrante",
+                                    nombreCliente: nombreClienteFinal,
                                     sucursalEtiqueta: args.sucursalEtiqueta,
                                 }),
                                 signal: AbortSignal.timeout(8000),
@@ -892,7 +998,7 @@ class PipelineLlamada {
                             tipo: args.tipo,
                             resumen: args.resumen,
                             telefonoCliente: callerNumber || "desconocido",
-                            nombreCliente: "Llamada entrante",
+                            nombreCliente: nombreClienteFinal,
                             sucursalEtiqueta: args.sucursalEtiqueta,
                         }),
                         signal: AbortSignal.timeout(8000),
@@ -1077,6 +1183,13 @@ class PipelineLlamada {
             conexionPromise,
         ]);
         if (configRapida) {
+            // GATE DE CRÉDITOS: sin saldo → mensaje corto y colgar. Nada de OpenAI.
+            if (configRapida.bloqueado) {
+                if (configRapida.negocioId)
+                    this.negocioId = configRapida.negocioId;
+                await this.rechazarPorSaldo();
+                return;
+            }
             // Llegó a tiempo: saludo con memoria. La voz priorizamos el registro
             // local (más reciente), si no la del fetch, si no marin.
             this.configNegocio = { ...this.configNegocio, ...configRapida };
@@ -1101,6 +1214,13 @@ class PipelineLlamada {
             fetchPromise.then((configCompleta) => {
                 if (!configCompleta) {
                     console.warn("[PIPELINE] Config nunca llegó — agente seguirá con defaults");
+                    return;
+                }
+                // GATE DE CRÉDITOS (config tardía): cortar aunque el saludo ya sonó.
+                if (configCompleta.bloqueado) {
+                    if (configCompleta.negocioId)
+                        this.negocioId = configCompleta.negocioId;
+                    this.rechazarPorSaldo().catch(() => { });
                     return;
                 }
                 this.configNegocio = { ...this.configNegocio, ...configCompleta };
@@ -1154,6 +1274,12 @@ class PipelineLlamada {
     }
     async finalizarLlamada() {
         this.realtime.cerrar();
+        // Llamada rechazada por falta de créditos: no hubo conversación real —
+        // nada que guardar ni cobrar.
+        if (this.saldoBloqueado) {
+            console.log(`[PIPELINE] Llamada ${this.callSid} rechazada por saldo — webhook omitido`);
+            return;
+        }
         const duracionSegundos = Math.round((Date.now() - this.inicioLlamada) / 1000);
         const historial = this.historialOrdenado
             .filter((t) => !t.pending && t.content.trim().length > 0)
@@ -1161,6 +1287,17 @@ class PipelineLlamada {
         const transcripcion = historial
             .map((t) => `${t.role === "user" ? "Cliente" : "Agente"}: ${t.content}`)
             .join("\n");
+        // Costo REAL de la llamada (antes se mandaba 0 y la voz salía "gratis" en los
+        // márgenes). OpenAI Realtime se calcula de los tokens que la API reportó;
+        // whisper-1 (transcribe el ~40% que habla el cliente, $0.006/min) se estima
+        // por duración. costoUsd = costo del proveedor OpenAI (whisper incluido). El
+        // minuto de Twilio se registra aparte (es infra, no proveedor de IA).
+        const usoVoz = this.realtime.resumenUso();
+        const minutos = duracionSegundos / 60;
+        const costoWhisper = minutos * 0.4 * 0.006;
+        const costoUsd = Number((usoVoz.costoUsd + costoWhisper).toFixed(6));
+        const costoTwilioAprox = Number((minutos * 0.01).toFixed(6)); // inbound MX, informativo
+        console.log(`[PIPELINE] Costo voz — OpenAI $${costoUsd} (realtime $${usoVoz.costoUsd.toFixed(6)} + whisper $${costoWhisper.toFixed(6)}) · Twilio ~$${costoTwilioAprox} · tokens`, usoVoz);
         console.log(`[PIPELINE] Llamada finalizada — ${duracionSegundos}s, ${this.turnos} turnos`);
         console.log(`[PIPELINE] Enviando ${historial.length} mensajes a Odin`);
         if (historial.length > 0)
@@ -1170,27 +1307,48 @@ class PipelineLlamada {
             console.warn("[PIPELINE] No hay negocioId — webhook a Odin omitido");
             return;
         }
-        try {
-            const resp = await fetch(`${config_1.config.odinAppUrl}/api/webhooks/voice`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", ...odinAuth() },
-                body: JSON.stringify({
-                    negocioId: this.negocioId,
-                    telefonoCliente: this.callerNumber || "desconocido",
-                    nombreCliente: "Llamada entrante",
-                    transcripcion,
-                    duracionSegundos,
-                    turnos: this.turnos,
-                    costoUsd: 0,
-                    historial,
-                }),
-            });
-            const data = await resp.json();
-            console.log(`[PIPELINE] Webhook Odin → ${resp.status}:`, data);
+        // Webhook de cierre CON REINTENTOS: aquí viaja la transcripción y el
+        // descuento de créditos — si Vercel está frío o falla, antes se perdía
+        // todo con un solo intento. El backoff cubre cold starts y caídas cortas;
+        // Odin dedupea por callSid, así que reintentar nunca duplica.
+        const payload = JSON.stringify({
+            negocioId: this.negocioId,
+            callSid: this.callSid || null,
+            telefonoCliente: this.callerNumber || "desconocido",
+            nombreCliente: this.nombreCliente || "Llamada entrante",
+            transcripcion,
+            duracionSegundos,
+            turnos: this.turnos,
+            costoUsd,
+            historial,
+        });
+        const ESPERAS_MS = [0, 4000, 15_000, 60_000];
+        for (let intento = 1; intento <= ESPERAS_MS.length; intento++) {
+            if (ESPERAS_MS[intento - 1] > 0) {
+                await new Promise((r) => setTimeout(r, ESPERAS_MS[intento - 1]));
+            }
+            try {
+                const resp = await fetch(`${config_1.config.odinAppUrl}/api/webhooks/voice`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", ...odinAuth() },
+                    body: payload,
+                    signal: AbortSignal.timeout(20_000),
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (resp.ok) {
+                    console.log(`[PIPELINE] Webhook Odin → ${resp.status} (intento ${intento}):`, data);
+                    return;
+                }
+                console.warn(`[PIPELINE] Webhook Odin HTTP ${resp.status} (intento ${intento}/${ESPERAS_MS.length}):`, data);
+                // 4xx = payload/config mal (reintentar no ayuda); 5xx/timeout sí.
+                if (resp.status >= 400 && resp.status < 500)
+                    return;
+            }
+            catch (err) {
+                console.warn(`[PIPELINE] Webhook Odin falló (intento ${intento}/${ESPERAS_MS.length}):`, err?.message || err);
+            }
         }
-        catch (err) {
-            console.error("[PIPELINE] Error notificando a Odin:", err);
-        }
+        console.error(`[PIPELINE] Webhook Odin AGOTÓ reintentos — llamada ${this.callSid} sin registrar`);
     }
 }
 exports.PipelineLlamada = PipelineLlamada;

@@ -153,6 +153,31 @@ wss.on("connection", (ws: WebSocket) => {
 // función serverless caliente. Sin esto, una llamada que entra después de
 // rato encuentra Vercel frío y el fetch tarda 3-5s extra.
 const WARMUP_MS = 4 * 60 * 1000;
+
+// ═══ SLA de escalamientos ═══
+// Vercel Hobby solo permite crons DIARIOS, así que este server (siempre
+// encendido) hace de scheduler fino: cada 30 min dispara el cron de Odin que
+// re-notifica al gerente las solicitudes pendientes sin responder. El
+// endpoint es idempotente (respeta sus propios intervalos), así que llamarlo
+// de más no duplica recordatorios.
+const SLA_MS = 30 * 60 * 1000;
+async function dispararSlaEscalamientos() {
+  if (!config.voiceServerSecret) return; // dev sin secreto: no hay cómo autenticar
+  try {
+    const resp = await fetch(`${config.odinAppUrl}/api/cron/escalamientos`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.voiceServerSecret}` },
+      signal: AbortSignal.timeout(110_000),
+    });
+    const data = await resp.json().catch(() => ({}));
+    console.log(`[SLA] escalamientos → ${resp.status}`, data);
+  } catch (err: any) {
+    console.warn("[SLA] escalamientos falló:", err?.message || err);
+  }
+}
+setInterval(dispararSlaEscalamientos, SLA_MS);
+setTimeout(dispararSlaEscalamientos, 60_000); // primer barrido al minuto del arranque
+
 async function warmupOdin() {
   try {
     const authHeader: Record<string, string> = config.voiceServerSecret

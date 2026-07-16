@@ -28,6 +28,7 @@ interface HabilidadesActivas {
     agenda_citas: boolean;
     aprendizaje: boolean;
     solicitud_reserva?: boolean;
+    pedidos?: boolean;
 }
 interface MetodoPagoNegocio {
     tipo: "transferencia" | "deposito" | "paypal" | "mercadopago" | "otro";
@@ -82,6 +83,7 @@ export interface ConfigNegocio {
     saludoInicial?: string;
     temasTransferencia?: string[];
     ubicacionUrl?: string;
+    bloqueado?: boolean;
 }
 export declare class PipelineLlamada {
     private ws;
@@ -98,10 +100,13 @@ export declare class PipelineLlamada {
     private receptorOrigen;
     private esRebote;
     private turnos;
+    private nombreCliente;
+    private saldoBloqueado;
     constructor(ws: WebSocket, negocioId: string, configNegocio: ConfigNegocio, callerNumber?: string, numeroTwilio?: string, callSid?: string, forwardedFrom?: string);
     private calcularContextoSucursal;
     private esTranscripcionValida;
     private colgarTwilioCall;
+    private rechazarPorSaldo;
     private manejarFuncion;
     private registrarCallbacks;
     iniciar(): Promise<void>;

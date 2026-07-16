@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
+const crypto_1 = require("crypto");
 const http_1 = require("http");
 const ws_1 = require("ws");
 const config_1 = require("./utils/config");
@@ -40,6 +41,24 @@ app.use((req, res, next) => {
         return res.sendStatus(204);
     next();
 });
+// Guard de secreto compartido para endpoints internos (server-to-server).
+// Valida `Authorization: Bearer <VOICE_SERVER_SECRET>` con comparación de
+// tiempo constante. Si el secreto NO está configurado (dev local), no bloquea
+// para no romper el flujo de desarrollo. En prod VOICE_SERVER_SECRET es
+// obligatorio, así que sí protege.
+function requireSecret(req, res, next) {
+    const secret = config_1.config.voiceServerSecret;
+    if (!secret)
+        return next(); // dev sin secreto
+    const auth = req.headers.authorization || "";
+    const token = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+    const a = Buffer.from(token);
+    const b = Buffer.from(secret);
+    const ok = a.length === b.length && (0, crypto_1.timingSafeEqual)(a, b);
+    if (!ok)
+        return res.status(401).json({ error: "No autorizado" });
+    next();
+}
 // ═══ API REST ═══
 app.get("/", (req, res) => {
     res.json({
@@ -53,12 +72,14 @@ app.post("/twiml", twiml_1.handleIncomingCall);
 app.get("/twiml", twiml_1.handleIncomingCall);
 // Fallback si el WebSocket no conecta
 app.post("/twiml-fallback", twiml_1.handleFallback);
-// API para Odin
-app.post("/api/configurar", configurar_1.configurarNegocio);
-app.get("/api/estado/:negocioId", configurar_1.obtenerEstado);
-app.get("/api/negocios", configurar_1.listarNegocios);
+// API para Odin (server-to-server → requieren secreto compartido)
+app.post("/api/configurar", requireSecret, configurar_1.configurarNegocio);
+app.get("/api/estado/:negocioId", requireSecret, configurar_1.obtenerEstado);
+app.get("/api/negocios", requireSecret, configurar_1.listarNegocios);
+app.post("/api/set-voz", requireSecret, registro_voz_1.setVozHandler);
+// preview-voz lo llama el browser del panel (no puede portar el secreto);
+// se protege con allowlist de voces + cache (costo acotado).
 app.get("/api/preview-voz", preview_voz_1.previewVoz);
-app.post("/api/set-voz", registro_voz_1.setVozHandler);
 // ═══ WebSocket Server ═══
 const server = (0, http_1.createServer)(app);
 const wss = new ws_1.WebSocketServer({ server, path: "/ws" });
@@ -113,6 +134,31 @@ wss.on("connection", (ws) => {
 // función serverless caliente. Sin esto, una llamada que entra después de
 // rato encuentra Vercel frío y el fetch tarda 3-5s extra.
 const WARMUP_MS = 4 * 60 * 1000;
+// ═══ SLA de escalamientos ═══
+// Vercel Hobby solo permite crons DIARIOS, así que este server (siempre
+// encendido) hace de scheduler fino: cada 30 min dispara el cron de Odin que
+// re-notifica al gerente las solicitudes pendientes sin responder. El
+// endpoint es idempotente (respeta sus propios intervalos), así que llamarlo
+// de más no duplica recordatorios.
+const SLA_MS = 30 * 60 * 1000;
+async function dispararSlaEscalamientos() {
+    if (!config_1.config.voiceServerSecret)
+        return; // dev sin secreto: no hay cómo autenticar
+    try {
+        const resp = await fetch(`${config_1.config.odinAppUrl}/api/cron/escalamientos`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${config_1.config.voiceServerSecret}` },
+            signal: AbortSignal.timeout(110_000),
+        });
+        const data = await resp.json().catch(() => ({}));
+        console.log(`[SLA] escalamientos → ${resp.status}`, data);
+    }
+    catch (err) {
+        console.warn("[SLA] escalamientos falló:", err?.message || err);
+    }
+}
+setInterval(dispararSlaEscalamientos, SLA_MS);
+setTimeout(dispararSlaEscalamientos, 60_000); // primer barrido al minuto del arranque
 async function warmupOdin() {
     try {
         const authHeader = config_1.config.voiceServerSecret

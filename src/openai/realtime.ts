@@ -17,6 +17,18 @@ const MODELO = "gpt-realtime";
 // En GA la API espera objeto con `type`, valor "audio/pcmu" (codec estándar).
 const FORMATO_AUDIO_TWILIO = { type: "audio/pcmu" as const };
 
+// Precios gpt-realtime (GA) en USD por 1M de tokens. Actualizar aquí si OpenAI
+// cambia tarifas. Ref (jul 2026): audio in 32 · audio out 64 · texto in 4 ·
+// texto out 16 · cacheado (texto o audio) 0.40. El cache es lo que decide si una
+// llamada larga sale barata o cara — por eso lo contamos aparte.
+const PRECIOS_REALTIME_USD_POR_1M = {
+  audioIn: 32,
+  audioOut: 64,
+  textIn: 4,
+  textOut: 16,
+  cached: 0.4,
+} as const;
+
 // Funciones pesadas que hacen un fetch a Odin y tardan (verificación de
 // disponibilidad, búsqueda de slots, creación en BD, cold start de Vercel).
 // Mientras se resuelven, el agente dice una frase de espera para no dejar la
@@ -80,6 +92,11 @@ export class OpenAIRealtime {
   private graceUntil: number = 0;
   private saludoEnviado: boolean = false;
   private cancelacionEnCurso: boolean = false;
+
+  // Contabilidad de costo real: acumula los tokens que la API reporta en cada
+  // response.done (msg.response.usage). Antes se mandaba costoUsd:0 a Odin y la
+  // voz salía "gratis" en los márgenes. Esto la hace medible por llamada.
+  private uso = { audioIn: 0, textIn: 0, cachedAudioIn: 0, cachedTextIn: 0, audioOut: 0, textOut: 0 };
 
   // Acumulador de argumentos de la función en curso
   private funcionActual: { callId: string; name: string; args: string } | null = null;
@@ -319,6 +336,9 @@ export class OpenAIRealtime {
       case "response.done": {
         this.respondiendo = false;
         this.cancelacionEnCurso = false;
+        // Cuenta el consumo de ESTE response (incluye cancelados y frases de
+        // espera: la API igual cobra los tokens que alcanzó a generar).
+        this.acumularUso(msg.response?.usage);
         const cancelada = msg.response?.status === "cancelled";
         const eraFiller = this.fillerActivo;
         this.fillerActivo = false;
@@ -531,6 +551,49 @@ export class OpenAIRealtime {
   setOnItemCreated(callback: (itemId: string) => void) { this.onItemCreated = callback; }
   setOnInterrupcion(callback: () => void) { this.onInterrupcion = callback; }
   setOnFunctionCall(callback: (name: string, args: any, callId: string) => Promise<any>) { this.onFunctionCall = callback; }
+
+  // Acumula el usage de un response.done. La API reporta el desglose de tokens
+  // de entrada (audio/texto, cacheados o no) y de salida.
+  private acumularUso(usage: any) {
+    if (!usage) return;
+    const itd = usage.input_token_details || {};
+    const otd = usage.output_token_details || {};
+    const ctd = itd.cached_tokens_details || {};
+    const audioIn = itd.audio_tokens || 0;
+    const textIn = itd.text_tokens || 0;
+    const cachedTotal = itd.cached_tokens || 0;
+    // Si la API no desglosa el cache, aproximamos: el grueso del contexto es audio.
+    const cachedAudio = ctd.audio_tokens ?? Math.min(cachedTotal, audioIn);
+    const cachedText = ctd.text_tokens ?? Math.max(0, cachedTotal - cachedAudio);
+    this.uso.audioIn += audioIn;
+    this.uso.textIn += textIn;
+    this.uso.cachedAudioIn += cachedAudio;
+    this.uso.cachedTextIn += cachedText;
+    this.uso.audioOut += otd.audio_tokens || 0;
+    this.uso.textOut += otd.text_tokens || 0;
+  }
+
+  // Costo real en USD de la parte OpenAI Realtime de la llamada (sin Twilio ni
+  // whisper). Los tokens cacheados se cobran a la tarifa reducida.
+  costoUsdOpenAI(): number {
+    const P = PRECIOS_REALTIME_USD_POR_1M;
+    const u = this.uso;
+    const audioInSinCache = Math.max(0, u.audioIn - u.cachedAudioIn);
+    const textInSinCache = Math.max(0, u.textIn - u.cachedTextIn);
+    return (
+      audioInSinCache * P.audioIn +
+      textInSinCache * P.textIn +
+      u.cachedAudioIn * P.cached +
+      u.cachedTextIn * P.cached +
+      u.audioOut * P.audioOut +
+      u.textOut * P.textOut
+    ) / 1_000_000;
+  }
+
+  // Desglose de tokens + costo, para el log de fin de llamada y diagnóstico.
+  resumenUso() {
+    return { ...this.uso, costoUsd: this.costoUsdOpenAI() };
+  }
 
   cerrar() {
     this.cancelarDebounceRespuesta();
