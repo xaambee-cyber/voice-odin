@@ -9,7 +9,13 @@ const config_1 = require("../utils/config");
 // Voces disponibles en gpt-realtime (GA): alloy, ash, ballad, cedar, coral,
 // echo, marin, sage, shimmer, verse. Default: marin (más natural en español).
 const VOZ_DEFAULT = "marin";
-const MODELO = "gpt-realtime";
+// MODELO con FALLBACK automático: intentamos primero la versión 2.1
+// (jul 2026: −25% latencia p95, mejor manejo de ruido/interrupciones y de
+// números dictados). Si la cuenta aún no la tiene habilitada, la conexión se
+// reintenta sola con el alias estable — una llamada JAMÁS se pierde por
+// apostar al modelo nuevo. Override manual con REALTIME_MODEL en el env.
+const MODELO_PREFERIDO = process.env.REALTIME_MODEL || "gpt-realtime-2.1";
+const MODELO_FALLBACK = "gpt-realtime";
 // Formato de audio para Twilio: G.711 μ-law a 8kHz.
 // En GA la API espera objeto con `type`, valor "audio/pcmu" (codec estándar).
 const FORMATO_AUDIO_TWILIO = { type: "audio/pcmu" };
@@ -79,10 +85,17 @@ class OpenAIRealtime {
     systemPrompt;
     tools;
     voz;
+    /** Velocidad de la voz (0.25–1.5, 1.0 default). Se fija al configurar la sesión. */
+    velocidad = null;
+    /** Con qué modelo quedó la sesión (preferido o fallback) — para logs. */
+    modeloActivo = MODELO_PREFERIDO;
     respondiendo = false;
     graceUntil = 0;
     saludoEnviado = false;
     cancelacionEnCurso = false;
+    /** Espera SILENCIOSA: la frase de espera ya terminó y el fetch sigue en
+     *  curso. El pipeline usa este hook para reproducir el tecleo. */
+    onEspera = null;
     // Contabilidad de costo real: acumula los tokens que la API reporta en cada
     // response.done (msg.response.usage). Antes se mandaba costoUsd:0 a Odin y la
     // voz salía "gratis" en los márgenes. Esto la hace medible por llamada.
@@ -109,10 +122,25 @@ class OpenAIRealtime {
         this.tools = tools;
         this.voz = voz;
     }
-    // Abre WebSocket y espera evento session.created antes de resolver.
+    // Abre WebSocket y espera session.created. Intenta primero MODELO_PREFERIDO
+    // y, si el WS falla antes de crear sesión (modelo no habilitado en la
+    // cuenta, typo del env), reintenta UNA vez con MODELO_FALLBACK.
     async abrirConexion() {
+        try {
+            await this.conectarModelo(MODELO_PREFERIDO);
+            this.modeloActivo = MODELO_PREFERIDO;
+        }
+        catch (err) {
+            if (MODELO_PREFERIDO === MODELO_FALLBACK)
+                throw err;
+            console.warn(`[REALTIME] ${MODELO_PREFERIDO} no disponible (${err?.message || err}) → fallback a ${MODELO_FALLBACK}`);
+            await this.conectarModelo(MODELO_FALLBACK);
+            this.modeloActivo = MODELO_FALLBACK;
+        }
+    }
+    conectarModelo(modelo) {
         return new Promise((resolve, reject) => {
-            const url = `wss://api.openai.com/v1/realtime?model=${MODELO}`;
+            const url = `wss://api.openai.com/v1/realtime?model=${modelo}`;
             this.ws = new ws_1.default(url, {
                 headers: { "Authorization": `Bearer ${config_1.config.openaiApiKey}` },
             });
@@ -125,7 +153,7 @@ class OpenAIRealtime {
                     const msg = JSON.parse(data.toString());
                     if (msg.type === "session.created" && !inicializado) {
                         inicializado = true;
-                        console.log(`[REALTIME] Sesión lista (${MODELO}, voz=${this.voz})`);
+                        console.log(`[REALTIME] Sesión lista (${modelo}, voz=${this.voz})`);
                         resolve();
                     }
                     this.handleMessage(msg);
@@ -155,16 +183,20 @@ class OpenAIRealtime {
     //   - voice va dentro de audio.output, no en raíz
     //   - formato es objeto { type: "audio/pcmu" } no string "g711_ulaw"
     // ============================================================================
-    configurarSesion(prompt, tools = [], voz) {
+    configurarSesion(prompt, tools = [], voz, velocidad) {
         this.systemPrompt = prompt;
         this.tools = tools;
         if (voz)
             this.voz = voz;
+        // Velocidad de habla: clamp al rango soportado por la API (0.25–1.5).
+        if (typeof velocidad === "number" && Number.isFinite(velocidad)) {
+            this.velocidad = Math.min(1.5, Math.max(0.25, velocidad));
+        }
         if (!this.ws || !this.conectado)
             return;
         const sessionConfig = {
             type: "realtime",
-            model: MODELO,
+            model: this.modeloActivo,
             output_modalities: ["audio"],
             instructions: prompt,
             audio: {
@@ -191,6 +223,9 @@ class OpenAIRealtime {
                 output: {
                     format: FORMATO_AUDIO_TWILIO,
                     voice: this.voz,
+                    // speed solo cambia la velocidad de REPRODUCCIÓN; el ritmo real lo
+                    // dirige el bloque de actuación del prompt. Se omite si no se pidió.
+                    ...(this.velocidad != null && this.velocidad !== 1 ? { speed: this.velocidad } : {}),
                 },
             },
         };
@@ -234,11 +269,22 @@ class OpenAIRealtime {
                     console.log("[REALTIME] Sesión configurada → enviando saludo");
                     this.graceUntil = Date.now() + 1500;
                     if (this.ws && this.conectado) {
+                        // SALUDO VARIADO: cada llamada arranca con un matiz distinto — un
+                        // humano jamás contesta dos veces con exactamente la misma frase.
+                        // Si el negocio configuró SALUDO INICIAL (está en el prompt), el
+                        // modelo lo respeta; esto solo varía el color de la entrega.
+                        const ESTILOS = [
+                            "con energía cálida, como si te alegrara la llamada",
+                            "sonriendo (que se escuche amable)",
+                            "tranquila y profesional",
+                            "con tono servicial y ágil",
+                        ];
+                        const estilo = ESTILOS[Math.floor(Math.random() * ESTILOS.length)];
                         // GA: response.create ya NO acepta `modalities` — solo `instructions`
                         this.ws.send(JSON.stringify({
                             type: "response.create",
                             response: {
-                                instructions: "Saluda brevemente al cliente en español mexicano. Una sola oración corta como: 'Hola, ¿en qué te puedo ayudar?' Nada más.",
+                                instructions: `Saluda al cliente en español mexicano, ${estilo}. Si tus instrucciones traen un SALUDO INICIAL, transmítelo con tus palabras; si no, algo breve tipo "Hola, ¿en qué te puedo ayudar?". UNA sola oración corta, con formulación natural (no leas un guion). Nada más.`,
                             },
                         }));
                     }
@@ -285,6 +331,9 @@ class OpenAIRealtime {
                     break;
                 // graceUntil protege la frase de espera (y el arranque del saludo) de que
                 // el eco/ruido las corte durante su ventana estimada de reproducción.
+                // El cliente habló: si estaba sonando el tecleo de espera, se corta —
+                // jamás debe teclear encima de la voz del cliente.
+                this.onEspera?.(false);
                 if (this.respondiendo && this.ws && this.conectado && Date.now() > this.graceUntil && !this.cancelacionEnCurso) {
                     this.cancelacionEnCurso = true;
                     if (this.onInterrupcion)
@@ -326,6 +375,12 @@ class OpenAIRealtime {
                     // La frase de espera terminó de generarse. Si el resultado ya llegó, se
                     // dice ahora (se encola en Twilio justo después de la frase).
                     this.intentarHablarResultado();
+                    // ¿El fetch sigue en curso? Entonces viene una ESPERA SILENCIOSA:
+                    // el pipeline reproduce el tecleo ("está buscando en el sistema")
+                    // hasta que llegue el resultado o el cliente hable.
+                    if (this.funcionLentaPendiente && !this.resultadoPendiente && !this.esperaInterrumpida) {
+                        this.onEspera?.(true);
+                    }
                     break;
                 }
                 // Terminó la respuesta que contenía el function_call. Si el fetch sigue en
@@ -451,6 +506,8 @@ class OpenAIRealtime {
     crearRespuesta() {
         if (!this.ws || !this.conectado)
             return;
+        // Va a hablar: la espera silenciosa (tecleo) termina aquí SIEMPRE.
+        this.onEspera?.(false);
         this.respondiendo = true;
         this.ws.send(JSON.stringify({ type: "response.create" }));
     }
@@ -513,6 +570,9 @@ class OpenAIRealtime {
         }
     }
     setOnAudioDelta(callback) { this.onAudioDelta = callback; }
+    /** true = arranca espera silenciosa (fetch en curso, nadie hablando);
+     *  false = terminó (va a hablar alguien o el cliente interrumpió). */
+    setOnEspera(callback) { this.onEspera = callback; }
     setOnTranscript(callback) { this.onTranscript = callback; }
     setOnItemCreated(callback) { this.onItemCreated = callback; }
     setOnInterrupcion(callback) { this.onInterrupcion = callback; }

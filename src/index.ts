@@ -178,6 +178,28 @@ async function dispararSlaEscalamientos() {
 setInterval(dispararSlaEscalamientos, SLA_MS);
 setTimeout(dispararSlaEscalamientos, 60_000); // primer barrido al minuto del arranque
 
+// ═══ Benchmarks por giro ═══
+// Igual que el SLA: sin Vercel Cron (todo vive en VPS), este server dispara el
+// recálculo de snapshots/cohortes. Cada 6 h es de sobra (los datos son del mes
+// en curso y el endpoint es idempotente).
+const BENCHMARKS_MS = 6 * 60 * 60 * 1000;
+async function dispararBenchmarks() {
+  if (!config.voiceServerSecret) return;
+  try {
+    const resp = await fetch(`${config.odinAppUrl}/api/cron/benchmarks`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.voiceServerSecret}` },
+      signal: AbortSignal.timeout(280_000),
+    });
+    const data = await resp.json().catch(() => ({}));
+    console.log(`[BENCHMARKS] → ${resp.status}`, data);
+  } catch (err: any) {
+    console.warn("[BENCHMARKS] falló:", err?.message || err);
+  }
+}
+setInterval(dispararBenchmarks, BENCHMARKS_MS);
+setTimeout(dispararBenchmarks, 3 * 60_000); // primer cálculo a los 3 min del arranque
+
 async function warmupOdin() {
   try {
     const authHeader: Record<string, string> = config.voiceServerSecret

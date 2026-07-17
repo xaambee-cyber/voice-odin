@@ -9,6 +9,7 @@ const twilio_1 = __importDefault(require("twilio"));
 const realtime_1 = require("../openai/realtime");
 const config_1 = require("../utils/config");
 const registro_voz_1 = require("../api/registro-voz");
+const sonidos_1 = require("../utils/sonidos");
 const DIAS_ES = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
 function construirHerramientas(cfg) {
     const herramientas = [];
@@ -236,6 +237,15 @@ function buildSystemPrompt(cfg, contextoExtra) {
     const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
     const pedidosActiva = cfg.habilidadesActivas?.pedidos ?? cfg.habilidades.includes("pedidos");
     const verificarDispReserva = cfg.verificarDisponibilidadReserva === true && solicitudReservaActiva;
+    // CITAS con anticipo: el negocio exige depósito para apartar la cita. El
+    // agente pide el anticipo y NO promete la cita confirmada (ver AGENDA DE
+    // CITAS). El monto exacto lo calcula el backend al agendar.
+    const requiereAnticipoCitas = cfg.requiereAnticipoCitas === true && agendaActiva;
+    const anticipoCitasPctVoz = requiereAnticipoCitas && cfg.anticipoCitas?.modalidad === "anticipo"
+        ? `anticipo del ${cfg.anticipoCitas.porcentaje || 50} por ciento`
+        : requiereAnticipoCitas
+            ? "pago completo por adelantado"
+            : null;
     const metodoPago = cfg.metodoPago || null;
     // Lista completa de métodos. Si vienen, las usamos; si no, fallback al
     // único método legacy.
@@ -359,6 +369,16 @@ FORMATO OBLIGATORIO — ESTÁS EN UNA LLAMADA TELEFÓNICA:
 - ABSOLUTAMENTE PROHIBIDO: asteriscos, guiones de lista, negritas (**texto**), numeración (1. 2. 3.), markdown de cualquier tipo.
 - Si tienes varios servicios, dícelos como en una conversación: "tenemos limpieza, radiografía y valoración" — no en lista.
 - Máximo 2 oraciones por respuesta. Directo y natural.
+
+=== ACTUACIÓN DE VOZ — CÓMO SUENAS (tan importante como lo que dices) ===
+Suenas como una recepcionista mexicana real, de carne y hueso, atendiendo el teléfono del negocio. Nadie debe notar que eres IA por tu forma de hablar.
+- ENTREGA: cálida, segura, con una sonrisa que se escuche. Frases cortas, una idea por frase, ritmo ágil sin sonar apurada.
+- NATURALIDAD: de vez en cuando (no siempre, máximo una por turno) abre con una micro-reacción natural: "claro", "va", "mmm, déjame ver", "perfecto", "ah, sí". Varía SIEMPRE tus arranques: jamás empieces dos turnos seguidos con la misma palabra.
+- CONFIRMACIÓN HUMANA: cuando el cliente te dé un dato importante (fecha, hora, nombre, servicio), repítelo breve y natural antes de continuar: "El sábado a las cuatro, perfecto…". Así confirmas sin sonar a robot que lee un formulario.
+- NÚMEROS EN VOZ ALTA: los teléfonos se dicen de dos en dos dígitos ("cincuenta y cinco… doce… treinta y cuatro…"); los precios con palabras ("quinientos pesos", nunca "500 pesos" leído en frío); las horas SIEMPRE con "de la mañana / de la tarde / de la noche".
+- ADAPTACIÓN: si el cliente habla rápido y va al grano, tú también. Si suena mayor o confundido, baja el ritmo y sé más clara. Si está molesto, suaviza el tono y no lo interrumpas.
+- IMPERFECCIÓN CONTROLADA: puedes reformular a media frase como un humano ("tenemos el… bueno, mira, lo que más piden es…") pero solo ocasionalmente y sin perder claridad.
+- PROHIBIDO sonar a menú telefónico, a locutora de comercial o a asistente corporativo. Eres una persona del equipo del negocio.
 ${cfg.saludoInicial && cfg.saludoInicial.trim() ? `
 SALUDO INICIAL OBLIGATORIO:
 Tu PRIMER mensaje de la llamada debe transmitir esto (dilo natural, hablado, sin leerlo robótico): "${cfg.saludoInicial.trim()}"
@@ -420,18 +440,25 @@ SERVICIOS DISPONIBLES PARA CITAS (usa el ID exacto al agendar):
 ${serviciosTexto || "No hay servicios configurados"}
 ${citasClienteTexto ? `\nCITAS VIGENTES DEL CLIENTE:\n${citasClienteTexto}` : "\nEste cliente no tiene citas vigentes."}
 
+REGLAS AL HABLAR DE HORARIOS (obligatorias):
+- Di TODA hora en formato de 12 horas con am/pm: "3:00 p.m.", "11:30 a.m."; el mediodía es "12:00 p.m.". NUNCA digas la hora en formato de 24 horas ni la pongas entre paréntesis.
+- "El [día]" o "el próximo [día]" = la ocurrencia MÁS CERCANA de ese día. Si dudas, confirma repitiendo el día de la semana + el número antes de agendar (ej. "el martes 8, ¿correcto?").
+- NO inventes ni enlistes horarios: no sabes cuáles están ocupados. Si el cliente pregunta "¿qué horarios tienes?", pregúntale a qué hora le gustaría y valida esa hora agendando; el sistema te dirá si está libre o te dará las horas cercanas.
+- EN CUANTO el cliente diga una hora concreta, agéndala o reagéndala de inmediato; NO vuelvas a preguntar disponibilidad ni repitas la misma ventana (eso es un bucle).
+
 INSTRUCCIONES PARA CITAS:
 1. AGENDAR: El cliente debe confirmar servicio + fecha + hora EXACTA antes de que llames a agendar_cita.
-   - Si el sistema responde que el horario está ocupado, informa los horarios disponibles y pregunta cuál prefiere.
+   - Si el horario está ocupado (409), la función te devuelve un mensaje con SOLO las dos horas más cercanas en am/pm: ofréceselas tal cual ("te puedo a las 2:30 o a las 4, ¿cuál prefieres?"), máximo dos por frase. NUNCA recites listas de horarios. Solo si el cliente pide ver el panorama, menciona las ventanas libres como rangos ("tengo libre de 7 a 9 de la mañana"). Si la función no trae horas cercanas, pregúntale al cliente a qué otra hora le gustaría.
    - Solo agenda dentro del horario de atención: ${horariosTexto || "No especificado"}
-   - INTERPRETACIÓN AM/PM: por teléfono la gente dice la hora en formato de 12h sin "am/pm". Interpreta SIEMPRE la hora que cae dentro del horario de atención. Ej.: si atiendes de 9 a 6 y el cliente dice "a las 3", es 15:00 (3 de la tarde), NO 03:00. Si la hora cabe en ambos turnos y es ambigua, pregunta "¿a las [hora] de la mañana o de la tarde?" antes de agendar. A agendar_cita la hora va SIEMPRE en formato 24h (THH:MM); cuando le confirmes la hora al cliente, dila con "de la mañana/tarde/noche" para que no haya confusión.
+   - INTERPRETACIÓN AM/PM: por teléfono la gente dice la hora en formato de 12h sin "am/pm". Interpreta SIEMPRE la hora que cae dentro del horario de atención. Ej.: si atiendes de 9 a 6 y el cliente dice "a las 3", es 15:00 (3 de la tarde), NO 03:00. Si la hora cabe en ambos turnos y es ambigua, pregunta "¿a las [hora] de la mañana o de la tarde?" antes de agendar. IMPORTANTE: a la función agendar_cita la hora va SIEMPRE en formato 24h (THH:MM) — ese es un dato interno; pero cuando le HABLES al cliente, di la hora SIEMPRE en 12h con am/pm ("las 3:00 p.m."), nunca en 24h ni entre paréntesis.
    - Usa la fecha y hora actual para calcular fechas relativas ("mañana", "el martes")
    - DATOS ADICIONALES DEL SERVICIO: algunos servicios de tu lista tienen una línea "Datos a recolectar antes de agendar". Si el servicio elegido la tiene:
      · ANTES de llamar a agendar_cita, recolecta conversando TODOS los campos marcados OBLIGATORIO. Pregunta de forma natural usando la etiqueta del campo (ej. para "Dirección de recolección" pregunta "¿En qué dirección recogemos?"). NUNCA digas el ID ni la palabra "campo".
      · Los campos "opcional" pregúntalos solo si fluye natural; si el cliente no los da, omítelos sin insistir.
      · Pasa lo recolectado en el parámetro camposAgenda usando como LLAVE el ID entre [campo:...] (ej. "c1"), nunca la etiqueta. Omite los campos opcionales que el cliente no haya dado.
      · Si el servicio NO tiene esa línea, agenda igual que siempre: NO mandes camposAgenda.
-   - REGLA DE ORO: NUNCA confirmes la cita al cliente hasta que agendar_cita responda con éxito. Si la función te dice que faltan datos, pídeselos al cliente exactamente y vuelve a llamar a agendar_cita; no des la cita por hecha mientras falten.
+   - REGLA DE ORO: NUNCA confirmes la cita al cliente hasta que agendar_cita responda con éxito. Si la función te dice que faltan datos, pídeselos al cliente exactamente y vuelve a llamar a agendar_cita; no des la cita por hecha mientras falten.${requiereAnticipoCitas ? `
+   - ANTICIPO OBLIGATORIO PARA APARTAR: este negocio pide un ${anticipoCitasPctVoz} para reservar la cita. NO prometas la cita como confirmada. Recolecta servicio + fecha + hora y llama a agendar_cita como siempre; el sistema aparta el horario, calcula el monto del anticipo y manda los datos de pago por WhatsApp a este mismo número. La función te devuelve un "mensaje" con el monto — dilo TAL CUAL. Deja claro que la cita SOLO queda confirmada cuando el cliente realice el pago; NO dictes números de cuenta ni links en voz (van por WhatsApp).` : ""}
 
 2. CANCELAR: Confirma explícitamente con el cliente antes de llamar a cancelar_cita. El cliente debe pedir cancelar de forma clara y directa. Si hay ambigüedad, pregunta: "¿Quieres cancelar tu cita?"
 
@@ -588,6 +615,20 @@ function mensajeDatosPagoVoz(mp, info) {
     const opciones = lista.map(viaDe).join(", o ");
     return `${encabezado} Aceptamos varias formas de pago: ${opciones}. Te paso los datos completos por WhatsApp para que elijas la que prefieras. Avísame cuando hayas pagado para confirmarlo con el equipo.`;
 }
+// Mensaje hablado cuando una CITA queda apartada esperando el anticipo. En
+// llamada NO se dictan datos de pago: el backend (/api/voice/citas) ya los
+// mandó por WhatsApp al número que llamó. Aquí solo decimos el monto y que la
+// cita se confirma al pagar — NUNCA que ya quedó confirmada.
+function mensajeAnticipoCitaVoz(monto, esMercadoPago, whatsappEnviado) {
+    const montoTxt = typeof monto === "number" && isFinite(monto) && monto > 0
+        ? ` de ${monto.toLocaleString("es-MX")} pesos`
+        : "";
+    const via = esMercadoPago ? "un link de pago" : "los datos de pago";
+    const envio = whatsappEnviado
+        ? `Te acabo de enviar ${via} por WhatsApp a este mismo número.`
+        : `En un momento te llegan ${via} por WhatsApp a este mismo número.`;
+    return `Para apartar tu cita necesitas un anticipo${montoTxt}. ${envio} En cuanto lo realices, tu cita queda confirmada y el equipo te avisa. ¿Hay algo más en lo que te pueda ayudar?`;
+}
 // Normaliza un número telefónico para comparación (solo dígitos, sin +).
 function digitosDe(s) {
     return String(s || "").replace(/[^\d]/g, "");
@@ -600,6 +641,75 @@ function mismoNumero(a, b) {
     if (!da || !db)
         return false;
     return da.slice(-10) === db.slice(-10);
+}
+// Convierte una hora en 24h ("15:00", "07:15") a 12h con am/pm en español
+// ("3:00 p.m.", "7:15 a.m."). Mediodía → "12:00 p.m.", medianoche → "12:00 a.m.".
+// Si el valor no es parseable lo regresa tal cual (defensivo: nunca truena).
+function hora24aAmPm(hhmm) {
+    const m = /^(\d{1,2}):(\d{2})/.exec(String(hhmm ?? "").trim());
+    if (!m)
+        return String(hhmm ?? "");
+    const h = Number(m[1]);
+    const min = m[2];
+    if (!Number.isFinite(h) || h < 0 || h > 23)
+        return String(hhmm ?? "");
+    const sufijo = h < 12 ? "a.m." : "p.m.";
+    const h12 = h % 12 === 0 ? 12 : h % 12;
+    return `${h12}:${min} ${sufijo}`;
+}
+const MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+];
+// Formatea un "YYYY-MM-DDTHH:MM" (formato interno de fechaInicio) a algo hablable
+// en 12h: "el 8 de julio a las 3:00 p.m.". Nunca dice la fecha ISO ni la hora en
+// 24h. Si no matchea el patrón, cae a un reemplazo suave para no perder el dato.
+function fechaHoraNatural(iso) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{1,2}:\d{2})/.exec(String(iso ?? "").trim());
+    if (!m)
+        return String(iso ?? "").replace("T", " a las ");
+    const dia = Number(m[3]);
+    const mes = MESES_ES[Number(m[2]) - 1];
+    const hora = hora24aAmPm(m[4]);
+    return mes ? `el ${dia} de ${mes} a las ${hora}` : `a las ${hora}`;
+}
+// Construye la respuesta de "horario ocupado" (409) para agendar/reagendar a
+// partir del nuevo contrato del backend. Regla de negocio: al hablar NO se
+// recitan listas (`slotsDisponibles` queda ignorado a propósito). Se ofrecen
+// SOLO las dos horas más cercanas (`recomendaciones`) ya convertidas a 12h;
+// las `ventanasLibres` se devuelven formateadas para que el modelo las use solo
+// si el cliente pide el panorama. Si no llegan recomendaciones (backend viejo o
+// sin cercanas), el fallback es preguntar la hora preferida.
+function respuestaHorarioOcupado(data) {
+    const cercanas = [];
+    const antes = data?.recomendaciones?.antes;
+    const despues = data?.recomendaciones?.despues;
+    if (typeof antes === "string" && antes.trim())
+        cercanas.push(hora24aAmPm(antes));
+    if (typeof despues === "string" && despues.trim())
+        cercanas.push(hora24aAmPm(despues));
+    const ventanas = Array.isArray(data?.ventanasLibres)
+        ? data.ventanasLibres
+            .filter((v) => v && typeof v.desde === "string" && typeof v.hasta === "string")
+            .map((v) => `de ${hora24aAmPm(v.desde)} a ${hora24aAmPm(v.hasta)}`)
+        : [];
+    let mensaje;
+    if (cercanas.length === 2) {
+        mensaje = `Ese horario ya está ocupado. ¿Te puedo agendar a las ${cercanas[0]} o a las ${cercanas[1]}?`;
+    }
+    else if (cercanas.length === 1) {
+        mensaje = `Ese horario ya está ocupado. ¿Te sirve a las ${cercanas[0]}, o prefieres otra hora?`;
+    }
+    else {
+        // Sin horas cercanas: NO recitamos slots. Preguntamos la hora preferida.
+        mensaje = `Ese horario ya está ocupado. ¿A qué otra hora te gustaría? Yo reviso si está libre.`;
+    }
+    const out = { ok: false, mensaje };
+    if (cercanas.length > 0)
+        out.recomendaciones = cercanas;
+    if (ventanas.length > 0)
+        out.ventanasLibres = ventanas;
+    return out;
 }
 class PipelineLlamada {
     ws;
@@ -631,6 +741,21 @@ class PipelineLlamada {
     // true = el negocio no tiene créditos: la llamada se rechazó con mensaje
     // corto y NO se manda webhook de cierre (no hay nada que cobrar/guardar).
     saldoBloqueado = false;
+    // ── TECLEO de espera ("está buscando en el sistema") ─────────────────────
+    // Suena SOLO en la espera silenciosa: después de la frase de espera y
+    // mientras el fetch de la herramienta sigue corriendo. Se corta al instante
+    // si el cliente habla o cuando el agente retoma la palabra.
+    tecleoTimer = null;
+    tecleoDesde = 0;
+    tecleoIdx = 0;
+    static TECLEO_MAX_MS = 15_000; // red de seguridad
+    // ── ROOM TONE (opt-in: AMBIENTE_LLAMADA=on) ──────────────────────────────
+    // "Aire" de oficina casi subliminal para matar el silencio digital muerto.
+    // Va en cola DESPUÉS del audio del agente (Twilio reproduce en orden), así
+    // que nunca ensucia la voz; en interrupciones el "clear" lo tira junto con
+    // el resto del buffer.
+    ambienteTimer = null;
+    ambienteIdx = 0;
     constructor(ws, negocioId, configNegocio, callerNumber = "", numeroTwilio = "", callSid = "", forwardedFrom = "") {
         this.ws = ws;
         this.negocioId = negocioId;
@@ -730,6 +855,8 @@ class PipelineLlamada {
     // Realtime corriendo. Sin webhook de cierre (saldoBloqueado lo omite).
     async rechazarPorSaldo() {
         this.saldoBloqueado = true;
+        this.detenerTecleo();
+        this.detenerAmbiente();
         console.warn(`[PIPELINE] Negocio ${this.negocioId || "?"} SIN créditos — rechazando llamada ${this.callSid}`);
         try {
             this.realtime.cerrar();
@@ -807,23 +934,37 @@ class PipelineLlamada {
                                 mensaje: `Antes de agendar necesito un par de datos más: ${data.faltantes.join(", ")}. ¿Me los puedes dar?`,
                             };
                         }
-                        // 409 Horario ocupado: ofrecer los horarios disponibles.
-                        if (data.slotsDisponibles) {
-                            return {
-                                ok: false,
-                                mensaje: `Ese horario está ocupado. Los horarios disponibles ese día son: ${data.slotsDisponibles.join(", ")}. ¿Cuál te conviene?`,
-                            };
+                        // 409 Horario ocupado: ofrecemos SOLO las dos horas más cercanas
+                        // (recomendaciones) en 12h. Ya NO recitamos slotsDisponibles.
+                        if (resp.status === 409 || data.recomendaciones || data.ventanasLibres || data.slotsDisponibles) {
+                            return respuestaHorarioOcupado(data);
                         }
                         return { ok: false, mensaje: "No pude registrar la cita. Por favor intenta con otro horario." };
                     }
+                    // 201 con anticipo: la cita NO está confirmada, quedó apartada
+                    // esperando el pago. Decimos el monto y que los datos van por WhatsApp
+                    // (el backend ya los envió). NO la damos por confirmada.
+                    if (data.esperandoPago) {
+                        return {
+                            ok: true,
+                            citaId: data.citaId,
+                            mensaje: mensajeAnticipoCitaVoz(data.montoAnticipo, data.esMercadoPago === true, data.mensajeWhatsappEnviado === true),
+                        };
+                    }
                     // 201 ok: la cita quedó agendada. Recién aquí confirmamos al cliente.
-                    return { ok: true, citaId: data.citaId, mensaje: `Tu cita quedó registrada para ${args.fechaInicio.replace("T", " a las ")}. ¿Hay algo más en lo que te pueda ayudar?` };
+                    return { ok: true, citaId: data.citaId, mensaje: `Tu cita quedó registrada para ${fechaHoraNatural(args.fechaInicio)}. ¿Hay algo más en lo que te pueda ayudar?` };
                 }
                 case "cancelar_cita": {
                     const resp = await fetch(`${odinUrl}/api/voice/citas`, {
                         method: "PATCH",
                         headers: { "Content-Type": "application/json", ...odinAuth() },
-                        body: JSON.stringify({ citaId: args.citaId, accion: "cancelar" }),
+                        // clienteTelefono: el backend valida que la cita sea de ESTE
+                        // llamante antes de cancelar (impide cancelar la cita de otro).
+                        body: JSON.stringify({
+                            citaId: args.citaId,
+                            accion: "cancelar",
+                            clienteTelefono: callerNumber || "desconocido",
+                        }),
                         signal: AbortSignal.timeout(8000),
                     });
                     if (!resp.ok)
@@ -839,16 +980,17 @@ class PipelineLlamada {
                             accion: "reagendar",
                             servicioId: args.servicioId,
                             fechaInicio: args.fechaInicio,
+                            // clienteTelefono: el backend valida que la cita sea de ESTE
+                            // llamante antes de moverla (impide reagendar la cita de otro).
+                            clienteTelefono: callerNumber || "desconocido",
                         }),
                         signal: AbortSignal.timeout(8000),
                     });
-                    const data = await resp.json();
+                    const data = (await resp.json().catch(() => ({})));
                     if (!resp.ok) {
-                        if (data.slotsDisponibles) {
-                            return {
-                                ok: false,
-                                mensaje: `Ese horario está ocupado. Los horarios disponibles son: ${data.slotsDisponibles.join(", ")}. ¿Cuál prefieres?`,
-                            };
+                        // 409 Horario ocupado al reagendar: mismas dos horas cercanas en 12h.
+                        if (resp.status === 409 || data.recomendaciones || data.ventanasLibres || data.slotsDisponibles) {
+                            return respuestaHorarioOcupado(data);
                         }
                         return { ok: false, mensaje: "No pude modificar la cita. Por favor intenta con otro horario." };
                     }
@@ -1115,9 +1257,74 @@ class PipelineLlamada {
             return { ok: false, mensaje: "Hubo un problema procesando la acción. Por favor intenta de nuevo." };
         }
     }
+    // ── Tecleo de espera ──────────────────────────────────────────────────────
+    iniciarTecleo() {
+        if (this.tecleoTimer)
+            return;
+        // Arranca en un punto aleatorio del loop para que dos esperas seguidas
+        // no suenen idénticas.
+        this.tecleoIdx = Math.floor(Math.random() * sonidos_1.FRAMES_TECLEO.length);
+        this.tecleoDesde = Date.now();
+        this.tecleoTimer = setInterval(() => {
+            if (Date.now() - this.tecleoDesde > PipelineLlamada.TECLEO_MAX_MS) {
+                this.detenerTecleo();
+                return;
+            }
+            this.enviarFrameCrudo(sonidos_1.FRAMES_TECLEO[this.tecleoIdx++ % sonidos_1.FRAMES_TECLEO.length]);
+        }, sonidos_1.MS_POR_FRAME);
+        console.log("[SONIDO] Tecleo de espera ON");
+    }
+    detenerTecleo() {
+        if (!this.tecleoTimer)
+            return;
+        clearInterval(this.tecleoTimer);
+        this.tecleoTimer = null;
+        // Tirar el tecleo ya encolado en Twilio para que la voz entre limpia al
+        // instante (mismo mecanismo que las interrupciones).
+        this.limpiarAudioTwilio();
+        console.log("[SONIDO] Tecleo de espera OFF");
+    }
+    // ── Room tone (opt-in) ────────────────────────────────────────────────────
+    iniciarAmbiente() {
+        if (!sonidos_1.AMBIENTE_ACTIVO || this.ambienteTimer)
+            return;
+        this.ambienteTimer = setInterval(() => {
+            // El tecleo manda: cuando suena, el ambiente se pausa (ya trae su aire).
+            if (this.tecleoTimer)
+                return;
+            this.enviarFrameCrudo(sonidos_1.FRAMES_AMBIENTE[this.ambienteIdx++ % sonidos_1.FRAMES_AMBIENTE.length]);
+        }, sonidos_1.MS_POR_FRAME);
+        console.log("[SONIDO] Room tone ON (AMBIENTE_LLAMADA=on)");
+    }
+    detenerAmbiente() {
+        if (!this.ambienteTimer)
+            return;
+        clearInterval(this.ambienteTimer);
+        this.ambienteTimer = null;
+    }
+    // Frame μ-law pre-generado directo a Twilio (misma vía que la voz).
+    enviarFrameCrudo(base64Frame) {
+        if (this.ws.readyState === ws_1.default.OPEN && this.streamSid) {
+            this.ws.send(JSON.stringify({
+                event: "media",
+                streamSid: this.streamSid,
+                media: { payload: base64Frame },
+            }));
+        }
+    }
     registrarCallbacks() {
-        this.realtime.setOnAudioDelta((b) => this.enviarAudioTwilio(b));
-        this.realtime.setOnInterrupcion(() => this.limpiarAudioTwilio());
+        this.realtime.setOnAudioDelta((b) => {
+            // Si el agente empieza a hablar con el tecleo activo (carrera muy
+            // corta), el tecleo muere aquí — la voz SIEMPRE gana.
+            if (this.tecleoTimer)
+                this.detenerTecleo();
+            this.enviarAudioTwilio(b);
+        });
+        this.realtime.setOnEspera((activa) => (activa ? this.iniciarTecleo() : this.detenerTecleo()));
+        this.realtime.setOnInterrupcion(() => {
+            this.detenerTecleo();
+            this.limpiarAudioTwilio();
+        });
         this.realtime.setOnFunctionCall((nombre, args, callId) => this.manejarFuncion(nombre, args, callId));
         this.realtime.setOnItemCreated((itemId) => {
             this.historialOrdenado.push({ role: "user", content: "", itemId, pending: true });
@@ -1203,13 +1410,13 @@ class PipelineLlamada {
                 esRebote: this.esRebote,
             });
             const tools = construirHerramientas(this.configNegocio);
-            this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin");
+            this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin", this.configNegocio.velocidadVoz ?? null);
             console.log(`[PIPELINE] Saludo con memoria + voz=${this.configNegocio.voz || "marin"} — ${this.configNegocio.nombreNegocio}${this.receptorOrigen ? ` (origen=${this.receptorOrigen.etiqueta})` : ""}${this.esRebote ? " (REBOTE)" : ""}`);
         }
         else {
             const prompt = buildSystemPrompt(this.configNegocio);
             const tools = construirHerramientas(this.configNegocio);
-            this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin");
+            this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin", this.configNegocio.velocidadVoz ?? null);
             console.log(`[PIPELINE] Saludo con defaults — config llegará en background (voz=${this.configNegocio.voz || "marin"})`);
             fetchPromise.then((configCompleta) => {
                 if (!configCompleta) {
@@ -1242,6 +1449,8 @@ class PipelineLlamada {
             case "start":
                 this.streamSid = mensaje.start?.streamSid || "";
                 console.log(`[TWILIO] Stream iniciado: ${this.streamSid}`);
+                // Room tone (si está activado por env): arranca con el stream.
+                this.iniciarAmbiente();
                 break;
             case "media":
                 if (mensaje.media?.payload)
@@ -1273,6 +1482,8 @@ class PipelineLlamada {
         this.limpiarAudioTwilio();
     }
     async finalizarLlamada() {
+        this.detenerTecleo();
+        this.detenerAmbiente();
         this.realtime.cerrar();
         // Llamada rechazada por falta de créditos: no hubo conversación real —
         // nada que guardar ni cobrar.

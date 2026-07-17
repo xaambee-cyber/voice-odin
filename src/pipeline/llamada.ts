@@ -3,6 +3,7 @@ import twilio from "twilio";
 import { OpenAIRealtime, HerramientaVoz } from "../openai/realtime";
 import { config } from "../utils/config";
 import { obtenerVozPorNumero } from "../api/registro-voz";
+import { FRAMES_TECLEO, FRAMES_AMBIENTE, MS_POR_FRAME, AMBIENTE_ACTIVO } from "../utils/sonidos";
 
 // Campo adicional que el negocio definió para agendar un servicio concreto
 // (ej. "Dirección de recolección"). La llave que se manda al backend es `id`
@@ -148,6 +149,9 @@ export interface ConfigNegocio {
   // manda desde config-llamada; el pipeline corta la llamada con un mensaje
   // corto en vez de atender gratis.
   bloqueado?: boolean;
+  // Velocidad de reproducción de la voz (0.25–1.5, 1.0 default). Opcional:
+  // si Odin algún día la manda en config-llamada, aquí ya se respeta.
+  velocidadVoz?: number;
 }
 
 interface TurnoHistorial {
@@ -553,6 +557,16 @@ FORMATO OBLIGATORIO — ESTÁS EN UNA LLAMADA TELEFÓNICA:
 - ABSOLUTAMENTE PROHIBIDO: asteriscos, guiones de lista, negritas (**texto**), numeración (1. 2. 3.), markdown de cualquier tipo.
 - Si tienes varios servicios, dícelos como en una conversación: "tenemos limpieza, radiografía y valoración" — no en lista.
 - Máximo 2 oraciones por respuesta. Directo y natural.
+
+=== ACTUACIÓN DE VOZ — CÓMO SUENAS (tan importante como lo que dices) ===
+Suenas como una recepcionista mexicana real, de carne y hueso, atendiendo el teléfono del negocio. Nadie debe notar que eres IA por tu forma de hablar.
+- ENTREGA: cálida, segura, con una sonrisa que se escuche. Frases cortas, una idea por frase, ritmo ágil sin sonar apurada.
+- NATURALIDAD: de vez en cuando (no siempre, máximo una por turno) abre con una micro-reacción natural: "claro", "va", "mmm, déjame ver", "perfecto", "ah, sí". Varía SIEMPRE tus arranques: jamás empieces dos turnos seguidos con la misma palabra.
+- CONFIRMACIÓN HUMANA: cuando el cliente te dé un dato importante (fecha, hora, nombre, servicio), repítelo breve y natural antes de continuar: "El sábado a las cuatro, perfecto…". Así confirmas sin sonar a robot que lee un formulario.
+- NÚMEROS EN VOZ ALTA: los teléfonos se dicen de dos en dos dígitos ("cincuenta y cinco… doce… treinta y cuatro…"); los precios con palabras ("quinientos pesos", nunca "500 pesos" leído en frío); las horas SIEMPRE con "de la mañana / de la tarde / de la noche".
+- ADAPTACIÓN: si el cliente habla rápido y va al grano, tú también. Si suena mayor o confundido, baja el ritmo y sé más clara. Si está molesto, suaviza el tono y no lo interrumpas.
+- IMPERFECCIÓN CONTROLADA: puedes reformular a media frase como un humano ("tenemos el… bueno, mira, lo que más piden es…") pero solo ocasionalmente y sin perder claridad.
+- PROHIBIDO sonar a menú telefónico, a locutora de comercial o a asistente corporativo. Eres una persona del equipo del negocio.
 ${cfg.saludoInicial && cfg.saludoInicial.trim() ? `
 SALUDO INICIAL OBLIGATORIO:
 Tu PRIMER mensaje de la llamada debe transmitir esto (dilo natural, hablado, sin leerlo robótico): "${cfg.saludoInicial.trim()}"
@@ -932,6 +946,21 @@ export class PipelineLlamada {
   // true = el negocio no tiene créditos: la llamada se rechazó con mensaje
   // corto y NO se manda webhook de cierre (no hay nada que cobrar/guardar).
   private saldoBloqueado: boolean = false;
+  // ── TECLEO de espera ("está buscando en el sistema") ─────────────────────
+  // Suena SOLO en la espera silenciosa: después de la frase de espera y
+  // mientras el fetch de la herramienta sigue corriendo. Se corta al instante
+  // si el cliente habla o cuando el agente retoma la palabra.
+  private tecleoTimer: ReturnType<typeof setInterval> | null = null;
+  private tecleoDesde: number = 0;
+  private tecleoIdx: number = 0;
+  private static readonly TECLEO_MAX_MS = 15_000; // red de seguridad
+  // ── ROOM TONE (opt-in: AMBIENTE_LLAMADA=on) ──────────────────────────────
+  // "Aire" de oficina casi subliminal para matar el silencio digital muerto.
+  // Va en cola DESPUÉS del audio del agente (Twilio reproduce en orden), así
+  // que nunca ensucia la voz; en interrupciones el "clear" lo tira junto con
+  // el resto del buffer.
+  private ambienteTimer: ReturnType<typeof setInterval> | null = null;
+  private ambienteIdx: number = 0;
 
   constructor(
     ws: WebSocket,
@@ -1041,6 +1070,8 @@ export class PipelineLlamada {
   // Realtime corriendo. Sin webhook de cierre (saldoBloqueado lo omite).
   private async rechazarPorSaldo(): Promise<void> {
     this.saldoBloqueado = true;
+    this.detenerTecleo();
+    this.detenerAmbiente();
     console.warn(`[PIPELINE] Negocio ${this.negocioId || "?"} SIN créditos — rechazando llamada ${this.callSid}`);
     try { this.realtime.cerrar(); } catch {}
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -1488,9 +1519,73 @@ export class PipelineLlamada {
     }
   }
 
+  // ── Tecleo de espera ──────────────────────────────────────────────────────
+  private iniciarTecleo() {
+    if (this.tecleoTimer) return;
+    // Arranca en un punto aleatorio del loop para que dos esperas seguidas
+    // no suenen idénticas.
+    this.tecleoIdx = Math.floor(Math.random() * FRAMES_TECLEO.length);
+    this.tecleoDesde = Date.now();
+    this.tecleoTimer = setInterval(() => {
+      if (Date.now() - this.tecleoDesde > PipelineLlamada.TECLEO_MAX_MS) {
+        this.detenerTecleo();
+        return;
+      }
+      this.enviarFrameCrudo(FRAMES_TECLEO[this.tecleoIdx++ % FRAMES_TECLEO.length]);
+    }, MS_POR_FRAME);
+    console.log("[SONIDO] Tecleo de espera ON");
+  }
+
+  private detenerTecleo() {
+    if (!this.tecleoTimer) return;
+    clearInterval(this.tecleoTimer);
+    this.tecleoTimer = null;
+    // Tirar el tecleo ya encolado en Twilio para que la voz entre limpia al
+    // instante (mismo mecanismo que las interrupciones).
+    this.limpiarAudioTwilio();
+    console.log("[SONIDO] Tecleo de espera OFF");
+  }
+
+  // ── Room tone (opt-in) ────────────────────────────────────────────────────
+  private iniciarAmbiente() {
+    if (!AMBIENTE_ACTIVO || this.ambienteTimer) return;
+    this.ambienteTimer = setInterval(() => {
+      // El tecleo manda: cuando suena, el ambiente se pausa (ya trae su aire).
+      if (this.tecleoTimer) return;
+      this.enviarFrameCrudo(FRAMES_AMBIENTE[this.ambienteIdx++ % FRAMES_AMBIENTE.length]);
+    }, MS_POR_FRAME);
+    console.log("[SONIDO] Room tone ON (AMBIENTE_LLAMADA=on)");
+  }
+
+  private detenerAmbiente() {
+    if (!this.ambienteTimer) return;
+    clearInterval(this.ambienteTimer);
+    this.ambienteTimer = null;
+  }
+
+  // Frame μ-law pre-generado directo a Twilio (misma vía que la voz).
+  private enviarFrameCrudo(base64Frame: string) {
+    if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
+      this.ws.send(JSON.stringify({
+        event: "media",
+        streamSid: this.streamSid,
+        media: { payload: base64Frame },
+      }));
+    }
+  }
+
   private registrarCallbacks() {
-    this.realtime.setOnAudioDelta((b) => this.enviarAudioTwilio(b));
-    this.realtime.setOnInterrupcion(() => this.limpiarAudioTwilio());
+    this.realtime.setOnAudioDelta((b) => {
+      // Si el agente empieza a hablar con el tecleo activo (carrera muy
+      // corta), el tecleo muere aquí — la voz SIEMPRE gana.
+      if (this.tecleoTimer) this.detenerTecleo();
+      this.enviarAudioTwilio(b);
+    });
+    this.realtime.setOnEspera((activa) => (activa ? this.iniciarTecleo() : this.detenerTecleo()));
+    this.realtime.setOnInterrupcion(() => {
+      this.detenerTecleo();
+      this.limpiarAudioTwilio();
+    });
     this.realtime.setOnFunctionCall((nombre, args, callId) => this.manejarFuncion(nombre, args, callId));
     this.realtime.setOnItemCreated((itemId) => {
       this.historialOrdenado.push({ role: "user", content: "", itemId, pending: true });
@@ -1573,12 +1668,12 @@ export class PipelineLlamada {
         esRebote: this.esRebote,
       });
       const tools = construirHerramientas(this.configNegocio);
-      this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin");
+      this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin", (this.configNegocio as { velocidadVoz?: number }).velocidadVoz ?? null);
       console.log(`[PIPELINE] Saludo con memoria + voz=${this.configNegocio.voz || "marin"} — ${this.configNegocio.nombreNegocio}${this.receptorOrigen ? ` (origen=${this.receptorOrigen.etiqueta})` : ""}${this.esRebote ? " (REBOTE)" : ""}`);
     } else {
       const prompt = buildSystemPrompt(this.configNegocio);
       const tools = construirHerramientas(this.configNegocio);
-      this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin");
+      this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin", (this.configNegocio as { velocidadVoz?: number }).velocidadVoz ?? null);
       console.log(`[PIPELINE] Saludo con defaults — config llegará en background (voz=${this.configNegocio.voz || "marin"})`);
 
       fetchPromise.then((configCompleta) => {
@@ -1612,6 +1707,8 @@ export class PipelineLlamada {
       case "start":
         this.streamSid = mensaje.start?.streamSid || "";
         console.log(`[TWILIO] Stream iniciado: ${this.streamSid}`);
+        // Room tone (si está activado por env): arranca con el stream.
+        this.iniciarAmbiente();
         break;
       case "media":
         if (mensaje.media?.payload) this.realtime.enviarAudio(mensaje.media.payload);
@@ -1646,6 +1743,8 @@ export class PipelineLlamada {
   }
 
   private async finalizarLlamada() {
+    this.detenerTecleo();
+    this.detenerAmbiente();
     this.realtime.cerrar();
 
     // Llamada rechazada por falta de créditos: no hubo conversación real —

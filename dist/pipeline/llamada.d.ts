@@ -79,11 +79,17 @@ export interface ConfigNegocio {
     verificarDisponibilidadReserva?: boolean;
     metodoPago?: MetodoPagoNegocio | null;
     metodosPago?: MetodoPagoNegocio[];
+    requiereAnticipoCitas?: boolean;
+    anticipoCitas?: {
+        modalidad: "completo" | "anticipo";
+        porcentaje?: number;
+    } | null;
     receptoresEscalamiento?: ReceptorEscalamiento[];
     saludoInicial?: string;
     temasTransferencia?: string[];
     ubicacionUrl?: string;
     bloqueado?: boolean;
+    velocidadVoz?: number;
 }
 export declare class PipelineLlamada {
     private ws;
@@ -102,12 +108,23 @@ export declare class PipelineLlamada {
     private turnos;
     private nombreCliente;
     private saldoBloqueado;
+    private tecleoTimer;
+    private tecleoDesde;
+    private tecleoIdx;
+    private static readonly TECLEO_MAX_MS;
+    private ambienteTimer;
+    private ambienteIdx;
     constructor(ws: WebSocket, negocioId: string, configNegocio: ConfigNegocio, callerNumber?: string, numeroTwilio?: string, callSid?: string, forwardedFrom?: string);
     private calcularContextoSucursal;
     private esTranscripcionValida;
     private colgarTwilioCall;
     private rechazarPorSaldo;
     private manejarFuncion;
+    private iniciarTecleo;
+    private detenerTecleo;
+    private iniciarAmbiente;
+    private detenerAmbiente;
+    private enviarFrameCrudo;
     private registrarCallbacks;
     iniciar(): Promise<void>;
     recibirMensajeTwilio(mensaje: any): void;
