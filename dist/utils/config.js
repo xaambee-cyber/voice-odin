@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.config = void 0;
+exports.urlPublicaHttps = urlPublicaHttps;
 const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
 exports.config = {
@@ -26,4 +27,18 @@ exports.config = {
     port: parseInt(process.env.PORT || "3001"),
     voiceServerUrl: process.env.VOICE_SERVER_URL || "wss://voice-odin.duckdns.org",
 };
+/**
+ * Base HTTPS pública de este server, derivada de VOICE_SERVER_URL (que viene en
+ * wss://). Twilio la necesita para los callbacks que ejecuta él mismo — hoy el
+ * `statusCallback` del <Number> de las transferencias a humano.
+ */
+function urlPublicaHttps() {
+    const host = exports.config.voiceServerUrl
+        .replace(/^wss:\/\//, "")
+        .replace(/^ws:\/\//, "")
+        .replace(/^https:\/\//, "")
+        .replace(/^http:\/\//, "")
+        .replace(/\/+$/, "");
+    return `https://${host}`;
+}
 //# sourceMappingURL=config.js.map

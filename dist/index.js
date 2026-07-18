@@ -12,6 +12,7 @@ const twiml_1 = require("./twilio/twiml");
 const configurar_1 = require("./api/configurar");
 const preview_voz_1 = require("./api/preview-voz");
 const registro_voz_1 = require("./api/registro-voz");
+const transferencias_1 = require("./api/transferencias");
 const llamada_1 = require("./pipeline/llamada");
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
@@ -72,6 +73,87 @@ app.post("/twiml", twiml_1.handleIncomingCall);
 app.get("/twiml", twiml_1.handleIncomingCall);
 // Fallback si el WebSocket no conecta
 app.post("/twiml-fallback", twiml_1.handleFallback);
+// ═══ Fin de una transferencia a humano ═══
+// Lo llama TWILIO (no Odin): es el `statusCallback` del <Number> dentro del
+// <Dial>, con `statusCallbackEvent="completed"`. Reporta cuánto duró el tramo
+// humano — el que sigue facturando dos piernas de Twilio después de que la IA
+// salió de la línea — para que Odin lo cobre a tarifa de solo telefonía.
+//
+// Es un callback de la pierna HIJA, así que dispara sin importar quién colgó
+// primero. (El `action` del <Dial> no sirve para esto: solo corre si la llamada
+// padre sigue viva, y si el cliente cuelga primero nunca llega.)
+//
+// No lleva `requireSecret`: quien pega aquí es Twilio, que no puede portar
+// nuestro bearer. La protección real es el mapa de transferencias en vuelo — un
+// ParentCallSid que no salió de un <Dial> nuestro no existe ahí y se ignora.
+app.post("/transferencia-estado", (req, res) => {
+    // En el callback de la hija, CallSid es la pierna saliente y ParentCallSid la
+    // llamada original del cliente — que es la que conoce Odin.
+    const callSidPadre = String(req.body?.ParentCallSid || "");
+    const estado = String(req.body?.CallStatus || "");
+    const duracionSegundos = parseInt(String(req.body?.CallDuration || "0"), 10) || 0;
+    // Twilio solo necesita un 2xx; no hay TwiML que devolver aquí. Respondemos ya
+    // y reportamos a Odin sin bloquear.
+    res.sendStatus(204);
+    const transferencia = (0, transferencias_1.tomarTransferencia)(callSidPadre);
+    if (!transferencia) {
+        console.warn(`[TRANSFER] Callback sin transferencia registrada: parent=${callSidPadre || "?"} — ignorado`);
+        return;
+    }
+    console.log(`[TRANSFER] ${callSidPadre} → ${transferencia.destino}: ${duracionSegundos}s con humano (${estado || "?"})`);
+    reportarTransferencia(transferencia, duracionSegundos, estado).catch((e) => console.error("[TRANSFER] Error reportando a Odin:", e?.message || e));
+});
+/**
+ * Manda a Odin la duración del tramo humano para que lo cobre. Con reintentos
+ * por la misma razón que el webhook de cierre: si esto se pierde, el negocio usó
+ * telefonía que nadie pagó. Odin dedupea por `transferencia_segundos`, así que
+ * reintentar nunca cobra dos veces.
+ */
+async function reportarTransferencia(transferencia, duracionSegundos, estado) {
+    const payload = JSON.stringify({
+        callSid: transferencia.callSid,
+        negocioId: transferencia.negocioId,
+        duracionSegundos,
+        estado,
+    });
+    const ESPERAS_MS = [0, 4000, 15_000, 60_000];
+    for (let intento = 1; intento <= ESPERAS_MS.length; intento++) {
+        if (ESPERAS_MS[intento - 1] > 0) {
+            await new Promise((r) => setTimeout(r, ESPERAS_MS[intento - 1]));
+        }
+        try {
+            const resp = await fetch(`${config_1.config.odinAppUrl}/api/webhooks/voice-transferencia`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(config_1.config.voiceServerSecret
+                        ? { Authorization: `Bearer ${config_1.config.voiceServerSecret}` }
+                        : {}),
+                },
+                body: payload,
+                signal: AbortSignal.timeout(20_000),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok) {
+                // `sinConversacion` = el webhook de cierre todavía no creó la
+                // conversación (sigue reintentando). Reintentamos para alcanzarlo.
+                if (data?.sinConversacion && intento < ESPERAS_MS.length) {
+                    console.warn(`[TRANSFER] Conversación aún no existe (intento ${intento}) — reintentando`);
+                    continue;
+                }
+                console.log(`[TRANSFER] Odin → ${resp.status} (intento ${intento}):`, data);
+                return;
+            }
+            console.warn(`[TRANSFER] Odin HTTP ${resp.status} (intento ${intento}):`, data);
+            if (resp.status >= 400 && resp.status < 500)
+                return; // payload/config mal
+        }
+        catch (err) {
+            console.warn(`[TRANSFER] Odin falló (intento ${intento}):`, err?.message || err);
+        }
+    }
+    console.error(`[TRANSFER] AGOTÓ reintentos — tramo humano de ${transferencia.callSid} sin cobrar`);
+}
 // API para Odin (server-to-server → requieren secreto compartido)
 app.post("/api/configurar", requireSecret, configurar_1.configurarNegocio);
 app.get("/api/estado/:negocioId", requireSecret, configurar_1.obtenerEstado);
@@ -171,6 +253,9 @@ async function dispararSlaEscalamientos() {
 }
 setInterval(dispararSlaEscalamientos, SLA_MS);
 setTimeout(dispararSlaEscalamientos, 60_000); // primer barrido al minuto del arranque
+// Transferencias que nunca recibieron su callback de Twilio: se purgan a las 6 h
+// para que el mapa no crezca sin límite.
+setInterval(transferencias_1.purgarTransferenciasViejas, 60 * 60 * 1000);
 // ═══ Benchmarks por giro ═══
 // Igual que el SLA: sin Vercel Cron (todo vive en VPS), este server dispara el
 // recálculo de snapshots/cohortes. Cada 6 h es de sobra (los datos son del mes

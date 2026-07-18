@@ -26,3 +26,18 @@ export const config = {
   port: parseInt(process.env.PORT || "3001"),
   voiceServerUrl: process.env.VOICE_SERVER_URL || "wss://voice-odin.duckdns.org",
 };
+
+/**
+ * Base HTTPS pública de este server, derivada de VOICE_SERVER_URL (que viene en
+ * wss://). Twilio la necesita para los callbacks que ejecuta él mismo — hoy el
+ * `statusCallback` del <Number> de las transferencias a humano.
+ */
+export function urlPublicaHttps(): string {
+  const host = config.voiceServerUrl
+    .replace(/^wss:\/\//, "")
+    .replace(/^ws:\/\//, "")
+    .replace(/^https:\/\//, "")
+    .replace(/^http:\/\//, "")
+    .replace(/\/+$/, "");
+  return `https://${host}`;
+}

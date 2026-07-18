@@ -1,7 +1,8 @@
 import WebSocket from "ws";
 import twilio from "twilio";
 import { OpenAIRealtime, HerramientaVoz } from "../openai/realtime";
-import { config } from "../utils/config";
+import { config, urlPublicaHttps } from "../utils/config";
+import { registrarTransferencia, tomarTransferencia } from "../api/transferencias";
 import { obtenerVozPorNumero } from "../api/registro-voz";
 import { FRAMES_TECLEO, FRAMES_AMBIENTE, MS_POR_FRAME, AMBIENTE_ACTIVO } from "../utils/sonidos";
 
@@ -1452,6 +1453,22 @@ export class PipelineLlamada {
               const callerIdAttr = this.numeroTwilio
                 ? ` callerId="${this.numeroTwilio}"`
                 : "";
+              // `statusCallback` sobre el <Number> es lo que cierra la fuga de
+              // las transferencias: sin él nadie se enteraba de cuánto duró la
+              // parte humana, que sigue facturando DOS piernas de Twilio
+              // (entrante $0.0100/min + saliente a móvil $0.0473/min) con la IA
+              // ya fuera de la línea.
+              //
+              // Va en el <Number> y NO como `action` del <Dial> a propósito: el
+              // `action` solo se dispara si la llamada padre sigue viva cuando
+              // termina el <Dial>. Si el CLIENTE cuelga primero — la mitad de
+              // los casos — el padre muere y ese callback nunca llega. El
+              // statusCallback de la pierna hija es del ciclo de vida de esa
+              // llamada, así que dispara sin importar quién colgó.
+              //
+              // Al no usar `action`, el flujo de la llamada queda EXACTAMENTE
+              // como estaba: al terminar el <Dial> sin más verbos, Twilio cuelga.
+              const cbEstado = `${urlPublicaHttps()}/transferencia-estado`;
               // NO usamos <Say> de Twilio: cambiaba a Polly.Mia y se notaba
               // el corte de voz vs la del agente (marin/cedar/etc.).
               // En cambio, el AGENTE mismo dice "Te conecto con un asesor"
@@ -1462,18 +1479,36 @@ export class PipelineLlamada {
               // El delay debe ser suficiente para que termine la frase de
               // ~3s pero no tanto que el cliente se impaciente. 3500ms es
               // un buen middle ground.
+              // timeout 25 → 15 s: cada segundo que el receptor no contesta es
+              // pierna saliente facturándose para nada, y a los 15 s ya es obvio
+              // que no va a contestar.
               const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Dial${callerIdAttr} timeout="25" answerOnBridge="true">${transferTo}</Dial>
+  <Dial${callerIdAttr} timeout="15" answerOnBridge="true"><Number statusCallback="${cbEstado}" statusCallbackEvent="completed" statusCallbackMethod="POST">${transferTo}</Number></Dial>
 </Response>`;
               const callSidSnapshot = this.callSid;
+              const negocioIdSnapshot = negocioId;
               console.log(`[FUNCIÓN] escalar_humano: programando transfer → ${transferTo} en 3500ms (callerId=${this.numeroTwilio || "default"})`);
               setTimeout(async () => {
+                // Registrar ANTES de aplicar el TwiML: Twilio puede resolver el
+                // <Dial> y disparar el statusCallback antes de que termine este
+                // await, y si la transferencia no estuviera en el mapa todavía
+                // el callback se descartaría y ese tramo no se cobraría.
+                registrarTransferencia({
+                  callSid: callSidSnapshot,
+                  negocioId: negocioIdSnapshot,
+                  destino: transferTo!,
+                  inicioMs: Date.now(),
+                });
                 try {
                   const twClient = twilio(config.twilioAccountSid, config.twilioAuthToken);
                   const updated = await twClient.calls(callSidSnapshot).update({ twiml });
                   console.log(`[FUNCIÓN] escalar_humano: Twilio status=${updated.status} → ${transferTo}`);
                 } catch (e: any) {
+                  // Twilio rechazó el TwiML: no hay pierna saliente que cobrar y
+                  // el callback nunca va a llegar. Desregistrar para no dejar
+                  // basura en el mapa hasta que la purge el TTL.
+                  tomarTransferencia(callSidSnapshot);
                   console.error("[FUNCIÓN] escalar_humano: fallo al aplicar TwiML:", e?.message || e, e?.code ? `(code=${e.code})` : "");
                 }
               }, 3500);
@@ -1856,7 +1891,14 @@ export class PipelineLlamada {
     const minutos = duracionSegundos / 60;
     const costoWhisper = minutos * 0.4 * 0.006;
     const costoUsd = Number((usoVoz.costoUsd + costoWhisper).toFixed(6));
-    const costoTwilioAprox = Number((minutos * 0.01).toFixed(6)); // inbound MX, informativo
+    // Twilio entrante MX ($0.0100/min) redondeado al minuto, que es como Twilio
+    // factura de verdad. Una llamada de 8 s cuesta el minuto completo — por eso
+    // el cobro al negocio tiene un mínimo.
+    const costoTwilioAprox = Number((Math.ceil(minutos) * 0.01).toFixed(6));
+
+    // ¿El agente alcanzó a hablar? Si OpenAI generó audio, hubo servicio. Si no
+    // (sesión murió antes del saludo, TwiML de fallback), Odin no cobra.
+    const huboContacto = usoVoz.audioOut > 0;
     console.log(
       `[PIPELINE] Costo voz — OpenAI $${costoUsd} (realtime $${usoVoz.costoUsd.toFixed(6)} + whisper $${costoWhisper.toFixed(6)}) · Twilio ~$${costoTwilioAprox} · tokens`,
       usoVoz,
@@ -1885,6 +1927,15 @@ export class PipelineLlamada {
       duracionSegundos,
       turnos: this.turnos,
       costoUsd,
+      // Desglose para auditar margen por negocio en xambee-admin.
+      costoOpenaiUsd: costoUsd,
+      costoTwilioUsd: costoTwilioAprox,
+      tokensEntrada: usoVoz.audioIn + usoVoz.textIn,
+      tokensSalida: usoVoz.audioOut + usoVoz.textOut,
+      tokensCacheados: usoVoz.cachedAudioIn + usoVoz.cachedTextIn,
+      // Señales de cobro (ver calcularCreditosVoz en Odin).
+      huboContacto,
+      esRebote: this.esRebote,
       historial,
     });
     const ESPERAS_MS = [0, 4000, 15_000, 60_000];
