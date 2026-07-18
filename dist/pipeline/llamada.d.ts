@@ -91,6 +91,10 @@ export interface ConfigNegocio {
     bloqueado?: boolean;
     velocidadVoz?: number;
 }
+export declare function buildSystemPrompt(cfg: ConfigNegocio, contextoExtra?: {
+    receptorOrigen?: ReceptorEscalamiento | null;
+    esRebote?: boolean;
+}): string;
 export declare class PipelineLlamada {
     private ws;
     private realtime;

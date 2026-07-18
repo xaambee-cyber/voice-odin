@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.PipelineLlamada = void 0;
+exports.buildSystemPrompt = buildSystemPrompt;
 const ws_1 = __importDefault(require("ws"));
 const twilio_1 = __importDefault(require("twilio"));
 const realtime_1 = require("../openai/realtime");
@@ -225,7 +226,30 @@ function construirHerramientas(cfg) {
     console.log(`[PIPELINE] Herramientas cargadas: ${herramientas.map((h) => h.name).join(", ") || "(ninguna)"}`);
     return herramientas;
 }
+// Exportada para poder verificar el orden del prompt (ver el aviso de abajo
+// sobre el caché) sin tener que levantar una llamada real.
 function buildSystemPrompt(cfg, contextoExtra) {
+    // ⚠️ ORDEN DEL PROMPT — NO MOVER LO VOLÁTIL HACIA ARRIBA ⚠️
+    //
+    // OpenAI cachea automáticamente el PREFIJO del prompt: si dos llamadas
+    // empiezan exactamente igual, esa parte común se cobra a $0.40/1M en vez de
+    // $4/1M. Pero exige coincidencia exacta desde el primer carácter y un mínimo
+    // de 1024 tokens, y el caché muere a los ~5-10 min de inactividad.
+    //
+    // Antes, `ahoraStr` (que incluye MINUTOS, o sea distinto en cada llamada) iba
+    // arriba, a ~660 tokens del inicio. Eso dejaba el prefijo estable POR DEBAJO
+    // del mínimo de 1024 → el caché no se activaba NUNCA y cada llamada pagaba
+    // tarifa completa por los ~5-8k tokens de contexto.
+    //
+    // Por eso TODO lo que cambia entre llamadas del mismo negocio (fecha y hora,
+    // contexto de rebote/sucursal, citas de quien llama, receptor por defecto)
+    // vive ahora en un solo bloque === CONTEXTO DE ESTA LLAMADA === al FINAL del
+    // prompt. Las secciones de arriba que lo necesitan apuntan a él.
+    //
+    // Si agregas algo que varíe por llamada o por cliente, va en ese bloque final
+    // — no en medio del prompt. Se puede verificar en producción: la columna
+    // `tokens_cacheados` de `conversaciones` debe ser > 0 en llamadas seguidas al
+    // mismo negocio.
     const tz = cfg.zonaHoraria || "America/Mexico_City";
     const ahora = new Date();
     const ahoraStr = ahora.toLocaleString("es-MX", {
@@ -347,7 +371,7 @@ Luego escucha y actúa. NO intentes escalar de nuevo en la misma llamada — el 
         if (contextoExtra.receptorOrigen) {
             const r = contextoExtra.receptorOrigen;
             return `
-CONTEXTO DE ESTA LLAMADA:
+CÓMO LLEGÓ ESTA LLAMADA:
 El cliente marcó al número de "${r.etiqueta}" y la llamada se desvió hacia ti porque ahí no contestaron. Menciona "${r.etiqueta}" si aplica para que el cliente se ubique. Si pide hablar con un humano, sugiere primero "${r.etiqueta}" como opción por defecto (pero no insistas si quiere otra).
 `;
         }
@@ -385,9 +409,6 @@ ${cfg.saludoInicial && cfg.saludoInicial.trim() ? `
 SALUDO INICIAL OBLIGATORIO:
 Tu PRIMER mensaje de la llamada debe transmitir esto (dilo natural, hablado, sin leerlo robótico): "${cfg.saludoInicial.trim()}"
 ` : ""}
-
-FECHA Y HORA ACTUAL: ${ahoraStr}
-${bloqueContextoLlamada}
 
 DATOS DEL NEGOCIO (solo estos existen):
 ${cfg.horario ? `- Horario general: ${cfg.horario}` : ""}
@@ -440,7 +461,8 @@ HORARIOS DE ATENCIÓN: ${horariosTexto || "No especificado"}
 
 SERVICIOS DISPONIBLES PARA CITAS (usa el ID exacto al agendar):
 ${serviciosTexto || "No hay servicios configurados"}
-${citasClienteTexto ? `\nCITAS VIGENTES DEL CLIENTE:\n${citasClienteTexto}` : "\nEste cliente no tiene citas vigentes."}
+
+(Las citas que YA tiene quien está llamando están hasta el final, en CONTEXTO DE ESTA LLAMADA. Consúltalas ahí antes de reagendar o cancelar.)
 
 REGLAS AL HABLAR DE HORARIOS (obligatorias):
 - Di TODA hora en formato de 12 horas con am/pm: "3:00 p.m.", "11:30 a.m."; el mediodía es "12:00 p.m.". NUNCA digas la hora en formato de 24 horas ni la pongas entre paréntesis.
@@ -489,7 +511,7 @@ ${receptoresTexto ? `
 SUCURSALES O PERSONAS A LAS QUE PUEDES ESCALAR:
 ${receptoresTexto}
 
-Si hay varias opciones, pregunta al cliente: "¿Con cuál sucursal/persona quieres hablar?". Si solo hay una, úsala sin preguntar.${contextoExtra?.receptorOrigen ? ` Si el cliente no especifica, usa "${contextoExtra.receptorOrigen.etiqueta}" porque fue al que él llamó originalmente.` : ""}
+Si hay varias opciones, pregunta al cliente: "¿Con cuál sucursal/persona quieres hablar?". Si solo hay una, úsala sin preguntar. (Si esta llamada llegó desviada desde una sucursal concreta, lo dice el CONTEXTO DE ESTA LLAMADA al final: ésa es la opción por defecto.)
 Pasa la etiqueta EXACTA como parámetro "sucursalEtiqueta" en la función escalar_humano.
 ` : ""}
 
@@ -530,7 +552,19 @@ REGLAS:
 - Solo llama a registrar_pregunta cuando genuinamente no tengas la información
 - No llames a registrar_pregunta por preguntas sobre citas o escalamientos
 - Si el cliente repite una pregunta que ya registraste, NO la registres de nuevo. Di: "Ya lo anoté, el equipo te contactará."
-- NUNCA intentes responder algo que ya quedó registrado como pregunta sin respuesta`;
+- NUNCA intentes responder algo que ya quedó registrado como pregunta sin respuesta
+
+=== CONTEXTO DE ESTA LLAMADA ===
+Todo lo anterior es fijo para este negocio. Lo que sigue es de ESTA llamada en concreto y es lo que aplica ahora mismo.
+
+FECHA Y HORA ACTUAL: ${ahoraStr}${bloqueContextoLlamada}${agendaActiva ? (citasClienteTexto ? `
+
+CITAS VIGENTES DE QUIEN LLAMA:
+${citasClienteTexto}` : `
+
+CITAS VIGENTES DE QUIEN LLAMA: ninguna.`) : ""}${escalamientoActivo && receptoresTexto && contextoExtra?.receptorOrigen ? `
+
+ESCALAMIENTO POR DEFECTO: si el cliente pide hablar con una persona y no dice con cuál, usa "${contextoExtra.receptorOrigen.etiqueta}" — fue al número que él marcó originalmente.` : ""}`;
 }
 // Palabras exclusivamente en inglés que nunca aparecen en español conversacional.
 const ENGLISH_STOPWORDS = new Set([
