@@ -34,6 +34,7 @@ export declare class OpenAIRealtime {
     private resultadoPendiente;
     private esperaInterrumpida;
     private respuestaTimer;
+    private ultimaActividadRespuesta;
     constructor(systemPrompt: string, tools?: HerramientaVoz[], voz?: string);
     abrirConexion(): Promise<void>;
     private conectarModelo;

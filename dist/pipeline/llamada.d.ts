@@ -111,6 +111,9 @@ export declare class PipelineLlamada {
     private tecleoTimer;
     private tecleoDesde;
     private tecleoIdx;
+    /** Frames de tecleo REALMENTE enviados en esta espera (para decidir si hay
+     *  que limpiar el buffer de Twilio al parar — ver detenerTecleo). */
+    private tecleoFramesEnviados;
     private static readonly TECLEO_MAX_MS;
     private ambienteTimer;
     private ambienteIdx;
@@ -131,6 +134,13 @@ export declare class PipelineLlamada {
     private enviarAudioTwilio;
     private limpiarAudioTwilio;
     interrumpir(): void;
+    private finalizada;
+    /** Cierre por caída/cierre del WS SIN evento "stop" previo. BUG visto en
+     *  producción: cuando colgar_llamada fallaba con Twilio y cerrábamos el WS
+     *  nosotros, "stop" jamás llegaba → la llamada NO se guardaba (sin
+     *  transcripción, sin nombre, sin créditos). Ahora cualquier final llega a
+     *  finalizarLlamada exactamente una vez. */
+    finalizarPorCierreDeSocket(): void;
     private finalizarLlamada;
 }
 export {};

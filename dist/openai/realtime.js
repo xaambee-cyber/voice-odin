@@ -73,7 +73,22 @@ const PROTEGER_FRASE_MS = 4000;
 // agente responda. Sirve para AGRUPAR varios fragmentos cortos ("ok"… "ok"…) en
 // una sola respuesta en vez de contestar a cada uno. Cada vez que el cliente
 // (re)empieza a hablar, este temporizador se reinicia.
-const DEBOUNCE_RESPUESTA_MS = 600;
+// 450ms (antes 600): el VAD semántico YA decide fin-de-turno por contenido;
+// este debounce es solo el colchón anti-fragmentos. Override: VOZ_DEBOUNCE_MS.
+const DEBOUNCE_RESPUESTA_MS = Number(process.env.VOZ_DEBOUNCE_MS) || 450;
+// Eagerness del VAD semántico: qué tan rápido decide que el cliente terminó.
+// "low" era MUY conservador → esperas variables de 1-3s según cómo sonara la
+// frase (la causa #1 de la latencia inconsistente). "medium" responde bastante
+// más rápido con pocas falsas entradas; ajustable con VOZ_VAD_EAGERNESS
+// (low | medium | high | auto) sin redeploy de código.
+const VAD_EAGERNESS = (["low", "medium", "high", "auto"].includes(process.env.VOZ_VAD_EAGERNESS || "")
+    ? process.env.VOZ_VAD_EAGERNESS
+    : "medium");
+// Auto-sanación anti-mudez: si `respondiendo` se queda atorado en true (un
+// response.done perdido tras una cancelación), el agente quedaría CALLADO para
+// siempre. Si al ir a responder llevamos más de este tiempo sin actividad real
+// de respuesta (created/delta/done), asumimos flag rancio y respondemos igual.
+const RESPUESTA_RANCIA_MS = 6000;
 class OpenAIRealtime {
     ws = null;
     onAudioDelta = null;
@@ -117,6 +132,10 @@ class OpenAIRealtime {
     // Debounce para agrupar la entrada del cliente en una sola respuesta. Se
     // reinicia cada vez que el cliente (re)empieza a hablar.
     respuestaTimer = null;
+    // Última señal de vida de una respuesta (created/delta/done). Si
+    // `respondiendo` quedó atorado sin actividad, la auto-sanación lo resetea
+    // en vez de dejar al agente mudo — ver programarRespuestaUsuario().
+    ultimaActividadRespuesta = 0;
     constructor(systemPrompt, tools = [], voz = VOZ_DEFAULT) {
         this.systemPrompt = systemPrompt;
         this.tools = tools;
@@ -205,10 +224,12 @@ class OpenAIRealtime {
                     transcription: { model: "whisper-1", language: "es" },
                     turn_detection: {
                         type: "semantic_vad",
-                        // "low": el VAD es más conservador para decidir que el cliente habló.
-                        // Reduce las interrupciones falsas por eco/ruido que cortaban al agente
-                        // a media frase. Cuesta un pelín de reactividad al barge-in real.
-                        eagerness: "low",
+                        // eagerness configurable (default "medium"): "low" causaba esperas
+                        // de 1-3s VARIABLES según cómo sonara la frase del cliente — la
+                        // principal causa de latencia inconsistente. Las interrupciones
+                        // falsas del agente las siguen conteniendo graceUntil + los guards
+                        // de speech_started, no el eagerness.
+                        eagerness: VAD_EAGERNESS,
                         // create_response:false → NOSOTROS creamos la respuesta, no OpenAI.
                         // Así agrupamos TODO lo que el cliente dijo (aunque lo diga en varios
                         // fragmentos cortos como "ok"… "ok"…) en UNA sola respuesta, en vez de
@@ -302,6 +323,7 @@ class OpenAIRealtime {
             // GA: nuevos nombres de eventos (con prefijo "output_")
             case "response.output_audio.delta":
             case "response.audio.delta": // backward compat por si alterna
+                this.ultimaActividadRespuesta = Date.now();
                 if (msg.delta && this.onAudioDelta) {
                     this.onAudioDelta(msg.delta);
                 }
@@ -350,10 +372,12 @@ class OpenAIRealtime {
             case "response.created":
                 this.respondiendo = true;
                 this.cancelacionEnCurso = false;
+                this.ultimaActividadRespuesta = Date.now();
                 break;
             case "response.done": {
                 this.respondiendo = false;
                 this.cancelacionEnCurso = false;
+                this.ultimaActividadRespuesta = Date.now();
                 // Cuenta el consumo de ESTE response (incluye cancelados y frases de
                 // espera: la API igual cobra los tokens que alcanzó a generar).
                 this.acumularUso(msg.response?.usage);
@@ -528,8 +552,19 @@ class OpenAIRealtime {
             this.respuestaTimer = null;
             if (this.funcionActual || this.funcionLentaPendiente || this.fillerActivo)
                 return;
-            if (this.respondiendo)
-                return;
+            if (this.respondiendo) {
+                // AUTO-SANACIÓN: si el flag lleva demasiado sin actividad real
+                // (response.done perdido tras una cancelación), estaba dejando al
+                // agente MUDO — el cliente hablaba y nadie contestaba jamás. Se
+                // resetea el flag rancio y se responde de todos modos.
+                if (Date.now() - this.ultimaActividadRespuesta > RESPUESTA_RANCIA_MS) {
+                    console.warn("[REALTIME] respondiendo=true RANCIO (sin actividad) → auto-sanación, respondiendo igual");
+                    this.respondiendo = false;
+                }
+                else {
+                    return;
+                }
+            }
             this.crearRespuesta();
         }, DEBOUNCE_RESPUESTA_MS);
     }

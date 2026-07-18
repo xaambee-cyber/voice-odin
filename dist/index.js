@@ -121,6 +121,11 @@ wss.on("connection", (ws) => {
     });
     ws.on("close", () => {
         console.log(`[WS] Conexión cerrada — callSid: ${callSid}`);
+        // Red de seguridad: si el WS murió SIN evento "stop" (p. ej. colgamos
+        // nosotros por fallo del REST de Twilio, o se cayó la conexión), la
+        // llamada se finaliza igual — transcripción, nombre y créditos JAMÁS se
+        // pierden. Es idempotente: si "stop" ya la finalizó, no hace nada.
+        pipeline?.finalizarPorCierreDeSocket();
         if (callSid) {
             llamadasActivas.delete(callSid);
         }
@@ -134,6 +139,13 @@ wss.on("connection", (ws) => {
 // función serverless caliente. Sin esto, una llamada que entra después de
 // rato encuentra Vercel frío y el fetch tarda 3-5s extra.
 const WARMUP_MS = 4 * 60 * 1000;
+// Aviso temprano de env incompleto: sin las credenciales de Twilio fallan
+// colgar_llamada, las TRANSFERENCIAS a humano y el rechazo por saldo (visto
+// en prod como "error con Twilio API: Authenticate"). Mejor gritarlo al
+// arrancar que descubrirlo a media llamada.
+if (!config_1.config.twilioAccountSid || !config_1.config.twilioAuthToken) {
+    console.error("⚠️  [CONFIG] Faltan TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN — colgar, transferir y rechazar por saldo NO funcionarán");
+}
 // ═══ SLA de escalamientos ═══
 // Vercel Hobby solo permite crons DIARIOS, así que este server (siempre
 // encendido) hace de scheduler fino: cada 30 min dispara el cron de Odin que
@@ -182,19 +194,18 @@ async function dispararBenchmarks() {
 }
 setInterval(dispararBenchmarks, BENCHMARKS_MS);
 setTimeout(dispararBenchmarks, 3 * 60_000); // primer cálculo a los 3 min del arranque
+// En VPS ya no hay cold start que calentar: esto quedó como HEARTBEAT de que
+// Odin está vivo (usa /api/health, público). Solo hace ruido si algo va mal.
 async function warmupOdin() {
     try {
-        const authHeader = config_1.config.voiceServerSecret
-            ? { Authorization: `Bearer ${config_1.config.voiceServerSecret}` }
-            : {};
-        const resp = await fetch(`${config_1.config.odinAppUrl}/api/voice/config-llamada?negocioId=__warmup__`, {
-            headers: authHeader,
+        const resp = await fetch(`${config_1.config.odinAppUrl}/api/health`, {
             signal: AbortSignal.timeout(8000),
         });
-        console.log(`[WARMUP] Odin respondió ${resp.status}`);
+        if (!resp.ok)
+            console.warn(`[HEARTBEAT] Odin respondió ${resp.status}`);
     }
     catch (err) {
-        console.warn("[WARMUP] Odin no respondió:", err?.message || err);
+        console.warn("[HEARTBEAT] Odin no respondió:", err?.message || err);
     }
 }
 setInterval(warmupOdin, WARMUP_MS);

@@ -377,6 +377,7 @@ Suenas como una recepcionista mexicana real, de carne y hueso, atendiendo el tel
 - CONFIRMACIÓN HUMANA: cuando el cliente te dé un dato importante (fecha, hora, nombre, servicio), repítelo breve y natural antes de continuar: "El sábado a las cuatro, perfecto…". Así confirmas sin sonar a robot que lee un formulario.
 - NÚMEROS EN VOZ ALTA: los teléfonos se dicen de dos en dos dígitos ("cincuenta y cinco… doce… treinta y cuatro…"); los precios con palabras ("quinientos pesos", nunca "500 pesos" leído en frío); las horas SIEMPRE con "de la mañana / de la tarde / de la noche".
 - ADAPTACIÓN: si el cliente habla rápido y va al grano, tú también. Si suena mayor o confundido, baja el ritmo y sé más clara. Si está molesto, suaviza el tono y no lo interrumpas.
+- BREVEDAD RADICAL (por teléfono lo largo desespera): máximo ~30 palabras por turno. Si tienes MUCHA información (una lista de servicios, varios horarios), da máximo TRES opciones y pregunta cuál le interesa — jamás recites el catálogo completo de corrido.
 - IMPERFECCIÓN CONTROLADA: puedes reformular a media frase como un humano ("tenemos el… bueno, mira, lo que más piden es…") pero solo ocasionalmente y sin perder claridad.
 - PROHIBIDO sonar a menú telefónico, a locutora de comercial o a asistente corporativo. Eres una persona del equipo del negocio.
 ${cfg.saludoInicial && cfg.saludoInicial.trim() ? `
@@ -629,6 +630,13 @@ function mensajeAnticipoCitaVoz(monto, esMercadoPago, whatsappEnviado) {
         : `En un momento te llegan ${via} por WhatsApp a este mismo número.`;
     return `Para apartar tu cita necesitas un anticipo${montoTxt}. ${envio} En cuanto lo realices, tu cita queda confirmada y el equipo te avisa. ¿Hay algo más en lo que te pueda ayudar?`;
 }
+// ── Caché de config por número+cliente (TTL corto) ──────────────────────────
+// La config del negocio tarda 1.5-3.5s en llegar de Odin (queries a Supabase);
+// sin caché, la 2ª llamada seguida saludaba genérico otra vez. La clave incluye
+// al CLIENTE porque la config trae SUS citas vigentes (no se comparte entre
+// llamantes). El fetch de fondo siempre re-aplica datos frescos.
+const configCache = new Map();
+const CONFIG_CACHE_TTL_MS = 60_000;
 // Normaliza un número telefónico para comparación (solo dígitos, sin +).
 function digitosDe(s) {
     return String(s || "").replace(/[^\d]/g, "");
@@ -748,6 +756,9 @@ class PipelineLlamada {
     tecleoTimer = null;
     tecleoDesde = 0;
     tecleoIdx = 0;
+    /** Frames de tecleo REALMENTE enviados en esta espera (para decidir si hay
+     *  que limpiar el buffer de Twilio al parar — ver detenerTecleo). */
+    tecleoFramesEnviados = 0;
     static TECLEO_MAX_MS = 15_000; // red de seguridad
     // ── ROOM TONE (opt-in: AMBIENTE_LLAMADA=on) ──────────────────────────────
     // "Aire" de oficina casi subliminal para matar el silencio digital muerto.
@@ -1265,11 +1276,13 @@ class PipelineLlamada {
         // no suenen idénticas.
         this.tecleoIdx = Math.floor(Math.random() * sonidos_1.FRAMES_TECLEO.length);
         this.tecleoDesde = Date.now();
+        this.tecleoFramesEnviados = 0;
         this.tecleoTimer = setInterval(() => {
             if (Date.now() - this.tecleoDesde > PipelineLlamada.TECLEO_MAX_MS) {
                 this.detenerTecleo();
                 return;
             }
+            this.tecleoFramesEnviados++;
             this.enviarFrameCrudo(sonidos_1.FRAMES_TECLEO[this.tecleoIdx++ % sonidos_1.FRAMES_TECLEO.length]);
         }, sonidos_1.MS_POR_FRAME);
         console.log("[SONIDO] Tecleo de espera ON");
@@ -1279,10 +1292,18 @@ class PipelineLlamada {
             return;
         clearInterval(this.tecleoTimer);
         this.tecleoTimer = null;
-        // Tirar el tecleo ya encolado en Twilio para que la voz entre limpia al
-        // instante (mismo mecanismo que las interrupciones).
-        this.limpiarAudioTwilio();
-        console.log("[SONIDO] Tecleo de espera OFF");
+        // Limpiar el buffer de Twilio SOLO si se alcanzó a encolar bastante tecleo
+        // (>1s): ahí sí conviene cortarlo para que la voz entre ya.
+        //
+        // BUG que esto corrige (visto en logs de producción): cuando el fetch
+        // resolvía rápido, el tecleo llevaba ~70ms y el "clear" incondicional
+        // tiraba TODO el buffer — incluida la COLA de la frase de espera que aún
+        // se estaba reproduciendo → "Permíteme, reviso la agen—" y silencio seco.
+        // Con poco tecleo encolado, mejor dejarlo sonar (termina en <1s solo).
+        const limpiar = this.tecleoFramesEnviados > 50; // 50 frames ≈ 1 segundo
+        if (limpiar)
+            this.limpiarAudioTwilio();
+        console.log(`[SONIDO] Tecleo de espera OFF (${this.tecleoFramesEnviados} frames${limpiar ? ", buffer limpiado" : ", sin limpiar"})`);
     }
     // ── Room tone (opt-in) ────────────────────────────────────────────────────
     iniciarAmbiente() {
@@ -1380,15 +1401,58 @@ class PipelineLlamada {
             params.set("callerNumber", this.callerNumber);
         const url = `${config_1.config.odinAppUrl}/api/voice/config-llamada?${params.toString()}`;
         const fetchPromise = fetchConfigConRetry(url, 10000);
+        // El fetch SIEMPRE refresca la caché al resolver (aunque llegue tarde):
+        // la siguiente llamada del mismo cliente saluda con memoria al instante.
+        const cacheKey = `${this.numeroTwilio}|${this.callerNumber}`;
+        fetchPromise
+            .then((c) => {
+            if (c && !c.bloqueado && c.negocioId) {
+                configCache.set(cacheKey, { config: c, ts: Date.now() });
+            }
+        })
+            .catch(() => { });
         const conexionPromise = this.realtime.abrirConexion();
-        // Race del fetch contra timeout 1.5s. La conexión OpenAI corre en paralelo.
-        const [configRapida] = await Promise.all([
-            Promise.race([
-                fetchPromise,
-                new Promise((resolve) => setTimeout(() => resolve(null), 1500)),
-            ]),
-            conexionPromise,
-        ]);
+        // FAST-PATH DE CACHÉ: si este número+cliente llamó hace <60s (rellamadas,
+        // cortes, pruebas), la config del negocio ya la tenemos — saludo CON
+        // memoria sin esperar el fetch (en logs de prod tardaba 1.5-3.5s y el
+        // saludo salía genérico). El fetch de fondo re-aplica datos frescos.
+        const enCache = configCache.get(cacheKey);
+        const configCacheada = enCache && Date.now() - enCache.ts < CONFIG_CACHE_TTL_MS ? enCache.config : null;
+        let configRapida;
+        if (configCacheada) {
+            await conexionPromise;
+            configRapida = configCacheada;
+            console.log(`[PIPELINE] Config desde CACHÉ (${Math.round((Date.now() - enCache.ts) / 1000)}s) — saludo con memoria inmediato`);
+            // Refresh de fondo: cuando llegue la config fresca, se re-aplica (citas
+            // vigentes del cliente, cambios de catálogo) sin tocar la voz.
+            fetchPromise.then((fresca) => {
+                if (!fresca)
+                    return;
+                if (fresca.bloqueado) {
+                    if (fresca.negocioId)
+                        this.negocioId = fresca.negocioId;
+                    this.rechazarPorSaldo().catch(() => { });
+                    return;
+                }
+                this.configNegocio = { ...this.configNegocio, ...fresca };
+                if (fresca.negocioId)
+                    this.negocioId = fresca.negocioId;
+                this.calcularContextoSucursal();
+                this.realtime.actualizarConfiguracion(buildSystemPrompt(this.configNegocio, { receptorOrigen: this.receptorOrigen, esRebote: this.esRebote }), construirHerramientas(this.configNegocio));
+                console.log("[PIPELINE] Config fresca re-aplicada sobre la cacheada");
+            });
+        }
+        else {
+            // Race del fetch contra timeout 1.5s. La conexión OpenAI corre en paralelo.
+            const [r] = await Promise.all([
+                Promise.race([
+                    fetchPromise,
+                    new Promise((resolve) => setTimeout(() => resolve(null), 1500)),
+                ]),
+                conexionPromise,
+            ]);
+            configRapida = r;
+        }
         if (configRapida) {
             // GATE DE CRÉDITOS: sin saldo → mensaje corto y colgar. Nada de OpenAI.
             if (configRapida.bloqueado) {
@@ -1481,7 +1545,25 @@ class PipelineLlamada {
         this.realtime.cancelarRespuesta();
         this.limpiarAudioTwilio();
     }
+    // Idempotencia del cierre: finalizarLlamada puede dispararse por el evento
+    // "stop" de Twilio Y por el cierre del WebSocket (ver index.ts). Solo la
+    // primera ejecución hace el trabajo.
+    finalizada = false;
+    /** Cierre por caída/cierre del WS SIN evento "stop" previo. BUG visto en
+     *  producción: cuando colgar_llamada fallaba con Twilio y cerrábamos el WS
+     *  nosotros, "stop" jamás llegaba → la llamada NO se guardaba (sin
+     *  transcripción, sin nombre, sin créditos). Ahora cualquier final llega a
+     *  finalizarLlamada exactamente una vez. */
+    finalizarPorCierreDeSocket() {
+        if (this.finalizada)
+            return;
+        console.warn("[PIPELINE] WS cerrado sin evento stop → finalizando llamada igual");
+        this.finalizarLlamada().catch((e) => console.error("[PIPELINE] Error finalizando por cierre de socket:", e));
+    }
     async finalizarLlamada() {
+        if (this.finalizada)
+            return;
+        this.finalizada = true;
         this.detenerTecleo();
         this.detenerAmbiente();
         this.realtime.cerrar();
