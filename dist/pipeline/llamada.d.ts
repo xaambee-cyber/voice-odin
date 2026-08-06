@@ -73,6 +73,12 @@ export interface ConfigNegocio {
     voz?: string;
     catalogo?: ItemCatalogo[];
     servicios?: Servicio[];
+    profesionales?: Array<{
+        id: string;
+        nombre: string;
+        atiendeTodosServicios: boolean;
+        servicioIds: string[];
+    }>;
     horarioDetallado?: HorarioDetallado[];
     citasCliente?: CitaCliente[];
     habilidadesActivas?: HabilidadesActivas;

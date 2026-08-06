@@ -114,6 +114,12 @@ export interface ConfigNegocio {
   voz?: string;
   catalogo?: ItemCatalogo[];
   servicios?: Servicio[];
+  profesionales?: Array<{
+    id: string;
+    nombre: string;
+    atiendeTodosServicios: boolean;
+    servicioIds: string[];
+  }>;
   horarioDetallado?: HorarioDetallado[];
   citasCliente?: CitaCliente[];
   habilidadesActivas?: HabilidadesActivas;
@@ -182,6 +188,7 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
           servicioId: { type: "string", description: "ID exacto del servicio (usa los que aparecen en tu lista de servicios)" },
           fechaInicio: { type: "string", description: "Fecha y hora de inicio en formato ISO: YYYY-MM-DDTHH:MM:00" },
           clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural ANTES de agendar ('¿A nombre de quién agendo la cita?') si aún no lo ha dicho en la llamada. Si ya lo dijo, úsalo sin volver a preguntar. Si no lo quiere dar, pasa 'Cliente'." },
+          profesional: { type: "string", description: "Nombre EXACTO del profesional, solo si el cliente eligió uno que atiende ese servicio. Si no pidió a nadie, omítelo." },
           camposAgenda: {
             type: "object",
             description: "Datos adicionales que pide el servicio elegido. Las LLAVES deben ser los IDs de campo (ej. \"c1\", \"c2\"), NUNCA las etiquetas largas; los valores son lo que dijo el cliente. Inclúyelo SOLO si el servicio tiene campos adicionales; OMÍTELO por completo si el servicio no tiene ninguno.",
@@ -215,6 +222,7 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
           citaId: { type: "string", description: "ID exacto de la cita a modificar" },
           servicioId: { type: "string", description: "Nuevo ID de servicio (solo si cambia)" },
           fechaInicio: { type: "string", description: "Nueva fecha y hora ISO: YYYY-MM-DDTHH:MM:00 (solo si cambia)" },
+          profesional: { type: "string", description: "Nombre EXACTO del nuevo profesional, solo si el cliente pide cambiarlo." },
         },
         required: ["citaId"],
       },
@@ -526,6 +534,13 @@ export function buildSystemPrompt(
       ).join("\n")
     : null;
 
+  const profesionalesTexto = (cfg.profesionales ?? []).map((p) => {
+    const nombres = p.atiendeTodosServicios
+      ? "todos los servicios"
+      : p.servicioIds.map((id) => cfg.servicios?.find((s) => s.id === id)?.nombre).filter(Boolean).join(", ");
+    return `- ${p.nombre} — atiende ${nombres}`;
+  }).join("\n");
+
   const horariosTexto = cfg.horarioDetallado && cfg.horarioDetallado.length > 0
     ? cfg.horarioDetallado.map((h) => `${DIAS_ES[h.diaSemana]}: ${h.horaInicio}–${h.horaFin}`).join(", ")
     : cfg.horario || null;
@@ -604,6 +619,7 @@ ${cfg.telefono ? `- Teléfono: ${cfg.telefono}` : ""}
 
 ${cfg.conocimiento ? `BASE DE CONOCIMIENTO (esta es TODA la información que tienes, no existe más):\n${cfg.conocimiento}` : "NO TIENES BASE DE CONOCIMIENTO. No tienes información adicional sobre este negocio."}
 ${serviciosTexto ? `\nCATÁLOGO DE SERVICIOS Y PRODUCTOS:\n${serviciosTexto}` : ""}
+${profesionalesTexto ? `\nPROFESIONALES (lista completa):\n${profesionalesTexto}\nSi el cliente pide a alguien, usa su nombre EXACTO en profesional. No ofrezcas a una persona para un servicio que no atiende. Si no pide a nadie, omite profesional y el sistema asignará a quien esté libre.` : ""}
 ${habitacionesTexto ? `\nLUGARES Y HABITACIONES DISPONIBLES:\n${verificarDispReserva && habitacionesConId ? habitacionesConId : habitacionesTexto}\n(Refiérete a cada uno por su NOMBRE; no digas "servicios" ni asumas que todo es "habitación" — puede ser terraza, salón o cabaña. Para reservar usa la función solicitar_reserva — el agente NO confirma disponibilidad, solo recolecta y manda la solicitud.${verificarDispReserva ? " Los [ID:...] son internos: NUNCA los digas en voz alta." : ""})` : ""}
 ${menuTexto ? `\nMENÚ:\n${menuTexto}\n(Cuando hables del menú di "platillos" o el nombre de cada uno, no "servicios".)` : ""}
 ${productosTexto ? `\nPRODUCTOS:\n${productosTexto}` : ""}
@@ -1159,6 +1175,7 @@ export class PipelineLlamada {
             fechaInicio: args.fechaInicio,
             clienteNombre: nombreClienteFinal,
             clienteTelefono: callerNumber || "desconocido",
+            profesional: args.profesional,
           };
           // Campos personalizados del servicio: solo los mandamos si el modelo
           // recolectó al menos uno. La llave es el id del campo (c1, c2…),
@@ -1265,6 +1282,7 @@ export class PipelineLlamada {
               accion: "reagendar",
               servicioId: args.servicioId,
               fechaInicio: args.fechaInicio,
+              profesional: args.profesional,
               // clienteTelefono: el backend valida que la cita sea de ESTE
               // llamante antes de moverla (impide reagendar la cita de otro).
               clienteTelefono: callerNumber || "desconocido",
