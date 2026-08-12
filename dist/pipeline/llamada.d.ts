@@ -96,6 +96,38 @@ export interface ConfigNegocio {
     ubicacionUrl?: string;
     bloqueado?: boolean;
     velocidadVoz?: number;
+    nichoActivo?: boolean;
+    /** Bloque de prompt del giro (vocabulario, reglas, catálogo con IDs). */
+    nichoPromptBloque?: string;
+    /** Una entrada por operación que este negocio puede cerrar. Se registra una
+     *  tool por cada una — no hay lista escrita a mano de motores aquí, para que
+     *  un motor nuevo en Odin llegue al teléfono sin desplegar este repo. */
+    accionesMotor?: AccionMotorVoz[];
+}
+/** Un dato que el agente tiene que recolectar. Espejo de `CampoVoz` en
+ *  `Odin/app/lib/motores/voz.ts`. */
+interface CampoMotorVoz {
+    id: string;
+    label: string;
+    requerido: boolean;
+    tipo: string;
+    opciones?: string[];
+    ayuda?: string;
+}
+interface AccionMotorVoz {
+    /** Nombre de la función a registrar (`reservar_mesa`, `registrar_orden`…). */
+    tool: string;
+    /** Marcador equivalente. Es lo que se le manda a /api/voice/accion-motor. */
+    marcador: string;
+    descripcion: string;
+    campos: {
+        clave: string;
+        tipo: string;
+        requerido: boolean;
+        descripcion: string;
+    }[];
+    camposGiro: CampoMotorVoz[];
+    camposDueno: CampoMotorVoz[];
 }
 export declare function buildSystemPrompt(cfg: ConfigNegocio, contextoExtra?: {
     receptorOrigen?: ReceptorEscalamiento | null;

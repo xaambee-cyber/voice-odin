@@ -159,6 +159,41 @@ export interface ConfigNegocio {
   // Velocidad de reproducción de la voz (0.25–1.5, 1.0 default). Opcional:
   // si Odin algún día la manda en config-llamada, aquí ya se respeta.
   velocidadVoz?: number;
+  // ── MOTOR DE NICHOS ───────────────────────────────────────────────────────
+  // Odin manda estas tres desde config-llamada desde hace tiempo y este server
+  // las ignoraba por completo. Consecuencia: por teléfono NO EXISTÍAN las
+  // órdenes de servicio, los prospectos, los viajes, las membresías, los cupos
+  // ni las reservas de mesa. Un taller cerraba una reparación por WhatsApp y
+  // con el mismo asistente no podía por llamada.
+  nichoActivo?: boolean;
+  /** Bloque de prompt del giro (vocabulario, reglas, catálogo con IDs). */
+  nichoPromptBloque?: string;
+  /** Una entrada por operación que este negocio puede cerrar. Se registra una
+   *  tool por cada una — no hay lista escrita a mano de motores aquí, para que
+   *  un motor nuevo en Odin llegue al teléfono sin desplegar este repo. */
+  accionesMotor?: AccionMotorVoz[];
+}
+
+/** Un dato que el agente tiene que recolectar. Espejo de `CampoVoz` en
+ *  `Odin/app/lib/motores/voz.ts`. */
+interface CampoMotorVoz {
+  id: string;
+  label: string;
+  requerido: boolean;
+  tipo: string;
+  opciones?: string[];
+  ayuda?: string;
+}
+
+interface AccionMotorVoz {
+  /** Nombre de la función a registrar (`reservar_mesa`, `registrar_orden`…). */
+  tool: string;
+  /** Marcador equivalente. Es lo que se le manda a /api/voice/accion-motor. */
+  marcador: string;
+  descripcion: string;
+  campos: { clave: string; tipo: string; requerido: boolean; descripcion: string }[];
+  camposGiro: CampoMotorVoz[];
+  camposDueno: CampoMotorVoz[];
 }
 
 interface TurnoHistorial {
@@ -169,6 +204,90 @@ interface TurnoHistorial {
 }
 
 const DIAS_ES = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOOLS DE MOTOR — las que Odin declara por negocio (`accionesMotor`)
+//
+// Se construyen a partir de los datos que llegan, NO de una lista escrita aquí.
+// Es la diferencia entre cerrar el hueco una vez y volver a abrirlo con cada
+// motor nuevo: el día que Odin agregue el motor 13, el teléfono lo tendrá sin
+// tocar este repo ni desplegarlo.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Tipo del marcador → tipo de JSON Schema. Lo que no se reconozca va como
+ *  texto: por teléfono todo llega como palabras y el backend valida al final. */
+function tipoJson(tipo: string): Record<string, any> {
+  switch (tipo) {
+    case "number":
+      return { type: "number" };
+    case "boolean":
+      return { type: "boolean" };
+    case "string[]":
+      return { type: "array", items: { type: "string" } };
+    default:
+      return { type: "string" };
+  }
+}
+
+/** Los campos que agregan el giro y el dueño viven juntos en `camposMotor`,
+ *  igual que `camposAgenda` en las citas. Las LLAVES son los ids (`c1`), nunca
+ *  las etiquetas: es lo que `completarCamposDeAccion` espera del otro lado. */
+function propiedadesCamposMotor(campos: CampoMotorVoz[]): Record<string, any> | null {
+  if (campos.length === 0) return null;
+  const props: Record<string, any> = {};
+  for (const c of campos) {
+    const desc = [
+      c.label,
+      c.requerido ? "(OBLIGATORIO)" : "(opcional)",
+      c.opciones?.length ? `Opciones: ${c.opciones.join(", ")}.` : "",
+      c.ayuda || "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    props[c.id] = c.opciones?.length
+      ? { type: "string", enum: c.opciones, description: desc }
+      : { type: "string", description: desc };
+  }
+  return props;
+}
+
+function herramientasDeMotor(acciones: AccionMotorVoz[]): HerramientaVoz[] {
+  return acciones.map((a) => {
+    const properties: Record<string, any> = {};
+    const required: string[] = [];
+
+    for (const c of a.campos) {
+      properties[c.clave] = { ...tipoJson(c.tipo), description: c.descripcion };
+      if (c.requerido) required.push(c.clave);
+    }
+
+    const extra = propiedadesCamposMotor([...a.camposGiro, ...a.camposDueno]);
+    if (extra) {
+      const obligatorios = [...a.camposGiro, ...a.camposDueno]
+        .filter((c) => c.requerido)
+        .map((c) => c.label);
+      properties.camposMotor = {
+        type: "object",
+        description:
+          "Datos adicionales que pide este negocio. Las LLAVES son los IDs de campo, NUNCA las etiquetas." +
+          (obligatorios.length > 0
+            ? ` Antes de llamar a esta función recolecta conversando: ${obligatorios.join(", ")}.`
+            : ""),
+        properties: extra,
+      };
+    }
+
+    return {
+      type: "function" as const,
+      name: a.tool,
+      // La hora en 24 h es un dato interno y el modelo tiende a repetirla en voz
+      // alta. Se le recuerda aquí porque la descripción de la tool es lo único
+      // que ve en el momento de llamarla.
+      description: `${a.descripcion} Recolecta y confirma con el cliente todos los datos obligatorios ANTES de llamarla. Si algún dato incluye una hora, pásala en formato de 24 horas — pero cuando le HABLES al cliente dila siempre en 12 horas con am/pm. NO confirmes la operación hasta que la función responda con éxito.`,
+      parameters: { type: "object", properties, required },
+    };
+  });
+}
 
 function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
   const herramientas: HerramientaVoz[] = [];
@@ -391,6 +510,20 @@ function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
     });
   }
 
+  // Las de MOTOR van al final y solo las que Odin declaró para este negocio.
+  // Se filtran las que chocan de nombre con una tool escrita a mano: si algún
+  // día un motor se llamara `crear_pedido`, dos funciones con el mismo nombre
+  // dejarían al modelo eligiendo al azar en mitad de una llamada.
+  const yaExisten = new Set(herramientas.map((h) => h.name));
+  const deMotor = herramientasDeMotor(cfg.accionesMotor || []).filter((h) => {
+    if (yaExisten.has(h.name)) {
+      console.warn(`[PIPELINE] Tool de motor "${h.name}" ignorada: ya existe una con ese nombre`);
+      return false;
+    }
+    return true;
+  });
+  herramientas.push(...deMotor);
+
   console.log(`[PIPELINE] Herramientas cargadas: ${herramientas.map((h) => h.name).join(", ") || "(ninguna)"}`);
   return herramientas;
 }
@@ -554,6 +687,38 @@ export function buildSystemPrompt(
   if (escalamientoActivo) habilidadesLista.push("- escalamiento");
   habilidadesLista.push("- aprendizaje");
   const habilidadesTexto = habilidadesLista.join("\n");
+
+  // ── EL GIRO (motor de nichos) ─────────────────────────────────────────────
+  // `nichoPromptBloque` lo arma Odin con la receta del giro: vocabulario
+  // ("platillos", no "servicios"), reglas y catálogo con IDs. Llegaba en cada
+  // llamada y este server ni lo leía, así que por teléfono el asistente hablaba
+  // como si el negocio fuera genérico.
+  //
+  // Va en la parte ESTABLE del prompt —arriba del bloque de contexto— porque no
+  // cambia entre llamadas del mismo negocio: ahí lo cachea OpenAI (ver el aviso
+  // del orden del prompt). Meterlo abajo rompería el prefijo de todos.
+  //
+  // El bloque está redactado para CHAT y habla de marcadores `[ASÍ:{...}]`. Por
+  // teléfono no hay dónde escribir uno: esas operaciones son tools. La nota de
+  // abajo es lo que traduce una gramática a la otra, y sin ella el modelo
+  // "emite" el marcador en voz alta y el cliente escucha un corchete.
+  const accionesMotor = cfg.accionesMotor || [];
+  const nichoBloque = (cfg.nichoPromptBloque || "").trim();
+  const bloqueGiro = nichoBloque
+    ? `
+=== TU GIRO ===
+${nichoBloque}
+${
+  accionesMotor.length > 0
+    ? `
+IMPORTANTE — ESTO ES UNA LLAMADA, NO UN CHAT:
+Arriba se habla de "marcadores" entre corchetes. Eso es para los mensajes escritos. Por teléfono NO existen: cada una de esas operaciones es una FUNCIÓN que debes invocar.
+${accionesMotor.map((a) => `- Para "${a.descripcion.replace(/\s+/g, " ").trim()}" llama a la función ${a.tool}.`).join("\n")}
+NUNCA digas en voz alta un corchete, un nombre de marcador, un ID ni un JSON. Son internos.
+`
+    : ""
+}`
+    : "";
 
   // Bloque dinámico al inicio del prompt: si la llamada es un rebote o llegó
   // por desvío desde una sucursal específica, el agente se comporta distinto.
@@ -742,6 +907,7 @@ REGLAS:
 - NO asumas que el cliente ya pagó. Un "gracias", "ok", "va", "perfecto", "ahí va", un silencio o un ruido NO son confirmación de pago. Si dudas, deja pagoReportado en false y pregunta: "¿Ya realizaste el pago?".
 - Después de dar los datos de pago, NO vuelvas a llamar a solicitar_reserva hasta que el cliente diga claramente que ya pagó.` : ""}
 ` : ""}
+${bloqueGiro}
 === CONOCIMIENTO FALTANTE — ACCIÓN OBLIGATORIA ===
 REGLA CRÍTICA: Cuando el cliente pregunta algo que NO está en tu base de conocimiento, DEBES llamar a registrar_pregunta ANTES de responder. La función confirma el registro y te da el mensaje para el cliente.
 
@@ -1608,8 +1774,96 @@ export class PipelineLlamada {
           return { ok: true, mensaje: "Hasta luego." };
         }
 
-        default:
-          return { ok: false, mensaje: "Función no reconocida." };
+        default: {
+          // ── TOOLS DE MOTOR ────────────────────────────────────────────────
+          // No hay un `case` por operación a propósito: la lista la manda Odin
+          // en `accionesMotor` y aquí solo se traduce a su marcador. Todo lo
+          // demás —validar, completar los campos del giro, persistir y avisarle
+          // al dueño— lo hace `/api/voice/accion-motor` con el MISMO núcleo que
+          // WhatsApp y Meta. Duplicar aquí esa lógica es como los dos canales
+          // se desincronizaron la vez pasada.
+          const accion = (this.configNegocio.accionesMotor || []).find((a) => a.tool === nombre);
+          if (!accion) return { ok: false, mensaje: "Función no reconocida." };
+
+          // Los campos del giro y los del dueño viajan aplanados dentro de
+          // `_extras`, que es la llave que `completarCamposDeAccion` conoce.
+          const { camposMotor, ...datos } = (args || {}) as Record<string, any>;
+          const cuerpo: Record<string, any> = { ...datos };
+          if (camposMotor && typeof camposMotor === "object") cuerpo._extras = camposMotor;
+          // El nombre lo captura el pipeline llamada a llamada; el marcador lo
+          // pide con su propia clave (`nombre` en mesas, `nombreCliente` en las
+          // demás), así que solo se rellena la que el esquema declaró y esté vacía.
+          for (const clave of ["nombre", "nombreCliente"]) {
+            if (accion.campos.some((c) => c.clave === clave) && !cuerpo[clave]) {
+              cuerpo[clave] = nombreClienteFinal;
+            }
+          }
+          if (accion.campos.some((c) => c.clave === "telefono") && !cuerpo.telefono) {
+            cuerpo.telefono = callerNumber || "";
+          }
+
+          const respMotor = await fetch(`${odinUrl}/api/voice/accion-motor`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...odinAuth() },
+            body: JSON.stringify({
+              negocioId,
+              telefonoCliente: callerNumber || "desconocido",
+              nombreCliente: nombreClienteFinal,
+              // Sin `conversacionId` a propósito: la conversación de una llamada
+              // la crea Odin al CERRARLA (`/api/webhooks/voice`, dedupe por
+              // callSid), así que mientras la llamada corre todavía no existe.
+              // Es lo mismo que hacen agendar_cita y crear_pedido.
+              marcador: accion.marcador,
+              datos: cuerpo,
+            }),
+            signal: AbortSignal.timeout(10000),
+          });
+
+          const dataMotor: any = await respMotor.json().catch(() => ({}));
+          if (!respMotor.ok) {
+            console.error(`[FUNCIÓN] ${nombre} → HTTP ${respMotor.status}:`, dataMotor);
+            return { ok: false, mensaje: "No pude registrarlo en el sistema. ¿Lo intentamos de nuevo?" };
+          }
+
+          // LA REGLA DE HONESTIDAD, aplicada al teléfono. Va ANTES que el caso
+          // genérico a propósito: cuando el sistema se niega (no queda mesa a
+          // esa hora, el grupo no cabe en ninguna), el motivo ya viene redactado
+          // para el cliente en `error` y hay que decirlo TAL CUAL. Un "hubo un
+          // problema" en su lugar deja al cliente sin saber que puede pedir otra
+          // hora, que es la única salida que sí existe.
+          //
+          // Por chat este texto REEMPLAZA la confirmación que el modelo ya había
+          // escrito; en una llamada nada se ha dicho todavía —la tool corre
+          // antes de hablar—, así que basta con devolvérselo.
+          const primero = Array.isArray(dataMotor?.resultados) ? dataMotor.resultados[0] : null;
+          if (primero && primero.ok === false) {
+            console.warn(`[FUNCIÓN] ${nombre} → rechazado: ${primero.error}`);
+            return {
+              ok: false,
+              mensaje: primero.error
+                ? `${primero.error}. Díselo al cliente con esas palabras y ofrécele otra opción.`
+                : "No se pudo completar. Dile la verdad al cliente y ofrécele pasarlo con una persona.",
+            };
+          }
+
+          // FALTAN DATOS: se le devuelven al modelo con su etiqueta para que se
+          // los pida al cliente y vuelva a llamar. En una llamada no se puede
+          // "guardar un borrador" — o se completa ahora o se pierde.
+          const faltantes: string[] = Array.isArray(dataMotor?.faltantes) ? dataMotor.faltantes : [];
+          if ((dataMotor?.ejecutadas ?? 0) === 0) {
+            if (faltantes.length > 0) {
+              return {
+                ok: false,
+                mensaje: `Faltan datos para registrarlo. Pregúntale al cliente: ${faltantes.join(", ")}. Después vuelve a llamar a esta función.`,
+              };
+            }
+            console.error(`[FUNCIÓN] ${nombre} → sin ejecutar:`, dataMotor?.errores);
+            return { ok: false, mensaje: "No pude registrarlo. Ofrécele pasarlo con una persona." };
+          }
+
+          console.log(`[FUNCIÓN] ${nombre} → OK (${accion.marcador})`);
+          return { ok: true, mensaje: "Listo, quedó registrado. Confírmaselo al cliente." };
+        }
       }
     } catch (err) {
       console.error(`[FUNCIÓN] Error en ${nombre}:`, err);

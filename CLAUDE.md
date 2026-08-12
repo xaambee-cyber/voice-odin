@@ -16,11 +16,27 @@ solo el servidor de llamadas.
    STT + conversación + TTS, sin pasos intermedios (`src/openai/realtime.ts`).
 3. `src/pipeline/llamada.ts` (`PipelineLlamada`) es el orquestador: arma el
    system prompt en español mexicano a partir de la configuración del negocio,
-   define las **tools** que el modelo puede invocar (`agendar_cita`,
-   `cancelar_cita`, `reagendar_cita`, `solicitar_reserva`, `crear_pedido`,
-   `escalar_humano`, `registrar_pregunta`, `colgar_llamada`,
-   `enviar_ubicacion`) y las ejecuta llamando de vuelta a **Odin** (la app
-   Next.js) por HTTP con el secreto compartido `VOICE_SERVER_SECRET`.
+   define las **tools** que el modelo puede invocar y las ejecuta llamando de
+   vuelta a **Odin** (la app Next.js) por HTTP con el secreto compartido
+   `VOICE_SERVER_SECRET`.
+
+   Las tools son de **dos clases**, y la diferencia importa:
+
+   - **Fijas**, escritas en este repo: `agendar_cita`, `cancelar_cita`,
+     `reagendar_cita`, `solicitar_reserva`, `crear_pedido`, `escalar_humano`,
+     `registrar_pregunta`, `colgar_llamada`, `enviar_ubicacion`. Cada una tiene
+     su `case` en `manejarFuncion` y su endpoint propio en Odin.
+   - **De motor**, que llegan como DATOS en `accionesMotor` de
+     `config-llamada` (`reservar_mesa`, `registrar_orden`,
+     `registrar_prospecto`, `registrar_viaje`, `registrar_membresia`,
+     `apartar_lugares`). No hay un `case` por cada una: se registran solas a
+     partir del esquema que manda Odin y todas se ejecutan contra
+     `/api/voice/accion-motor`, que valida, persiste y avisa al dueño con el
+     MISMO núcleo que WhatsApp y Meta.
+
+   **Si Odin agrega un motor nuevo, el teléfono lo tiene sin tocar este repo.**
+   No vuelvas a escribir a mano una tool de motor: eso es lo que tuvo por meses
+   al asistente cerrando reparaciones por WhatsApp y no por llamada.
 4. La configuración de cada negocio (catálogo, horarios, habilidades activas,
    métodos de pago, etc.) la entrega Odin en caliente por HTTP
    (`config.odinAppUrl` + `/api/voice/...`), no vive en este repo.
