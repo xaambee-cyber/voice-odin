@@ -1738,10 +1738,30 @@ export class PipelineLlamada {
             }
           }
 
+          // POR DÓNDE le va a llegar la respuesta, dicho tal cual.
+          //
+          // Cuando alguien del negocio contesta este pendiente, Odin le manda la
+          // respuesta al cliente POR WHATSAPP, al número desde el que llamó (ver
+          // `responderPendiente` en app/lib/pendientes.ts). Decir "alguien te
+          // contactará" a secas dejaba a la persona esperando una llamada que no
+          // iba a llegar, y el WhatsApp le aparecía después sin contexto.
+          //
+          // Y si la llamada entró con el identificador oculto no hay número al
+          // cual escribirle: Odin no crea el pendiente, así que NADIE va a poder
+          // contestarle. Ahí no se promete nada — se le pide un contacto. Misma
+          // regla de honestidad que los marcadores: si la acción no se pudo
+          // hacer, no se finge que sí.
+          const hayNumeroParaResponder =
+            !!callerNumber && callerNumber.replace(/\D/g, "").length >= 10;
+
           const mensajes: Record<string, string> = {
-            directo: "Listo, ya notifiqué al equipo. Alguien te contactará pronto.",
+            directo: hayNumeroParaResponder
+              ? "Listo, ya notifiqué al equipo. Te escriben por WhatsApp a este mismo número."
+              : "Listo, ya notifiqué al equipo. ¿Me compartes un número de WhatsApp para que te contacten?",
             emergencia: "Entendido. El equipo fue notificado de inmediato.",
-            no_sabe: "Ya notifiqué al equipo para que te contacten con esa información.",
+            no_sabe: hayNumeroParaResponder
+              ? "Ya notifiqué al equipo. En cuanto me confirmen, te llega la respuesta por WhatsApp a este número."
+              : "Ya notifiqué al equipo. ¿Me compartes un número de WhatsApp para mandarte la respuesta?",
           };
           return { ok: true, mensaje: mensajes[args.tipo] || "Ya notifiqué al equipo." };
         }
@@ -1761,10 +1781,24 @@ export class PipelineLlamada {
           if (!respAprendizaje.ok) {
             const errBody = await respAprendizaje.text().catch(() => "");
             console.error(`[FUNCIÓN] registrar_pregunta → HTTP ${respAprendizaje.status}: ${errBody}`);
-          } else {
-            console.log(`[FUNCIÓN] registrar_pregunta → HTTP ${respAprendizaje.status} OK`);
+            // No se registró nada: nadie va a poder contestarle. Prometer que
+            // "el equipo te contactará" seria mentir.
+            return { ok: true, mensaje: "Tomo nota. ¿Te parece si lo revisas directamente con el equipo?" };
           }
-          return { ok: true, mensaje: "Anotado. El equipo te contactará con esa información." };
+          console.log(`[FUNCIÓN] registrar_pregunta → HTTP ${respAprendizaje.status} OK`);
+
+          // Odin crea el pendiente solo si hay número al cual escribirle (ver
+          // /api/voice/aprendizaje). Sin número, la pregunta queda registrada
+          // para el dueño pero no hay forma de devolverle la respuesta a quien
+          // llamó, así que se le pide un contacto en vez de prometerle algo.
+          const puedenResponderle =
+            !!callerNumber && callerNumber.replace(/\D/g, "").length >= 10;
+          return {
+            ok: true,
+            mensaje: puedenResponderle
+              ? "Anotado. En cuanto el equipo me confirme, te llega la respuesta por WhatsApp a este número."
+              : "Anotado. ¿Me compartes un número de WhatsApp para mandarte la respuesta?",
+          };
         }
 
         case "colgar_llamada": {
