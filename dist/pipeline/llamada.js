@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.PipelineLlamada = void 0;
+exports.construirHerramientas = construirHerramientas;
 exports.buildSystemPrompt = buildSystemPrompt;
 const ws_1 = __importDefault(require("ws"));
 const twilio_1 = __importDefault(require("twilio"));
@@ -91,13 +92,123 @@ function herramientasDeMotor(acciones) {
         };
     });
 }
+/**
+ * El bloque de esquema para los datos que el dueño pide de más en una operación
+ * con tool escrita a mano (cita, reserva, pedido).
+ *
+ * Devuelve `null` cuando el negocio no configuró nada, y entonces la tool se
+ * declara EXACTAMENTE como siempre: ni una propiedad de más en el esquema que
+ * viaja en cada llamada.
+ */
+function propiedadDatosDueno(campos) {
+    const props = propiedadesCamposMotor(campos || []);
+    if (!props)
+        return null;
+    const obligatorios = (campos || []).filter((c) => c.requerido).map((c) => c.label);
+    return {
+        type: "object",
+        description: "Datos que este negocio pide SIEMPRE para esta operación. Las LLAVES son los IDs de campo, NUNCA las etiquetas." +
+            (obligatorios.length > 0
+                ? ` Antes de llamar a esta función recolecta conversando: ${obligatorios.join(", ")}.`
+                : ""),
+        properties: props,
+    };
+}
+/**
+ * Las tools del CICLO DE VIDA de lo ya creado: consultar, cambiar y cancelar.
+ *
+ * Son tres genéricas con el `tipo` acotado por enum, no tres por cada operación:
+ * un negocio con cinco motores encendidos tendría quince funciones y el modelo
+ * las lee ENTERAS en cada turno de la llamada. La lista de tipos y la de campos
+ * modificables las manda Odin (`operacionesCliente`), que las saca de la misma
+ * lista blanca que aplica el cambio — aquí no se decide qué se puede tocar.
+ */
+function herramientasDeCicloVida(operaciones) {
+    if (operaciones.length === 0)
+        return [];
+    const tipos = operaciones.map((o) => o.tipo);
+    const comoSeLlaman = operaciones.map((o) => `${o.tipo} = ${o.etiqueta}`).join("; ");
+    const editables = operaciones.filter((o) => o.camposEditables.length > 0);
+    const herramientas = [
+        {
+            type: "function",
+            name: "consultar_operacion",
+            description: `Consulta lo que el cliente que está llamando ya tiene registrado (${comoSeLlaman}). Sin referencia te devuelve su lista con las referencias; con referencia te da el detalle de esa. Úsala cuando pregunte "¿cómo va lo mío?", "¿qué pedí?", "¿ya está lista mi orden?" o antes de cambiar o cancelar algo, para ubicar cuál es. El resultado trae un "texto" — dilo TAL CUAL, no inventes ni completes datos.`,
+            parameters: {
+                type: "object",
+                properties: {
+                    tipo: { type: "string", enum: tipos, description: `Qué está consultando. ${comoSeLlaman}` },
+                    referencia: {
+                        type: "string",
+                        description: "Referencia de 8 caracteres que te dio el cliente (dictada letra por letra o número por número). Omítela para que te devuelva la lista completa.",
+                    },
+                },
+                required: ["tipo"],
+            },
+        },
+        {
+            type: "function",
+            name: "cancelar_operacion",
+            description: `Cancela algo que el cliente ya tiene registrado (${comoSeLlaman}). Llámala SOLO si el cliente lo pidió de forma explícita y clara, y solo después de haber confirmado con él CUÁL es (usa consultar_operacion para ubicar la referencia). El resultado trae un "texto" — dilo TAL CUAL; si el sistema no la canceló, NO le digas al cliente que quedó cancelada.`,
+            parameters: {
+                type: "object",
+                properties: {
+                    tipo: { type: "string", enum: tipos, description: `Qué está cancelando. ${comoSeLlaman}` },
+                    referencia: { type: "string", description: "Referencia de 8 caracteres de lo que se cancela. OBLIGATORIA." },
+                },
+                required: ["tipo", "referencia"],
+            },
+        },
+    ];
+    if (editables.length > 0) {
+        const queSePuedeCambiar = editables
+            .map((o) => `En ${o.tipo}: ${o.camposEditables.map((c) => `${c.clave} (${c.descripcion})`).join(", ")}`)
+            .join(". ");
+        herramientas.push({
+            type: "function",
+            name: "modificar_operacion",
+            description: `Cambia datos de algo que el cliente ya tiene registrado. SOLO estos campos, cada uno en su tipo — cualquier otro el sistema lo rechaza: ${queSePuedeCambiar}. Manda ÚNICAMENTE lo que cambia. Si el cliente quiere cambiar productos de un pedido, no uses esta función: se cancela y se registra uno nuevo. El resultado trae un "texto" — dilo TAL CUAL y NO confirmes el cambio antes de recibirlo.`,
+            parameters: {
+                type: "object",
+                properties: {
+                    tipo: {
+                        type: "string",
+                        enum: editables.map((o) => o.tipo),
+                        description: `Qué está modificando. ${editables.map((o) => `${o.tipo} = ${o.etiqueta}`).join("; ")}`,
+                    },
+                    referencia: { type: "string", description: "Referencia de 8 caracteres de lo que se modifica. OBLIGATORIA." },
+                    cambios: {
+                        type: "object",
+                        description: `Solo los campos que cambian, con su nombre exacto. ${queSePuedeCambiar}. Las horas van en formato de 24 horas; al cliente le hablas siempre en 12 horas con am/pm.`,
+                        additionalProperties: { type: "string" },
+                    },
+                },
+                required: ["tipo", "referencia", "cambios"],
+            },
+        });
+    }
+    return herramientas;
+}
+// Exportada por el mismo motivo que `buildSystemPrompt`: poder verificar qué
+// funciones se le declaran a un negocio —y sobre todo, cuáles NO— sin levantar
+// una llamada real. Una tool de más es una puerta que el modelo puede abrir por
+// error, y por teléfono un error no se edita ni se borra: ya se dijo en voz alta.
 function construirHerramientas(cfg) {
     const herramientas = [];
     const agendaActiva = cfg.habilidadesActivas?.agenda_citas ?? cfg.habilidades.includes("agenda_citas");
     const escalamientoActivo = cfg.habilidadesActivas?.escalamiento ?? cfg.habilidades.includes("escalamiento");
     const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
     const pedidosActiva = cfg.habilidadesActivas?.pedidos ?? cfg.habilidades.includes("pedidos");
+    const datosDueno = cfg.datosDuenoPorTipo || {};
     if (agendaActiva) {
+        // Los datos del dueño para CITAS viajan en el MISMO `camposAgenda` que los
+        // del servicio: para el cliente son la misma pregunta, y así es como
+        // /api/voice/citas los fusiona del otro lado (ver LLAVE_CAMPOS en Odin).
+        // Por eso se declaran como propiedades explícitas y se conserva
+        // `additionalProperties` para los que trae el servicio elegido, que varían
+        // servicio por servicio y no se pueden enumerar aquí.
+        const propsCita = propiedadesCamposMotor(datosDueno.cita || []);
+        const obligatoriosCita = (datosDueno.cita || []).filter((c) => c.requerido).map((c) => c.label);
         herramientas.push({
             type: "function",
             name: "agendar_cita",
@@ -111,7 +222,11 @@ function construirHerramientas(cfg) {
                     profesional: { type: "string", description: "Nombre EXACTO del profesional, solo si el cliente eligió uno que atiende ese servicio. Si no pidió a nadie, omítelo." },
                     camposAgenda: {
                         type: "object",
-                        description: "Datos adicionales que pide el servicio elegido. Las LLAVES deben ser los IDs de campo (ej. \"c1\", \"c2\"), NUNCA las etiquetas largas; los valores son lo que dijo el cliente. Inclúyelo SOLO si el servicio tiene campos adicionales; OMÍTELO por completo si el servicio no tiene ninguno.",
+                        description: "Datos adicionales que pide el servicio elegido. Las LLAVES deben ser los IDs de campo (ej. \"c1\", \"c2\"), NUNCA las etiquetas largas; los valores son lo que dijo el cliente. Inclúyelo SOLO si el servicio tiene campos adicionales; OMÍTELO por completo si el servicio no tiene ninguno." +
+                            (obligatoriosCita.length > 0
+                                ? ` Además, este negocio pide SIEMPRE estos datos en TODAS sus citas — recolécalos conversando antes de llamar: ${obligatoriosCita.join(", ")}.`
+                                : ""),
+                        ...(propsCita ? { properties: propsCita } : {}),
                         additionalProperties: { type: "string" },
                     },
                 },
@@ -148,6 +263,10 @@ function construirHerramientas(cfg) {
     }
     if (solicitudReservaActiva) {
         const verificarDisp = cfg.verificarDisponibilidadReserva === true;
+        // Los datos que el dueño pide de más en TODAS sus reservas. Sin esto,
+        // /api/voice/reservar respondía 400 FALTAN_CAMPOS y la reserva no se podía
+        // cerrar por teléfono aunque sí por WhatsApp.
+        const camposMotorReserva = propiedadDatosDueno(datosDueno.reserva);
         if (verificarDisp) {
             // Modo hospedaje con verificación: la tool recibe fechas estructuradas y
             // el ID de la unidad. El resultado le dice al modelo qué responder
@@ -167,6 +286,7 @@ function construirHerramientas(cfg) {
                         itemNombre: { type: "string", description: "Nombre de la unidad para el negocio, si aplica." },
                         clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural antes de reservar ('¿A nombre de quién hago la reserva?') si aún no lo dijo. Si ya lo dijo, úsalo sin volver a preguntar." },
                         pagoReportado: { type: "boolean", description: "false la primera vez (verificar disponibilidad). Ponlo true ÚNICAMENTE cuando el cliente diga de forma EXPLÍCITA E INEQUÍVOCA que YA realizó el pago (por ejemplo: 'ya transferí', 'ya hice el depósito', 'ya pagué', 'ya te mandé el comprobante'). NUNCA lo pongas true por un 'gracias', 'ok', 'va', 'perfecto', 'ahí va', un silencio o ruido. Si tienes la más mínima duda de si ya pagó, déjalo en false y pregúntale: '¿Ya realizaste el pago?'." },
+                        ...(camposMotorReserva ? { camposMotor: camposMotorReserva } : {}),
                     },
                     required: ["detalles", "fechaEntrada", "fechaSalida"],
                 },
@@ -192,6 +312,7 @@ function construirHerramientas(cfg) {
                         personas: { type: "number", description: "Número de personas si aplica" },
                         itemNombre: { type: "string", description: "Habitación, mesa, servicio o ítem específico que pidió, si aplica" },
                         clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural antes de enviar la solicitud ('¿A nombre de quién?') si aún no lo dijo." },
+                        ...(camposMotorReserva ? { camposMotor: camposMotorReserva } : {}),
                     },
                     required: ["detalles"],
                 },
@@ -199,6 +320,9 @@ function construirHerramientas(cfg) {
         }
     }
     if (pedidosActiva) {
+        // Igual que en reservas: sin estos campos /api/voice/pedidos rechazaba con
+        // FALTAN_CAMPOS y el pedido no se registraba nunca.
+        const camposMotorPedido = propiedadDatosDueno(datosDueno.pedido);
         herramientas.push({
             type: "function",
             name: "crear_pedido",
@@ -222,6 +346,7 @@ function construirHerramientas(cfg) {
                     direccion: { type: "string", description: "Dirección de entrega (solo si es a domicilio)" },
                     notas: { type: "string", description: "Indicaciones especiales del cliente, si las hay" },
                     clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural antes de registrar el pedido ('¿A nombre de quién es el pedido?') si aún no lo dijo." },
+                    ...(camposMotorPedido ? { camposMotor: camposMotorPedido } : {}),
                 },
                 required: ["items", "tipo"],
             },
@@ -316,6 +441,9 @@ function construirHerramientas(cfg) {
         return true;
     });
     herramientas.push(...deMotor);
+    // Y el ciclo de vida de lo YA creado. Va al final por la misma razón: son
+    // datos que manda Odin, no una lista escrita aquí.
+    herramientas.push(...herramientasDeCicloVida(cfg.operacionesCliente || []));
     console.log(`[PIPELINE] Herramientas cargadas: ${herramientas.map((h) => h.name).join(", ") || "(ninguna)"}`);
     return herramientas;
 }
@@ -447,6 +575,13 @@ function buildSystemPrompt(cfg, contextoExtra) {
     const citasClienteTexto = cfg.citasCliente && cfg.citasCliente.length > 0
         ? cfg.citasCliente.map((c) => `- [ID:${c.id}] ${c.servicio} — ${c.fechaInicio} — ${c.estado}`).join("\n")
         : null;
+    // Lo que quien llama ya tiene abierto. Odin ya lo filtró por su teléfono; la
+    // referencia va con el tipo porque es lo que pide cada tool del ciclo de vida.
+    const operacionesResumenTexto = (cfg.operacionesClienteResumen || []).length > 0
+        ? (cfg.operacionesClienteResumen || [])
+            .map((o) => `- ${o.etiqueta} referencia ${o.referencia} (tipo ${o.tipo}): ${o.resumen}`)
+            .join("\n")
+        : null;
     const habilidadesLista = [];
     if (agendaActiva)
         habilidadesLista.push("- agenda_citas");
@@ -482,6 +617,67 @@ ${accionesMotor.map((a) => `- Para "${a.descripcion.replace(/\s+/g, " ").trim()}
 NUNCA digas en voz alta un corchete, un nombre de marcador, un ID ni un JSON. Son internos.
 `
             : ""}`
+        : "";
+    // ── DATOS QUE ESTE NEGOCIO PIDE SIEMPRE ───────────────────────────────────
+    // Lo que el dueño configuró de más para cita, reserva y pedido. Va en la
+    // parte ESTABLE del prompt: es del negocio, no de la llamada. Las tools ya lo
+    // llevan en su esquema; esto es para que el agente lo pregunte CONVERSANDO y
+    // no lo descubra hasta que el backend le responda que faltan datos.
+    const datosDuenoCfg = cfg.datosDuenoPorTipo || {};
+    const NOMBRE_OPERACION_DUENO = {
+        cita: "agendar una cita",
+        reserva: "hacer una reserva",
+        pedido: "registrar un pedido",
+    };
+    const LLAVE_DUENO = {
+        cita: "camposAgenda",
+        reserva: "camposMotor",
+        pedido: "camposMotor",
+    };
+    const bloqueDatosDueno = (() => {
+        const partes = ["cita", "reserva", "pedido"]
+            .filter((t) => (t === "cita" ? agendaActiva : t === "reserva" ? solicitudReservaActiva : pedidosActiva))
+            .map((t) => {
+            const campos = datosDuenoCfg[t] || [];
+            if (campos.length === 0)
+                return "";
+            const lista = campos
+                .map((c) => `${c.label} [campo:${c.id}, ${c.requerido ? "OBLIGATORIO" : "opcional"}]${c.opciones?.length ? ` — opciones: ${c.opciones.join(", ")}` : ""}${c.ayuda ? ` — ${c.ayuda}` : ""}`)
+                .join("; ");
+            return `- Para ${NOMBRE_OPERACION_DUENO[t]}: ${lista}. Pásalos en ${LLAVE_DUENO[t]} usando como LLAVE el ID entre [campo:...].`;
+        })
+            .filter(Boolean);
+        if (partes.length === 0)
+            return "";
+        return `
+=== DATOS QUE ESTE NEGOCIO PIDE SIEMPRE ===
+Estos datos van ADEMÁS de los normales, en TODAS las operaciones de ese tipo:
+${partes.join("\n")}
+Pregúntalos conversando y con la etiqueta natural (para "Dirección de recolección" pregunta "¿En qué dirección recogemos?"). NUNCA digas el ID ni la palabra "campo". Los opcionales solo si fluye; no insistas.
+`;
+    })();
+    // ── CICLO DE VIDA: consultar, cambiar y cancelar lo ya creado ─────────────
+    // Estable por negocio (qué operaciones y qué campos). Lo que tiene ESTE
+    // llamante va abajo, en CONTEXTO DE ESTA LLAMADA.
+    const operacionesCliente = cfg.operacionesCliente || [];
+    const bloqueCicloVida = operacionesCliente.length > 0
+        ? `
+=== SOLICITUDES QUE EL CLIENTE YA TIENE ===
+Este cliente puede consultar, cambiar o cancelar lo que ya registró: ${operacionesCliente.map((o) => o.etiqueta).join(", ")}.
+
+CÓMO SE IDENTIFICA CADA UNA: por una REFERENCIA de 8 caracteres. Al cliente se la dictas despacio, carácter por carácter ("a, ele, siete, dos…"), y cuando él te la dicte repítesela para confirmar antes de actuar.
+
+PROCEDIMIENTO OBLIGATORIO:
+1. Si el cliente no dice cuál, llama a consultar_operacion SIN referencia para ver su lista y ofrécele máximo dos opciones habladas.
+2. Confirma con él cuál es ANTES de cambiar o cancelar nada.
+3. Llama a la función que toca (consultar_operacion, modificar_operacion o cancelar_operacion) y di el "texto" que devuelva TAL CUAL.
+
+REGLAS QUE NO SE ROMPEN:
+- NUNCA confirmes un cambio o una cancelación antes de que la función responda. Si el sistema no lo hizo, díselo con esas palabras y ofrécele pasarlo con una persona.
+- Solo puedes tocar lo de QUIEN ESTÁ LLAMANDO. Si te pide algo de otra persona, no lo intentes: dile que por seguridad solo puedes ver lo de este número.
+- No inventes estados, precios, avances ni fechas de entrega. Lo que no venga en el "texto" de la función, no existe.
+- Frases ambiguas ("olvídalo", "ya no", "no importa") NO son una cancelación. Ante la duda mínima, pregunta.
+`
         : "";
     // Bloque dinámico al inicio del prompt: si la llamada es un rebote o llegó
     // por desvío desde una sucursal específica, el agente se comporta distinto.
@@ -668,7 +864,7 @@ REGLAS:
 - NO asumas que el cliente ya pagó. Un "gracias", "ok", "va", "perfecto", "ahí va", un silencio o un ruido NO son confirmación de pago. Si dudas, deja pagoReportado en false y pregunta: "¿Ya realizaste el pago?".
 - Después de dar los datos de pago, NO vuelvas a llamar a solicitar_reserva hasta que el cliente diga claramente que ya pagó.` : ""}
 ` : ""}
-${bloqueGiro}
+${bloqueGiro}${bloqueDatosDueno}${bloqueCicloVida}
 === CONOCIMIENTO FALTANTE — ACCIÓN OBLIGATORIA ===
 REGLA CRÍTICA: Cuando el cliente pregunta algo que NO está en tu base de conocimiento, DEBES llamar a registrar_pregunta ANTES de responder. La función confirma el registro y te da el mensaje para el cliente.
 
@@ -692,7 +888,12 @@ FECHA Y HORA ACTUAL: ${ahoraStr}${bloqueContextoLlamada}${agendaActiva ? (citasC
 CITAS VIGENTES DE QUIEN LLAMA:
 ${citasClienteTexto}` : `
 
-CITAS VIGENTES DE QUIEN LLAMA: ninguna.`) : ""}${escalamientoActivo && receptoresTexto && contextoExtra?.receptorOrigen ? `
+CITAS VIGENTES DE QUIEN LLAMA: ninguna.`) : ""}${operacionesCliente.length > 0 ? (operacionesResumenTexto ? `
+
+SOLICITUDES VIGENTES DE QUIEN LLAMA (ya verificadas contra su número; úsalas para ubicar de cuál habla sin pedirle la referencia):
+${operacionesResumenTexto}` : `
+
+SOLICITUDES VIGENTES DE QUIEN LLAMA: ninguna registrada con este número. Si insiste en que tiene una, pídele la referencia y consúltala con consultar_operacion.`) : ""}${escalamientoActivo && receptoresTexto && contextoExtra?.receptorOrigen ? `
 
 ESCALAMIENTO POR DEFECTO: si el cliente pide hablar con una persona y no dice con cuál, usa "${contextoExtra.receptorOrigen.etiqueta}" — fue al número que él marcó originalmente.` : ""}`;
 }
@@ -803,6 +1004,33 @@ function mensajeAnticipoCitaVoz(monto, esMercadoPago, whatsappEnviado) {
 const configCache = new Map();
 const CONFIG_CACHE_TTL_MS = 60_000;
 // Normaliza un número telefónico para comparación (solo dígitos, sin +).
+/**
+ * Los datos del dueño tal como los recolectó el modelo, listos para viajar.
+ *
+ * Devuelve `undefined` cuando no hay nada: mandar `{}` haría que el endpoint
+ * viera un objeto vacío en vez de "no vino la llave", que es lo mismo hoy pero
+ * no tiene por qué seguir siéndolo. Los valores se pasan a texto porque las
+ * llaves son ids de campo y del otro lado se guardan como texto.
+ */
+function limpiarCamposDueno(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+        return undefined;
+    const entradas = Object.entries(raw).filter(([, v]) => v != null && String(v).trim().length > 0);
+    if (entradas.length === 0)
+        return undefined;
+    return Object.fromEntries(entradas.map(([k, v]) => [k, String(v).trim()]));
+}
+/**
+ * La referencia que el cliente dictó, normalizada.
+ *
+ * Por teléfono llega con espacios, guiones y comas de la transcripción ("a, ele,
+ * siete - dos"). Del otro lado se compara contra el id sin guiones, así que
+ * cualquier cosa que no sea letra o número sobra. Se conserva TAL CUAL en
+ * mayúsculas: la comparación de Odin es case-insensitive.
+ */
+function limpiarReferencia(raw) {
+    return String(raw ?? "").replace(/[^A-Za-z0-9]/g, "").toUpperCase().slice(0, 40);
+}
 function digitosDe(s) {
     return String(s || "").replace(/[^\d]/g, "");
 }
@@ -1194,11 +1422,23 @@ class PipelineLlamada {
                             verificarDisponibilidad,
                             pagoReportado,
                             canal: "voz",
+                            // Los datos que el dueño pide de más en TODAS sus reservas. La
+                            // llave es el id del campo (c1, c2…), nunca la etiqueta.
+                            camposMotor: limpiarCamposDueno(args.camposMotor),
                         }),
                         signal: AbortSignal.timeout(8000),
                     });
                     const data = (await resp.json().catch(() => ({})));
                     if (!resp.ok) {
+                        // 400 FALTAN_CAMPOS: faltó un dato que este negocio pide siempre.
+                        // Se le devuelven las ETIQUETAS al modelo para que se las pida al
+                        // cliente y reintente — igual que en agendar_cita.
+                        if (data.error === "FALTAN_CAMPOS" && Array.isArray(data.faltantes) && data.faltantes.length > 0) {
+                            return {
+                                ok: false,
+                                mensaje: `Antes de mandar la reserva necesito un par de datos más: ${data.faltantes.join(", ")}. ¿Me los puedes dar?`,
+                            };
+                        }
                         // 409 = sin disponibilidad: queremos que el agente lo diga, no que
                         // lo trate como error técnico. Por eso ok:true con mensaje honesto.
                         if (data.noDisponible || resp.status === 409) {
@@ -1249,11 +1489,18 @@ class PipelineLlamada {
                             tipo: args.tipo,
                             direccion: args.direccion ?? null,
                             notas: args.notas ?? null,
+                            camposMotor: limpiarCamposDueno(args.camposMotor),
                         }),
                         signal: AbortSignal.timeout(8000),
                     });
                     const data = (await resp.json().catch(() => ({})));
                     if (!resp.ok) {
+                        if (data.error === "FALTAN_CAMPOS" && Array.isArray(data.faltantes) && data.faltantes.length > 0) {
+                            return {
+                                ok: false,
+                                mensaje: `Antes de registrar el pedido necesito un par de datos más: ${data.faltantes.join(", ")}. ¿Me los puedes dar?`,
+                            };
+                        }
                         return { ok: false, mensaje: "Tuve un problema registrando el pedido. ¿Me lo confirmas otra vez, por favor?" };
                     }
                     return { ok: true, mensaje: `Listo, registré tu pedido por un total de ${data.total} pesos. El negocio te lo confirma en seguida. ¿Algo más?` };
@@ -1426,10 +1673,28 @@ class PipelineLlamada {
                             console.error("[FUNCIÓN] escalar_humano: fallo al programar transferencia:", e?.message || e, e?.code ? `(code=${e.code})` : "");
                         }
                     }
+                    // POR DÓNDE le va a llegar la respuesta, dicho tal cual.
+                    //
+                    // Cuando alguien del negocio contesta este pendiente, Odin le manda la
+                    // respuesta al cliente POR WHATSAPP, al número desde el que llamó (ver
+                    // `responderPendiente` en app/lib/pendientes.ts). Decir "alguien te
+                    // contactará" a secas dejaba a la persona esperando una llamada que no
+                    // iba a llegar, y el WhatsApp le aparecía después sin contexto.
+                    //
+                    // Y si la llamada entró con el identificador oculto no hay número al
+                    // cual escribirle: Odin no crea el pendiente, así que NADIE va a poder
+                    // contestarle. Ahí no se promete nada — se le pide un contacto. Misma
+                    // regla de honestidad que los marcadores: si la acción no se pudo
+                    // hacer, no se finge que sí.
+                    const hayNumeroParaResponder = !!callerNumber && callerNumber.replace(/\D/g, "").length >= 10;
                     const mensajes = {
-                        directo: "Listo, ya notifiqué al equipo. Alguien te contactará pronto.",
+                        directo: hayNumeroParaResponder
+                            ? "Listo, ya notifiqué al equipo. Te escriben por WhatsApp a este mismo número."
+                            : "Listo, ya notifiqué al equipo. ¿Me compartes un número de WhatsApp para que te contacten?",
                         emergencia: "Entendido. El equipo fue notificado de inmediato.",
-                        no_sabe: "Ya notifiqué al equipo para que te contacten con esa información.",
+                        no_sabe: hayNumeroParaResponder
+                            ? "Ya notifiqué al equipo. En cuanto me confirmen, te llega la respuesta por WhatsApp a este número."
+                            : "Ya notifiqué al equipo. ¿Me compartes un número de WhatsApp para mandarte la respuesta?",
                     };
                     return { ok: true, mensaje: mensajes[args.tipo] || "Ya notifiqué al equipo." };
                 }
@@ -1448,11 +1713,103 @@ class PipelineLlamada {
                     if (!respAprendizaje.ok) {
                         const errBody = await respAprendizaje.text().catch(() => "");
                         console.error(`[FUNCIÓN] registrar_pregunta → HTTP ${respAprendizaje.status}: ${errBody}`);
+                        // No se registró nada: nadie va a poder contestarle. Prometer que
+                        // "el equipo te contactará" seria mentir.
+                        return { ok: true, mensaje: "Tomo nota. ¿Te parece si lo revisas directamente con el equipo?" };
                     }
-                    else {
-                        console.log(`[FUNCIÓN] registrar_pregunta → HTTP ${respAprendizaje.status} OK`);
+                    console.log(`[FUNCIÓN] registrar_pregunta → HTTP ${respAprendizaje.status} OK`);
+                    // Odin crea el pendiente solo si hay número al cual escribirle (ver
+                    // /api/voice/aprendizaje). Sin número, la pregunta queda registrada
+                    // para el dueño pero no hay forma de devolverle la respuesta a quien
+                    // llamó, así que se le pide un contacto en vez de prometerle algo.
+                    const puedenResponderle = !!callerNumber && callerNumber.replace(/\D/g, "").length >= 10;
+                    return {
+                        ok: true,
+                        mensaje: puedenResponderle
+                            ? "Anotado. En cuanto el equipo me confirme, te llega la respuesta por WhatsApp a este número."
+                            : "Anotado. ¿Me compartes un número de WhatsApp para mandarte la respuesta?",
+                    };
+                }
+                case "consultar_operacion":
+                case "modificar_operacion":
+                case "cancelar_operacion": {
+                    // ── CICLO DE VIDA DE LO YA CREADO ─────────────────────────────────
+                    // Las tres van al MISMO endpoint porque son la misma operación con
+                    // distinta acción, y ese endpoint corre el MISMO núcleo que WhatsApp
+                    // (`ejecutarOperacionCliente`): las mismas reglas de qué se puede
+                    // tocar según el estado, la misma validación por teléfono y los
+                    // mismos textos. Reimplementar aquí cualquier parte de eso es como
+                    // los canales se desincronizaron la vez pasada.
+                    //
+                    // Sin número de quien llama no se intenta siquiera: la autorización
+                    // ES el teléfono, y "desconocido" no autoriza nada.
+                    if (!callerNumber) {
+                        return {
+                            ok: false,
+                            mensaje: "No alcanzo a ver tu número desde esta llamada, así que no puedo consultar ni mover tus solicitudes. Dile al cliente que lo puede hacer por WhatsApp o pásalo con una persona.",
+                        };
                     }
-                    return { ok: true, mensaje: "Anotado. El equipo te contactará con esa información." };
+                    const accion = nombre === "consultar_operacion"
+                        ? (limpiarReferencia(args?.referencia) ? "consultar" : "listar")
+                        : nombre === "modificar_operacion"
+                            ? "modificar"
+                            : "cancelar";
+                    const respOp = await fetch(`${odinUrl}/api/voice/operacion-cliente`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", ...odinAuth() },
+                        body: JSON.stringify({
+                            negocioId,
+                            // NO sale de `args`: el modelo no elige de quién son los datos
+                            // que puede ver o mover. Es el número desde el que entró la
+                            // llamada, y punto.
+                            telefonoCliente: callerNumber,
+                            accion,
+                            tipo: args?.tipo,
+                            referencia: limpiarReferencia(args?.referencia) || undefined,
+                            cambios: args?.cambios && typeof args.cambios === "object" ? args.cambios : undefined,
+                        }),
+                        signal: AbortSignal.timeout(10000),
+                    });
+                    const dataOp = await respOp.json().catch(() => ({}));
+                    if (!respOp.ok) {
+                        console.error(`[FUNCIÓN] ${nombre} → HTTP ${respOp.status}:`, dataOp);
+                        return { ok: false, mensaje: "No pude consultarlo en el sistema ahorita. Dile al cliente la verdad y ofrécele pasarlo con una persona." };
+                    }
+                    // El equipo tiene que revisarlo (ya está pagado, ya está en proceso).
+                    // Se avisa por el MISMO camino que escalar_humano — no se inventa uno
+                    // nuevo — y solo si el negocio tiene escalamiento encendido, que es
+                    // lo que Odin decidió en `escalar`.
+                    if (dataOp?.escalar === true) {
+                        try {
+                            await fetch(`${odinUrl}/api/voice/escalar`, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json", ...odinAuth() },
+                                body: JSON.stringify({
+                                    negocioId,
+                                    tipo: "no_sabe",
+                                    resumen: `El cliente pidió ${accion === "cancelar" ? "cancelar" : "cambiar"} su ${String(args?.tipo || "solicitud")} por teléfono y el sistema no lo permitió: ${String(dataOp?.texto || "").slice(0, 500)}`,
+                                    telefonoCliente: callerNumber,
+                                    nombreCliente: nombreClienteFinal,
+                                }),
+                                signal: AbortSignal.timeout(8000),
+                            });
+                        }
+                        catch (e) {
+                            console.error(`[FUNCIÓN] ${nombre}: no se pudo avisar al equipo`, e);
+                        }
+                    }
+                    // LA REGLA DE HONESTIDAD: `aplicado` es lo único que autoriza al
+                    // agente a confirmar. Si el sistema no lo hizo, el texto ya explica
+                    // por qué y se dice TAL CUAL — nunca un "listo" de cortesía.
+                    const textoOp = typeof dataOp?.texto === "string" && dataOp.texto.trim()
+                        ? dataOp.texto.trim()
+                        : "No pude obtener esa información.";
+                    return {
+                        ok: dataOp?.aplicado === true,
+                        mensaje: dataOp?.aplicado === true
+                            ? textoOp
+                            : `${textoOp} Díselo al cliente con esas palabras; NO le confirmes nada que el sistema no haya hecho.`,
+                    };
                 }
                 case "colgar_llamada": {
                     // Esperar ~2s para que termine de hablar la despedida antes de colgar.

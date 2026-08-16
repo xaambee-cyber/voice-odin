@@ -20,23 +20,52 @@ solo el servidor de llamadas.
    vuelta a **Odin** (la app Next.js) por HTTP con el secreto compartido
    `VOICE_SERVER_SECRET`.
 
-   Las tools son de **dos clases**, y la diferencia importa:
+   Las tools son de **tres clases**, y la diferencia importa:
 
    - **Fijas**, escritas en este repo: `agendar_cita`, `cancelar_cita`,
      `reagendar_cita`, `solicitar_reserva`, `crear_pedido`, `escalar_humano`,
      `registrar_pregunta`, `colgar_llamada`, `enviar_ubicacion`. Cada una tiene
      su `case` en `manejarFuncion` y su endpoint propio en Odin.
-   - **De motor**, que llegan como DATOS en `accionesMotor` de
+   - **De motor** (CREAR), que llegan como DATOS en `accionesMotor` de
      `config-llamada` (`reservar_mesa`, `registrar_orden`,
      `registrar_prospecto`, `registrar_viaje`, `registrar_membresia`,
      `apartar_lugares`). No hay un `case` por cada una: se registran solas a
      partir del esquema que manda Odin y todas se ejecutan contra
      `/api/voice/accion-motor`, que valida, persiste y avisa al dueño con el
      MISMO núcleo que WhatsApp y Meta.
+   - **De ciclo de vida** (CONSULTAR / ACTUALIZAR / CANCELAR):
+     `consultar_operacion`, `modificar_operacion` y `cancelar_operacion`. Son
+     TRES genéricas, no tres por operación —un negocio con cinco motores tendría
+     quince funciones y el modelo las lee enteras en cada turno—; el `tipo` va
+     acotado por enum con lo que Odin manda en `operacionesCliente`, y los
+     campos modificables salen de la misma lista blanca que aplica el cambio
+     (`CAMPOS_EDITABLES` en Odin). Todas pegan a `/api/voice/operacion-cliente`.
 
    **Si Odin agrega un motor nuevo, el teléfono lo tiene sin tocar este repo.**
    No vuelvas a escribir a mano una tool de motor: eso es lo que tuvo por meses
    al asistente cerrando reparaciones por WhatsApp y no por llamada.
+
+   **Y no reimplementes aquí ninguna regla de negocio**: qué se puede cambiar,
+   en qué estado y de quién lo decide Odin en `operaciones-cliente.ts`, que es
+   el mismo módulo que usa WhatsApp. Este repo solo declara la tool y repite el
+   `texto` que devuelve la respuesta.
+
+## Las dos reglas de los datos del cliente
+
+Valen para las tres clases de tool y las aplica **Odin**, no este repo:
+
+1. **Solo lo de quien está llamando.** El `telefonoCliente` que viaja en cada
+   petición es el número desde el que entró la llamada (`callerNumber`), nunca
+   algo que el modelo haya elegido en `args`. Del otro lado se compara por los
+   ÚLTIMOS 10 DÍGITOS (`mismoTelefono`), porque el mismo número vive en la base
+   como `52…`, `521…` y a veces nacional. Una referencia o un id **jamás**
+   sustituyen al teléfono. Con número oculto no se consulta ni se mueve nada.
+2. **Solo lo que ese negocio tiene encendido.** `config-llamada` manda
+   únicamente las operaciones de sus motores activos y los datos del dueño de
+   las operaciones activas — lo apagado no viaja, ni como tool ni como tokens
+   de prompt. Aun así, cada endpoint vuelve a resolver los motores **leyendo la
+   base al momento de la llamada**: la config que trae el voice server es una
+   optimización, no la autorización.
 4. La configuración de cada negocio (catálogo, horarios, habilidades activas,
    métodos de pago, etc.) la entrega Odin en caliente por HTTP
    (`config.odinAppUrl` + `/api/voice/...`), no vive en este repo.

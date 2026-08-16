@@ -1,4 +1,5 @@
 import WebSocket from "ws";
+import { HerramientaVoz } from "../openai/realtime";
 interface CampoAgenda {
     id: string;
     label: string;
@@ -103,6 +104,49 @@ export interface ConfigNegocio {
      *  tool por cada una — no hay lista escrita a mano de motores aquí, para que
      *  un motor nuevo en Odin llegue al teléfono sin desplegar este repo. */
     accionesMotor?: AccionMotorVoz[];
+    /** Los datos que el DUEÑO configuró de más para cita, reserva y pedido — las
+     *  tres operaciones con tool escrita a mano aquí. Odin las mandaba desde hace
+     *  tiempo y este server las ignoraba, así que en un negocio con datos propios
+     *  configurados el backend rechazaba con FALTAN_CAMPOS y la cita, la reserva
+     *  o el pedido NO SE PODÍAN CERRAR POR TELÉFONO: el agente preguntaba, el
+     *  cliente contestaba y al final no quedaba registro de nada.
+     *
+     *  Las llaves son ids de campo (`c1`), nunca etiquetas. Viajan de vuelta en
+     *  `camposAgenda` (citas) o `camposMotor` (reserva y pedido) — no es un
+     *  capricho: es la llave que cada endpoint de Odin ya espera. */
+    datosDuenoPorTipo?: Partial<Record<"cita" | "reserva" | "pedido", CampoMotorVoz[]>>;
+    /** Lo que este negocio deja CONSULTAR, CAMBIAR y CANCELAR de lo ya creado, y
+     *  con qué campos exactamente. La lista blanca la calcula Odin de sus motores
+     *  encendidos: aquí no se decide nada, solo se declara la tool. Vacío = el
+     *  negocio no tiene esos motores y no se registra ninguna. */
+    operacionesCliente?: OperacionClienteVoz[];
+    /** Lo que QUIEN LLAMA ya tiene abierto (máx. 6). Cambia por llamante, así que
+     *  vive en el bloque de contexto del final del prompt — nunca arriba, o se
+     *  tira el caché del prefijo de todas las llamadas del negocio. */
+    operacionesClienteResumen?: FilaOperacionClienteVoz[];
+}
+/** Un campo que el cliente PUEDE cambiar de una operación ya creada. Espejo de
+ *  `CampoEditableCliente` en `Odin/app/lib/motores/operaciones-cliente.ts`. */
+interface CampoEditableVoz {
+    clave: string;
+    tipo: "texto" | "numero" | "si_no" | "fecha" | "fecha_hora";
+    descripcion: string;
+}
+interface OperacionClienteVoz {
+    /** `pedido`, `orden`, `viaje`… Es lo que se manda como `tipo`. */
+    tipo: string;
+    /** Cómo se llama en español, para que el agente lo diga natural. */
+    etiqueta: string;
+    /** Vacío = solo se puede consultar y cancelar. */
+    camposEditables: CampoEditableVoz[];
+}
+interface FilaOperacionClienteVoz {
+    tipo: string;
+    etiqueta: string;
+    /** Los 8 caracteres con los que el cliente la identifica. */
+    referencia: string;
+    resumen: string;
+    estado: string;
 }
 /** Un dato que el agente tiene que recolectar. Espejo de `CampoVoz` en
  *  `Odin/app/lib/motores/voz.ts`. */
@@ -129,6 +173,7 @@ interface AccionMotorVoz {
     camposGiro: CampoMotorVoz[];
     camposDueno: CampoMotorVoz[];
 }
+export declare function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[];
 export declare function buildSystemPrompt(cfg: ConfigNegocio, contextoExtra?: {
     receptorOrigen?: ReceptorEscalamiento | null;
     esRebote?: boolean;
