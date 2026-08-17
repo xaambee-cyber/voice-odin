@@ -379,7 +379,7 @@ function herramientasDeCicloVida(operaciones: OperacionClienteVoz[]): Herramient
     {
       type: "function",
       name: "consultar_operacion",
-      description: `Consulta lo que el cliente que está llamando ya tiene registrado (${comoSeLlaman}). Sin referencia te devuelve su lista con las referencias; con referencia te da el detalle de esa. Úsala cuando pregunte "¿cómo va lo mío?", "¿qué pedí?", "¿ya está lista mi orden?" o antes de cambiar o cancelar algo, para ubicar cuál es. El resultado trae un "texto" — dilo TAL CUAL, no inventes ni completes datos.`,
+      description: `Consulta lo que el cliente que está llamando ya tiene registrado (${comoSeLlaman}). Sin referencia te devuelve su lista; con referencia te da el detalle de esa. Úsala cuando pregunte "¿cómo va lo mío?", "¿qué pedí?", "¿ya está lista mi orden?" o antes de cambiar o cancelar algo, para ubicar cuál es. El resultado trae un "texto" — dilo TAL CUAL, no inventes ni completes datos.`,
       parameters: {
         type: "object",
         properties: {
@@ -387,7 +387,7 @@ function herramientasDeCicloVida(operaciones: OperacionClienteVoz[]): Herramient
           referencia: {
             type: "string",
             description:
-              "Referencia de 8 caracteres que te dio el cliente (dictada letra por letra o número por número). Omítela para que te devuelva la lista completa.",
+              "Código INTERNO de la solicitud, sacado de SOLICITUDES VIGENTES DE QUIEN LLAMA. NUNCA se lo digas ni se lo pidas al cliente. Omítelo para que te devuelva su lista.",
           },
         },
         required: ["tipo"],
@@ -396,12 +396,12 @@ function herramientasDeCicloVida(operaciones: OperacionClienteVoz[]): Herramient
     {
       type: "function",
       name: "cancelar_operacion",
-      description: `Cancela algo que el cliente ya tiene registrado (${comoSeLlaman}). Llámala SOLO si el cliente lo pidió de forma explícita y clara, y solo después de haber confirmado con él CUÁL es (usa consultar_operacion para ubicar la referencia). El resultado trae un "texto" — dilo TAL CUAL; si el sistema no la canceló, NO le digas al cliente que quedó cancelada.`,
+      description: `Cancela algo que el cliente ya tiene registrado (${comoSeLlaman}). Llámala SOLO si el cliente lo pidió de forma explícita y clara, y solo después de haber confirmado hablando con él CUÁL es (descríbesela: qué era y para cuándo). El resultado trae un "texto" — dilo TAL CUAL; si el sistema no la canceló, NO le digas al cliente que quedó cancelada.`,
       parameters: {
         type: "object",
         properties: {
           tipo: { type: "string", enum: tipos, description: `Qué está cancelando. ${comoSeLlaman}` },
-          referencia: { type: "string", description: "Referencia de 8 caracteres de lo que se cancela. OBLIGATORIA." },
+          referencia: { type: "string", description: "Código INTERNO de lo que se cancela, sacado de SOLICITUDES VIGENTES DE QUIEN LLAMA. OBLIGATORIO. Jamás se dice en voz alta." },
         },
         required: ["tipo", "referencia"],
       },
@@ -864,11 +864,16 @@ export function buildSystemPrompt(
     ? cfg.citasCliente.map((c) => `- [ID:${c.id}] ${c.servicio} — ${c.fechaInicio} — ${c.estado}`).join("\n")
     : null;
 
-  // Lo que quien llama ya tiene abierto. Odin ya lo filtró por su teléfono; la
-  // referencia va con el tipo porque es lo que pide cada tool del ciclo de vida.
+  // Lo que quien llama ya tiene abierto. Odin ya lo filtró por su teléfono; el
+  // código va con el tipo porque es lo que pide cada tool del ciclo de vida.
+  //
+  // Se pinta como [REF:...] a propósito, igual que los [ID:...] de las citas y
+  // del catálogo: es la marca que el modelo ya reconoce como "esto es interno,
+  // no se dice". Antes decía "referencia ABC12345" y el agente hacía lo lógico
+  // —dictársela al cliente carácter por carácter— y luego se la pedía de vuelta.
   const operacionesResumenTexto = (cfg.operacionesClienteResumen || []).length > 0
     ? (cfg.operacionesClienteResumen || [])
-        .map((o) => `- ${o.etiqueta} referencia ${o.referencia} (tipo ${o.tipo}): ${o.resumen}`)
+        .map((o) => `- [REF:${o.referencia}] ${o.etiqueta} (tipo ${o.tipo}): ${o.resumen}`)
         .join("\n")
     : null;
 
@@ -959,10 +964,10 @@ Pregúntalos conversando y con la etiqueta natural (para "Dirección de recolecc
 === SOLICITUDES QUE EL CLIENTE YA TIENE ===
 Este cliente puede consultar, cambiar o cancelar lo que ya registró: ${operacionesCliente.map((o) => o.etiqueta).join(", ")}.
 
-CÓMO SE IDENTIFICA CADA UNA: por una REFERENCIA de 8 caracteres. Al cliente se la dictas despacio, carácter por carácter ("a, ele, siete, dos…"), y cuando él te la dicte repítesela para confirmar antes de actuar.
+CÓMO SE IDENTIFICA CADA UNA: hablando, como lo haría una persona — por lo que es y para cuándo es ("tu pedido de dos playeras", "tu mesa del viernes a las dos"). Cada una tiene además un código interno que TÚ usas al llamar a las funciones: NUNCA lo digas en voz alta, ni lo deletrees, ni se lo pidas al cliente. Es como el número de expediente del sistema; al cliente no le sirve de nada y deletreárselo por teléfono convierte la llamada en una ventanilla.
 
 PROCEDIMIENTO OBLIGATORIO:
-1. Si el cliente no dice cuál, llama a consultar_operacion SIN referencia para ver su lista y ofrécele máximo dos opciones habladas.
+1. Si el cliente no dice cuál, llama a consultar_operacion SIN referencia para ver su lista y ofrécele máximo dos opciones habladas, descritas con palabras.
 2. Confirma con él cuál es ANTES de cambiar o cancelar nada.
 3. Llama a la función que toca (consultar_operacion, modificar_operacion o cancelar_operacion) y di el "texto" que devuelva TAL CUAL.
 
@@ -1187,10 +1192,10 @@ ${citasClienteTexto}` : `
 
 CITAS VIGENTES DE QUIEN LLAMA: ninguna.`) : ""}${operacionesCliente.length > 0 ? (operacionesResumenTexto ? `
 
-SOLICITUDES VIGENTES DE QUIEN LLAMA (ya verificadas contra su número; úsalas para ubicar de cuál habla sin pedirle la referencia):
+SOLICITUDES VIGENTES DE QUIEN LLAMA (ya verificadas contra su número; úsalas para ubicar de cuál habla). Los [REF:...] son INTERNOS: van en las funciones y NUNCA se dicen en voz alta:
 ${operacionesResumenTexto}` : `
 
-SOLICITUDES VIGENTES DE QUIEN LLAMA: ninguna registrada con este número. Si insiste en que tiene una, pídele la referencia y consúltala con consultar_operacion.`) : ""}${escalamientoActivo && receptoresTexto && contextoExtra?.receptorOrigen ? `
+SOLICITUDES VIGENTES DE QUIEN LLAMA: ninguna registrada con este número. Si insiste en que tiene una, dile que a este número no le aparece nada y ofrécele pasarlo con una persona. NO le pidas códigos ni referencias.`) : ""}${escalamientoActivo && receptoresTexto && contextoExtra?.receptorOrigen ? `
 
 ESCALAMIENTO POR DEFECTO: si el cliente pide hablar con una persona y no dice con cuál, usa "${contextoExtra.receptorOrigen.etiqueta}" — fue al número que él marcó originalmente.` : ""}`;
 }
