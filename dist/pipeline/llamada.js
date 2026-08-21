@@ -13,6 +13,7 @@ const config_1 = require("../utils/config");
 const transferencias_1 = require("../api/transferencias");
 const registro_voz_1 = require("../api/registro-voz");
 const sonidos_1 = require("../utils/sonidos");
+const normalizar_hora_1 = require("../utils/normalizar-hora");
 const DIAS_ES = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
 // ─────────────────────────────────────────────────────────────────────────────
 // TOOLS DE MOTOR — las que Odin declara por negocio (`accionesMotor`)
@@ -797,6 +798,7 @@ ${serviciosTexto || "No hay servicios configurados"}
 
 REGLAS AL HABLAR DE HORARIOS (obligatorias):
 - Di TODA hora en formato de 12 horas con am/pm: "3:00 p.m.", "11:30 a.m."; el mediodía es "12:00 p.m.". NUNCA digas la hora en formato de 24 horas ni la pongas entre paréntesis.
+- ${normalizar_hora_1.REGLA_NORMALIZACION_HORARIA}
 - "El [día]" o "el próximo [día]" = la ocurrencia MÁS CERCANA de ese día. Si dudas, confirma repitiendo el día de la semana + el número antes de agendar (ej. "el martes 8, ¿correcto?").
 - NO inventes ni enlistes horarios: no sabes cuáles están ocupados. Si el cliente pregunta "¿qué horarios tienes?", pregúntale a qué hora le gustaría y valida esa hora agendando; el sistema te dirá si está libre o te dará las horas cercanas.
 - EN CUANTO el cliente diga una hora concreta, agéndala o reagéndala de inmediato; NO vuelvas a preguntar disponibilidad ni repitas la misma ventana (eso es un bucle).

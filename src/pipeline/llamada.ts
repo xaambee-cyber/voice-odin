@@ -5,6 +5,7 @@ import { config, urlPublicaHttps } from "../utils/config";
 import { registrarTransferencia, tomarTransferencia } from "../api/transferencias";
 import { obtenerVozPorNumero } from "../api/registro-voz";
 import { FRAMES_TECLEO, FRAMES_AMBIENTE, MS_POR_FRAME, AMBIENTE_ACTIVO } from "../utils/sonidos";
+import { REGLA_NORMALIZACION_HORARIA } from "../utils/normalizar-hora";
 
 // Campo adicional que el negocio definió para agendar un servicio concreto
 // (ej. "Dirección de recolección"). La llave que se manda al backend es `id`
@@ -1096,6 +1097,7 @@ ${serviciosTexto || "No hay servicios configurados"}
 
 REGLAS AL HABLAR DE HORARIOS (obligatorias):
 - Di TODA hora en formato de 12 horas con am/pm: "3:00 p.m.", "11:30 a.m."; el mediodía es "12:00 p.m.". NUNCA digas la hora en formato de 24 horas ni la pongas entre paréntesis.
+- ${REGLA_NORMALIZACION_HORARIA}
 - "El [día]" o "el próximo [día]" = la ocurrencia MÁS CERCANA de ese día. Si dudas, confirma repitiendo el día de la semana + el número antes de agendar (ej. "el martes 8, ¿correcto?").
 - NO inventes ni enlistes horarios: no sabes cuáles están ocupados. Si el cliente pregunta "¿qué horarios tienes?", pregúntale a qué hora le gustaría y valida esa hora agendando; el sistema te dirá si está libre o te dará las horas cercanas.
 - EN CUANTO el cliente diga una hora concreta, agéndala o reagéndala de inmediato; NO vuelvas a preguntar disponibilidad ni repitas la misma ventana (eso es un bucle).

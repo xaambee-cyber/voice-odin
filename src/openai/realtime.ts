@@ -1,5 +1,12 @@
 import WebSocket from "ws";
 import { config } from "../utils/config";
+import {
+  anotacionHorariaParaAgente,
+  esAnotacionHoraria,
+  normalizarArgumentosConHora,
+  ultimaHoraExplicita,
+  type HoraExplicita,
+} from "../utils/normalizar-hora";
 
 export interface HerramientaVoz {
   type: "function";
@@ -148,6 +155,10 @@ export class OpenAIRealtime {
   // Debounce para agrupar la entrada del cliente en una sola respuesta. Se
   // reinicia cada vez que el cliente (re)empieza a hablar.
   private respuestaTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Esperamos brevemente el transcript para poder anotar AM/PM antes de responder. */
+  private esperandoTranscripcionHasta: number = 0;
+  /** Última hora explícita: red determinista para los argumentos de funciones. */
+  private horaExplicitaTurno: { hora: HoraExplicita; detectadaEl: number } | null = null;
 
   // Última señal de vida de una respuesta (created/delta/done). Si
   // `respondiendo` quedó atorado sin actividad, la auto-sanación lo resetea
@@ -346,7 +357,12 @@ export class OpenAIRealtime {
 
       case "conversation.item.created":
       case "conversation.item.added":
-        if (msg.item?.role === "user" && msg.item?.id && this.onItemCreated) {
+        if (
+          msg.item?.role === "user" &&
+          msg.item?.id &&
+          this.onItemCreated &&
+          !msg.item?.content?.some((c: any) => esAnotacionHoraria(c?.text))
+        ) {
           this.onItemCreated(msg.item.id);
         }
         break;
@@ -370,16 +386,37 @@ export class OpenAIRealtime {
         break;
 
       case "conversation.item.input_audio_transcription.completed":
+        this.esperandoTranscripcionHasta = 0;
+        if (msg.transcript && this.ws && this.conectado) {
+          const hora = ultimaHoraExplicita(msg.transcript);
+          if (hora) this.horaExplicitaTurno = { hora, detectadaEl: Date.now() };
+          const anotacion = anotacionHorariaParaAgente(msg.transcript);
+          if (anotacion) {
+            // Mensaje interno soportado por Realtime: entra al contexto antes
+            // de response.create, pero no al historial visible de la llamada.
+            this.ws.send(JSON.stringify({
+              type: "conversation.item.create",
+              item: {
+                type: "message",
+                role: "user",
+                content: [{ type: "input_text", text: anotacion }],
+              },
+            }));
+          }
+        }
         if (msg.transcript && this.onTranscript) {
           this.onTranscript(msg.transcript, "user", msg.item_id);
           console.log(`[REALTIME] Usuario: "${msg.transcript}"`);
         }
+        // Reinicia la respuesta después de insertar la equivalencia, no antes.
+        this.programarRespuestaUsuario(25);
         break;
 
       case "input_audio_buffer.speech_started":
         // El cliente (vuelve a) hablar → reinicia el debounce para AGRUPAR todo lo
         // que diga en una sola respuesta (no contestar fragmento por fragmento).
         this.cancelarDebounceRespuesta();
+        this.esperandoTranscripcionHasta = 0;
         // NO cancelar mientras se generan los argumentos de una función: cancelar
         // truncaría el JSON y la acción (p. ej. la reserva) se mandaría vacía.
         if (this.funcionActual) break;
@@ -399,6 +436,7 @@ export class OpenAIRealtime {
       case "input_audio_buffer.speech_stopped":
         // El cliente terminó (por ahora). Espera un poco por si sigue hablando y
         // recién entonces responde UNA sola vez con todo lo que dijo.
+        this.esperandoTranscripcionHasta = Date.now() + 1200;
         this.programarRespuestaUsuario();
         break;
 
@@ -494,6 +532,10 @@ export class OpenAIRealtime {
           try { args = JSON.parse(argsStr); } catch (e) {
             console.warn(`[REALTIME] Args de ${name} no son JSON válido (posible truncado): ${argsStr}`);
           }
+          if (this.horaExplicitaTurno && Date.now() - this.horaExplicitaTurno.detectadaEl < 120_000) {
+            args = normalizarArgumentosConHora(args, this.horaExplicitaTurno.hora);
+          }
+          this.horaExplicitaTurno = null;
           // Guardamos los args para elegir la frase de espera correcta (p. ej.
           // distinguir verificación de disponibilidad vs confirmación de pago).
           if (this.funcionLentaPendiente === name) this.funcionLentaArgs = args;
@@ -582,25 +624,38 @@ export class OpenAIRealtime {
   // hablar antes, se reinicia y TODO se agrupa en una sola respuesta. No responde
   // si hay una función o frase de espera en curso (esas manejan su propia
   // respuesta) ni si ya hay otra respuesta activa.
-  private programarRespuestaUsuario() {
+  private programarRespuestaUsuario(delayMs = DEBOUNCE_RESPUESTA_MS) {
     this.cancelarDebounceRespuesta();
     this.respuestaTimer = setTimeout(() => {
       this.respuestaTimer = null;
-      if (this.funcionActual || this.funcionLentaPendiente || this.fillerActivo) return;
-      if (this.respondiendo) {
-        // AUTO-SANACIÓN: si el flag lleva demasiado sin actividad real
-        // (response.done perdido tras una cancelación), estaba dejando al
-        // agente MUDO — el cliente hablaba y nadie contestaba jamás. Se
-        // resetea el flag rancio y se responde de todos modos.
-        if (Date.now() - this.ultimaActividadRespuesta > RESPUESTA_RANCIA_MS) {
-          console.warn("[REALTIME] respondiendo=true RANCIO (sin actividad) → auto-sanación, respondiendo igual");
-          this.respondiendo = false;
-        } else {
-          return;
-        }
+      this.intentarRespuestaUsuarioProgramada();
+    }, delayMs);
+  }
+
+  private intentarRespuestaUsuarioProgramada() {
+    const espera = this.esperandoTranscripcionHasta - Date.now();
+    if (espera > 0) {
+      this.respuestaTimer = setTimeout(() => {
+        this.respuestaTimer = null;
+        this.intentarRespuestaUsuarioProgramada();
+      }, Math.min(espera, 100));
+      return;
+    }
+    this.esperandoTranscripcionHasta = 0;
+    if (this.funcionActual || this.funcionLentaPendiente || this.fillerActivo) return;
+    if (this.respondiendo) {
+      // AUTO-SANACIÓN: si el flag lleva demasiado sin actividad real
+      // (response.done perdido tras una cancelación), estaba dejando al
+      // agente MUDO — el cliente hablaba y nadie contestaba jamás. Se
+      // resetea el flag rancio y se responde de todos modos.
+      if (Date.now() - this.ultimaActividadRespuesta > RESPUESTA_RANCIA_MS) {
+        console.warn("[REALTIME] respondiendo=true RANCIO (sin actividad) → auto-sanación, respondiendo igual");
+        this.respondiendo = false;
+      } else {
+        return;
       }
-      this.crearRespuesta();
-    }, DEBOUNCE_RESPUESTA_MS);
+    }
+    this.crearRespuesta();
   }
 
   // Hace que el agente diga UNA frase de espera con su propia voz mientras corre

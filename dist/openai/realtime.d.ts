@@ -34,6 +34,10 @@ export declare class OpenAIRealtime {
     private resultadoPendiente;
     private esperaInterrumpida;
     private respuestaTimer;
+    /** Esperamos brevemente el transcript para poder anotar AM/PM antes de responder. */
+    private esperandoTranscripcionHasta;
+    /** Última hora explícita: red determinista para los argumentos de funciones. */
+    private horaExplicitaTurno;
     private ultimaActividadRespuesta;
     constructor(systemPrompt: string, tools?: HerramientaVoz[], voz?: string);
     abrirConexion(): Promise<void>;
@@ -47,6 +51,7 @@ export declare class OpenAIRealtime {
     private crearRespuesta;
     private cancelarDebounceRespuesta;
     private programarRespuestaUsuario;
+    private intentarRespuestaUsuarioProgramada;
     private reproducirFraseEspera;
     enviarAudio(base64Audio: string): void;
     cancelarRespuesta(): void;
