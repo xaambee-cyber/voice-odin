@@ -115,6 +115,8 @@ export interface ConfigNegocio {
      *  `camposAgenda` (citas) o `camposMotor` (reserva y pedido) — no es un
      *  capricho: es la llave que cada endpoint de Odin ya espera. */
     datosDuenoPorTipo?: Partial<Record<"cita" | "reserva" | "pedido", CampoMotorVoz[]>>;
+    /** Quién confirma según la configuración efectiva que calculó Odin. */
+    confirmaAgentePorTipo?: Partial<Record<"cita" | "reserva" | "mesa" | "pedido", boolean>>;
     /** Lo que este negocio deja CONSULTAR, CAMBIAR y CANCELAR de lo ya creado, y
      *  con qué campos exactamente. La lista blanca la calcula Odin de sus motores
      *  encendidos: aquí no se decide nada, solo se declara la tool. Vacío = el

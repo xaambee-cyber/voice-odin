@@ -183,6 +183,8 @@ export interface ConfigNegocio {
    *  `camposAgenda` (citas) o `camposMotor` (reserva y pedido) — no es un
    *  capricho: es la llave que cada endpoint de Odin ya espera. */
   datosDuenoPorTipo?: Partial<Record<"cita" | "reserva" | "pedido", CampoMotorVoz[]>>;
+  /** Quién confirma según la configuración efectiva que calculó Odin. */
+  confirmaAgentePorTipo?: Partial<Record<"cita" | "reserva" | "mesa" | "pedido", boolean>>;
   /** Lo que este negocio deja CONSULTAR, CAMBIAR y CANCELAR de lo ya creado, y
    *  con qué campos exactamente. La lista blanca la calcula Odin de sus motores
    *  encendidos: aquí no se decide nada, solo se declara la tool. Vacío = el
@@ -753,6 +755,7 @@ export function buildSystemPrompt(
   const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
   const pedidosActiva = cfg.habilidadesActivas?.pedidos ?? cfg.habilidades.includes("pedidos");
   const verificarDispReserva = cfg.verificarDisponibilidadReserva === true && solicitudReservaActiva;
+  const reservaConfirmaAgente = cfg.confirmaAgentePorTipo?.reserva === true;
   // CITAS con anticipo: el negocio exige depósito para apartar la cita. El
   // agente pide el anticipo y NO promete la cita confirmada (ver AGENDA DE
   // CITAS). El monto exacto lo calcula el backend al agendar.
@@ -1044,7 +1047,7 @@ ${cfg.telefono ? `- Teléfono: ${cfg.telefono}` : ""}
 ${cfg.conocimiento ? `BASE DE CONOCIMIENTO (esta es TODA la información que tienes, no existe más):\n${cfg.conocimiento}` : "NO TIENES BASE DE CONOCIMIENTO. No tienes información adicional sobre este negocio."}
 ${serviciosTexto ? `\nCATÁLOGO DE SERVICIOS Y PRODUCTOS:\n${serviciosTexto}` : ""}
 ${profesionalesTexto ? `\nPROFESIONALES (lista completa):\n${profesionalesTexto}\nSi el cliente pide a alguien, usa su nombre EXACTO en profesional. No ofrezcas a una persona para un servicio que no atiende. Si no pide a nadie, omite profesional y el sistema asignará a quien esté libre.` : ""}
-${habitacionesTexto ? `\nLUGARES Y HABITACIONES DISPONIBLES:\n${verificarDispReserva && habitacionesConId ? habitacionesConId : habitacionesTexto}\n(Refiérete a cada uno por su NOMBRE; no digas "servicios" ni asumas que todo es "habitación" — puede ser terraza, salón o cabaña. Para reservar usa la función solicitar_reserva — el agente NO confirma disponibilidad, solo recolecta y manda la solicitud.${verificarDispReserva ? " Los [ID:...] son internos: NUNCA los digas en voz alta." : ""})` : ""}
+${habitacionesTexto ? `\nLUGARES Y HABITACIONES DISPONIBLES:\n${verificarDispReserva && habitacionesConId ? habitacionesConId : habitacionesTexto}\n(Refiérete a cada uno por su NOMBRE; no digas "servicios" ni asumas que todo es "habitación" — puede ser terraza, salón o cabaña. Para reservar usa la función solicitar_reserva; SOLO su resultado autoritativo dice si quedó confirmada o pendiente.${verificarDispReserva ? " Los [ID:...] son internos: NUNCA los digas en voz alta." : ""})` : ""}
 ${menuTexto ? `\nMENÚ:\n${menuTexto}\n(Cuando hables del menú di "platillos" o el nombre de cada uno, no "servicios".)` : ""}
 ${productosTexto ? `\nPRODUCTOS:\n${productosTexto}` : ""}
 ${metodosPagoTextoVoz ? `\nMÉTODOS DE PAGO QUE ACEPTA EL NEGOCIO (${modalidadPagoTextoVoz}):\n${metodosPagoTextoVoz}\n(Si te preguntan qué formas de pago aceptan ANTES de reservar, di los TIPOS hablados naturalmente — ej. "aceptamos transferencia bancaria y PayPal". NO dictes números de cuenta, CLABE ni links en voz: dile al cliente que te los envías por WhatsApp. La modalidad aplica a todos los métodos.)` : ""}
@@ -1151,7 +1154,7 @@ ${verificarDispReserva ? `
 === RESERVAS DE HOSPEDAJE (CON VERIFICACIÓN DE DISPONIBILIDAD) ===
 ${habitacionesConId ? `Las unidades y sus IDs están en HABITACIONES DISPONIBLES de arriba.` : "El negocio aún no tiene unidades cargadas; recolecta los datos sin ID."}
 
-CÓMO FUNCIONA (tú NUNCA confirmas la reserva — la confirma el negocio):
+CÓMO FUNCIONA (no prometas el resultado antes de llamar a la función; ${reservaConfirmaAgente ? "si el sistema puede garantizar disponibilidad y no falta pago, puede confirmarla automáticamente" : "la decisión final la toma el negocio"}):
 1. Pregunta al cliente: qué unidad quiere, primer día y último día de uso (ambos inclusive; si es un solo día, son el mismo). El número de personas es OPCIONAL — no insistas si no lo menciona. Convierte las fechas a formato YYYY-MM-DD usando la fecha actual.
 2. Cuando tengas la unidad y las fechas, llama a solicitar_reserva con pagoReportado=false.
 3. La función te devuelve un "mensaje" — dilo TAL CUAL al cliente (puede ser que no hay disponibilidad${metodoPago ? ", o los datos de pago" : ""}, o que el equipo le confirmará).
@@ -1160,7 +1163,7 @@ ${metodoPago ? `4. Como es una llamada y los datos de pago (números de cuenta, 
 
 REGLAS:
 - NUNCA inventes disponibilidad, precios${metodoPago ? " ni datos de pago" : ""}. Eso lo da la función.
-- NUNCA digas que la reserva ya quedó confirmada. Solo el equipo confirma.
+- Después de llamar a solicitar_reserva, di su campo "mensaje" TAL CUAL: distingue "registrada y pendiente" de "confirmada". NUNCA cambies una palabra por la otra.
 - NUNCA digas los [ID:...] en voz alta — son internos.
 - PRECIOS POR DÍA: si una unidad tiene "Precios por día" anotados arriba (Lun, Vie, Sáb, etc.), úsalos cuando el cliente pregunte el costo de un día específico ("¿cuánto cuesta el viernes?"). Días sin valor anotado cobran el PRECIO BASE. Si te piden el total de varios días, suma día por día con su precio correspondiente. El backend hace ese cálculo cuando llamas a solicitar_reserva, así que tu trabajo es solo informarlo bien si te lo preguntan ANTES de reservar.${metodoPago ? `
 - NO asumas que el cliente ya pagó. Un "gracias", "ok", "va", "perfecto", "ahí va", un silencio o un ruido NO son confirmación de pago. Si dudas, deja pagoReportado en false y pregunta: "¿Ya realizaste el pago?".
@@ -1675,6 +1678,8 @@ export class PipelineLlamada {
             montoAnticipo?: number;
             esMercadoPago?: boolean;
             mensajeWhatsappEnviado?: boolean;
+            estado?: string;
+            requiereConfirmacion?: boolean;
           };
           if (!resp.ok) {
             // 400 FALTAN_CAMPOS: faltó un dato obligatorio del servicio. El
@@ -1711,8 +1716,10 @@ export class PipelineLlamada {
               ),
             };
           }
-          // 201 ok: la cita quedó agendada. Recién aquí confirmamos al cliente.
-          return { ok: true, citaId: data.citaId, mensaje: `Tu cita quedó registrada para ${fechaHoraNatural(args.fechaInicio)}. ¿Hay algo más en lo que te pueda ayudar?` };
+          const detalle = fechaHoraNatural(args.fechaInicio);
+          return data.requiereConfirmacion
+            ? { ok: true, citaId: data.citaId, mensaje: `Tu solicitud de cita para ${detalle} quedó registrada, pero todavía está pendiente de confirmación del negocio. Te avisaremos por WhatsApp cuando respondan. ¿Algo más?` }
+            : { ok: true, citaId: data.citaId, mensaje: `Tu cita quedó confirmada para ${detalle}. ¿Hay algo más en lo que te pueda ayudar?` };
         }
 
         case "cancelar_cita": {
@@ -1798,6 +1805,8 @@ export class PipelineLlamada {
             metodoPago?: MetodoPagoNegocio;
             metodosPago?: MetodoPagoNegocio[];
             pagoInfo?: PagoInfo;
+            estado?: string;
+            requiereConfirmacion?: boolean;
           };
 
           if (!resp.ok) {
@@ -1839,11 +1848,10 @@ export class PipelineLlamada {
             return { ok: true, mensaje: "Perfecto, ya avisé al equipo para que verifique tu pago. Te confirman la reserva en breve. ¿Algo más?" };
           }
           // Disponible y sin método de pago configurado.
-          if (data.disponible) {
-            return { ok: true, mensaje: "Sí tenemos disponibilidad para esas fechas. El equipo te confirma la reserva en breve. ¿Algo más?" };
+          if (data.disponible && data.requiereConfirmacion === false) {
+            return { ok: true, mensaje: "Sí tenemos disponibilidad para esas fechas. Tu reserva quedó confirmada. ¿Algo más?" };
           }
-          // Legacy (verificar disponibilidad apagado): solo se mandó al admin.
-          return { ok: true, mensaje: "Listo, tu solicitud quedó registrada. El negocio te confirmará en breve por WhatsApp. ¿Hay algo más?" };
+          return { ok: true, mensaje: "Tu solicitud de reserva quedó registrada, pero todavía está pendiente de confirmación del negocio. Te avisaremos por WhatsApp cuando respondan. ¿Algo más?" };
         }
 
         case "crear_pedido": {
@@ -1865,7 +1873,7 @@ export class PipelineLlamada {
             }),
             signal: AbortSignal.timeout(8000),
           });
-          const data = (await resp.json().catch(() => ({}))) as { error?: string; faltantes?: string[]; total?: number; resumen?: string };
+          const data = (await resp.json().catch(() => ({}))) as { error?: string; faltantes?: string[]; total?: number; resumen?: string; requiereConfirmacion?: boolean };
           if (!resp.ok) {
             if (data.error === "FALTAN_CAMPOS" && Array.isArray(data.faltantes) && data.faltantes.length > 0) {
               return {
@@ -1875,7 +1883,9 @@ export class PipelineLlamada {
             }
             return { ok: false, mensaje: "Tuve un problema registrando el pedido. ¿Me lo confirmas otra vez, por favor?" };
           }
-          return { ok: true, mensaje: `Listo, registré tu pedido por un total de ${data.total} pesos. El negocio te lo confirma en seguida. ¿Algo más?` };
+          return data.requiereConfirmacion
+            ? { ok: true, mensaje: `Tu solicitud de pedido por ${data.total} pesos quedó registrada, pero todavía no está confirmada. Te avisaremos por WhatsApp cuando el negocio responda. ¿Algo más?` }
+            : { ok: true, mensaje: `Tu pedido quedó confirmado por un total de ${data.total} pesos. ¿Algo más?` };
         }
 
         case "enviar_ubicacion": {
@@ -2219,11 +2229,12 @@ export class PipelineLlamada {
           const accion = (this.configNegocio.accionesMotor || []).find((a) => a.tool === nombre);
           if (!accion) return { ok: false, mensaje: "Función no reconocida." };
 
-          // Los campos del giro y los del dueño viajan aplanados dentro de
-          // `_extras`, que es la llave que `completarCamposDeAccion` conoce.
+          // Los campos del giro y los del dueño conservan la misma llave que
+          // usan WhatsApp y Meta. Odin los valida y después los normaliza a
+          // `datos.extras`; aplanarlos aquí hacía que aparecieran como faltantes.
           const { camposMotor, ...datos } = (args || {}) as Record<string, any>;
           const cuerpo: Record<string, any> = { ...datos };
-          if (camposMotor && typeof camposMotor === "object") cuerpo._extras = camposMotor;
+          if (camposMotor && typeof camposMotor === "object") cuerpo.camposMotor = camposMotor;
           // El nombre lo captura el pipeline llamada a llamada; el marcador lo
           // pide con su propia clave (`nombre` en mesas, `nombreCliente` en las
           // demás), así que solo se rellena la que el esquema declaró y esté vacía.
@@ -2296,7 +2307,10 @@ export class PipelineLlamada {
           }
 
           console.log(`[FUNCIÓN] ${nombre} → OK (${accion.marcador})`);
-          return { ok: true, mensaje: "Listo, quedó registrado. Confírmaselo al cliente." };
+          const mensajeCliente = typeof primero?.mensajeCliente === "string" && primero.mensajeCliente.trim()
+            ? primero.mensajeCliente.trim()
+            : "La solicitud quedó registrada. El negocio revisará lo pendiente y te responderá por WhatsApp.";
+          return { ok: true, mensaje: mensajeCliente };
         }
       }
     } catch (err) {
