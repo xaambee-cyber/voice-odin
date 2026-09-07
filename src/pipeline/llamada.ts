@@ -114,6 +114,16 @@ export interface ConfigNegocio {
   zonaHoraria?: string;
   voz?: string;
   catalogo?: ItemCatalogo[];
+  // TODO lo que el negocio ofrece, ya formateado por Odin (con el aviso de los
+  // precios que no se publican pegado al final). Reemplaza a `servicios` como
+  // fuente del bloque de catálogo del prompt: `servicios` sólo trae lo
+  // AGENDABLE, así que un ítem del catálogo que no se agenda —una carrera, un
+  // paquete que sólo se cotiza— no aparecía por teléfono en NINGUNA parte, y el
+  // agente acababa negándole al cliente algo que el negocio sí tiene capturado.
+  // Viene formateado desde Odin a propósito: el formato del precio es una regla
+  // de negocio con prueba propia allá (`precioParaAgente`), y armarlo aquí con
+  // `precio` a secas es como se anuncia una carrera en "$0 MXN".
+  ofertaTexto?: string | null;
   servicios?: Servicio[];
   profesionales?: Array<{
     id: string;
@@ -853,6 +863,13 @@ export function buildSystemPrompt(
       ).join("\n")
     : null;
 
+  // El catálogo que el agente RECITA cuando le preguntan qué hay. Odin lo manda
+  // completo y ya formateado (`ofertaTexto`); `serviciosTexto` es sólo lo
+  // AGENDABLE y queda de respaldo para una versión de Odin anterior a este
+  // campo — es exactamente el comportamiento que había antes, así que un
+  // despliegue a destiempo no rompe nada, sólo no arregla nada todavía.
+  const catalogoTexto = (cfg.ofertaTexto || "").trim() || serviciosTexto;
+
   const profesionalesTexto = (cfg.profesionales ?? []).map((p) => {
     const nombres = p.atiendeTodosServicios
       ? "todos los servicios"
@@ -1046,7 +1063,7 @@ ${cfg.direccion ? `- Dirección: ${cfg.direccion}` : ""}
 ${cfg.telefono ? `- Teléfono: ${cfg.telefono}` : ""}
 
 ${cfg.conocimiento ? `BASE DE CONOCIMIENTO (esta es TODA la información que tienes, no existe más):\n${cfg.conocimiento}` : "NO TIENES BASE DE CONOCIMIENTO. No tienes información adicional sobre este negocio."}
-${serviciosTexto ? `\nCATÁLOGO DE SERVICIOS Y PRODUCTOS:\n${serviciosTexto}` : ""}
+${catalogoTexto ? `\nCATÁLOGO DE SERVICIOS Y PRODUCTOS:\n${catalogoTexto}` : ""}
 ${profesionalesTexto ? `\nPROFESIONALES (lista completa):\n${profesionalesTexto}\nSi el cliente pide a alguien, usa su nombre EXACTO en profesional. No ofrezcas a una persona para un servicio que no atiende. Si no pide a nadie, omite profesional y el sistema asignará a quien esté libre.` : ""}
 ${habitacionesTexto ? `\nLUGARES Y HABITACIONES DISPONIBLES:\n${verificarDispReserva && habitacionesConId ? habitacionesConId : habitacionesTexto}\n(Refiérete a cada uno por su NOMBRE; no digas "servicios" ni asumas que todo es "habitación" — puede ser terraza, salón o cabaña. Para reservar usa la función solicitar_reserva; SOLO su resultado autoritativo dice si quedó confirmada o pendiente.${verificarDispReserva ? " Los [ID:...] son internos: NUNCA los digas en voz alta." : ""})` : ""}
 ${menuTexto ? `\nMENÚ:\n${menuTexto}\n(Cuando hables del menú di "platillos" o el nombre de cada uno, no "servicios".)` : ""}
