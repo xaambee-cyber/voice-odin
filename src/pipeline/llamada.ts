@@ -179,6 +179,9 @@ export interface ConfigNegocio {
   nichoActivo?: boolean;
   /** Bloque de prompt del giro (vocabulario, reglas, catálogo con IDs). */
   nichoPromptBloque?: string;
+  /** true = Odin ya redactó el bloque del giro para llamada (funciones, no
+   *  marcadores). Sin él se le pega la traducción de marcadores a funciones. */
+  nichoBloqueParaVoz?: boolean;
   /** Una entrada por operación que este negocio puede cerrar. Se registra una
    *  tool por cada una — no hay lista escrita a mano de motores aquí, para que
    *  un motor nuevo en Odin llegue al teléfono sin desplegar este repo. */
@@ -452,45 +455,180 @@ function herramientasDeCicloVida(operaciones: OperacionClienteVoz[]): Herramient
   return herramientas;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// IDs CORTOS — s1, s2… para servicios y c1, c2… para citas
+//
+// Un UUID son ~25 tokens que viajan en CADA turno de la llamada (el prompt se
+// vuelve a leer completo en cada respuesta), y el modelo los copia mal: un
+// carácter cambiado era un 404 "servicio no encontrado" que el agente le
+// contaba al cliente como "no pude agendar, intenta con otro horario". El alias
+// se traduce aquí, en el servidor; a Odin siempre le llega el id real. Un id
+// real que llegue tal cual se respeta.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function aliasServicio(i: number): string {
+  return `s${i + 1}`;
+}
+
+export function aliasCita(i: number): string {
+  return `c${i + 1}`;
+}
+
+export function resolverServicioId(cfg: ConfigNegocio, id: unknown): string {
+  const s = String(id ?? "").trim();
+  const m = /^s(\d+)$/i.exec(s);
+  return (m && cfg.servicios?.[Number(m[1]) - 1]?.id) || s;
+}
+
+export function resolverCitaId(cfg: ConfigNegocio, id: unknown): string {
+  const s = String(id ?? "").trim();
+  const m = /^c(\d+)$/i.exec(s);
+  return (m && cfg.citasCliente?.[Number(m[1]) - 1]?.id) || s;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HORARIO Y CALENDARIO, dichos como se dicen
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ORDEN_SEMANA = [1, 2, 3, 4, 5, 6, 0]; // lunes primero, como lo dice la gente
+const MESES_CORTOS = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+/**
+ * "lunes a viernes de 7:00 a.m. a 7:00 p.m.; sábado de 7:00 a.m. a 2:00 p.m.;
+ * domingo cerrado". Antes iban los siete días en 24 h ("Domingo: 07:00–23:00,
+ * Lunes: …") DOS veces, y los días cerrados simplemente no aparecían: el
+ * modelo tenía que deducir que "no está" quería decir "cerrado".
+ */
+export function horarioCompacto(horario: HorarioDetallado[]): string {
+  const porDia = new Map(horario.map((h) => [h.diaSemana, h]));
+  const desc = (d: number) => {
+    const h = porDia.get(d);
+    return h ? `de ${hora24aAmPm(h.horaInicio)} a ${hora24aAmPm(h.horaFin)}` : "cerrado";
+  };
+  const grupos: { dias: number[]; desc: string }[] = [];
+  for (const d of ORDEN_SEMANA) {
+    const ult = grupos[grupos.length - 1];
+    if (ult && ult.desc === desc(d)) ult.dias.push(d);
+    else grupos.push({ dias: [d], desc: desc(d) });
+  }
+  const nombre = (d: number) => DIAS_ES[d].toLowerCase();
+  return grupos
+    .map((g) => {
+      const dias =
+        g.dias.length === 1
+          ? nombre(g.dias[0])
+          : g.dias.length === 2
+            ? `${nombre(g.dias[0])} y ${nombre(g.dias[1])}`
+            : `${nombre(g.dias[0])} a ${nombre(g.dias[g.dias.length - 1])}`;
+      return `${dias} ${g.desc}`;
+    })
+    .join("; ");
+}
+
+/**
+ * Dos semanas de "día = fecha", en la zona del negocio. El modelo no sabe qué
+ * día de la semana cae el 12; lo estima y se equivoca ("mañana martes" un
+ * lunes). WhatsApp ya le daba esta tabla y la voz no. Vive en el bloque del
+ * final porque cambia cada día.
+ */
+export function calendarioVoz(ahora: Date, tz: string, dias = 14): string {
+  const [y, m, d] = ahora.toLocaleDateString("en-CA", { timeZone: tz }).split("-").map(Number);
+  const partes: string[] = [];
+  for (let i = 0; i < dias; i++) {
+    const f = new Date(Date.UTC(y, m - 1, d + i));
+    const iso = f.toISOString().slice(0, 10);
+    partes.push(`${DIAS_ES[f.getUTCDay()].toLowerCase()} ${f.getUTCDate()} ${MESES_CORTOS[f.getUTCMonth()]}=${iso}${i === 0 ? " (hoy)" : ""}`);
+  }
+  return partes.join(", ");
+}
+
+/** Lo que el agente sabe hacer en ESTA llamada, sacado de las tools reales. */
+function capacidadesTexto(cfg: ConfigNegocio, herramientas: HerramientaVoz[]): string {
+  const n = new Set(herramientas.map((h) => h.name));
+  const lista: string[] = [];
+  if (n.has("agendar_cita")) lista.push("agendar citas, revisar horarios libres y cambiar o cancelar citas");
+  if (n.has("solicitar_reserva")) lista.push("tomar reservas");
+  if (n.has("crear_pedido")) lista.push("tomar pedidos");
+  for (const a of cfg.accionesMotor || []) {
+    if (!n.has(a.tool)) continue;
+    const primera = a.descripcion.replace(/\s+/g, " ").trim().split(/(?<=\.)\s/)[0].replace(/\.$/, "");
+    lista.push(`${primera.charAt(0).toLowerCase()}${primera.slice(1)} (${a.tool})`);
+  }
+  if (n.has("consultar_operacion")) lista.push("consultar, cambiar o cancelar lo que el cliente ya registró");
+  if (n.has("enviar_ubicacion")) lista.push("mandar la ubicación por WhatsApp");
+  if (n.has("escalar_humano")) lista.push("pasar el caso a una persona del equipo");
+  lista.push("anotar las preguntas que no sepas para que el negocio las conteste");
+  return lista.join("; ");
+}
+
+// Marcadores que un bloque de giro viejo (Odin sin `nichoBloqueParaVoz`) puede
+// nombrar, con la función que los hace por teléfono.
+const FUNCION_POR_MARCADOR_LEGADO: Record<string, string> = {
+  AGENDAR_CITA: "agendar_cita",
+  REAGENDAR_CITA: "reagendar_cita",
+  CANCELAR_CITA: "cancelar_cita",
+  CONSULTAR_DISPONIBILIDAD: "consultar_disponibilidad",
+  SOLICITUD_RESERVA: "solicitar_reserva",
+  CREAR_PEDIDO: "crear_pedido",
+};
+
 // Exportada por el mismo motivo que `buildSystemPrompt`: poder verificar qué
 // funciones se le declaran a un negocio —y sobre todo, cuáles NO— sin levantar
 // una llamada real. Una tool de más es una puerta que el modelo puede abrir por
 // error, y por teléfono un error no se edita ni se borra: ya se dijo en voz alta.
-export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
+export function construirHerramientas(cfg: ConfigNegocio, opts: { silencioso?: boolean } = {}): HerramientaVoz[] {
   const herramientas: HerramientaVoz[] = [];
   const agendaActiva = cfg.habilidadesActivas?.agenda_citas ?? cfg.habilidades.includes("agenda_citas");
   const escalamientoActivo = cfg.habilidadesActivas?.escalamiento ?? cfg.habilidades.includes("escalamiento");
   const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
   const pedidosActiva = cfg.habilidadesActivas?.pedidos ?? cfg.habilidades.includes("pedidos");
   const datosDueno = cfg.datosDuenoPorTipo || {};
+  // `profesional` solo se declara si el negocio tiene a quién elegir: en uno de
+  // calendario único es una propiedad que el modelo lee en cada turno para nada.
+  const hayProfesionales = (cfg.profesionales || []).length > 0;
 
   if (agendaActiva) {
     // Los datos del dueño para CITAS viajan en el MISMO `camposAgenda` que los
     // del servicio: para el cliente son la misma pregunta, y así es como
     // /api/voice/citas los fusiona del otro lado (ver LLAVE_CAMPOS en Odin).
-    // Por eso se declaran como propiedades explícitas y se conserva
-    // `additionalProperties` para los que trae el servicio elegido, que varían
-    // servicio por servicio y no se pueden enumerar aquí.
+    // Se conserva `additionalProperties` para los que trae el servicio elegido
+    // (y los del giro), que varían y no se pueden enumerar aquí.
     const propsCita = propiedadesCamposMotor(datosDueno.cita || []);
     const obligatoriosCita = (datosDueno.cita || []).filter((c) => c.requerido).map((c) => c.label);
+    const profesionalProp = hayProfesionales
+      ? { profesional: { type: "string", description: "Nombre EXACTO del profesional, solo si el cliente pidió a alguien que atiende ese servicio." } }
+      : {};
     herramientas.push({
       type: "function",
-      name: "agendar_cita",
-      description: "Agenda una nueva cita para el cliente. Llama esta función solo cuando el cliente haya confirmado el servicio, la fecha y la hora exacta. Si el servicio elegido tiene CAMPOS ADICIONALES (los verás en tu lista de servicios), antes de llamar a esta función debes haber recolectado al menos todos los campos obligatorios y pasarlos en camposAgenda.",
+      name: "consultar_disponibilidad",
+      description: "Horarios REALES libres de un día para un servicio. Úsala cuando el cliente pregunte qué horarios hay o si hay espacio un día, y di el \"mensaje\" tal cual. Si ya dijo una hora concreta, no la uses: agenda directo.",
       parameters: {
         type: "object",
         properties: {
-          servicioId: { type: "string", description: "ID exacto del servicio (usa los que aparecen en tu lista de servicios)" },
-          fechaInicio: { type: "string", description: "Fecha y hora de inicio en formato ISO: YYYY-MM-DDTHH:MM:00" },
-          clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural ANTES de agendar ('¿A nombre de quién agendo la cita?') si aún no lo ha dicho en la llamada. Si ya lo dijo, úsalo sin volver a preguntar. Si no lo quiere dar, pasa 'Cliente'." },
-          profesional: { type: "string", description: "Nombre EXACTO del profesional, solo si el cliente eligió uno que atiende ese servicio. Si no pidió a nadie, omítelo." },
+          servicioId: { type: "string", description: "ID del servicio de tu lista (s1, s2…)." },
+          fecha: { type: "string", description: "Día a revisar, YYYY-MM-DD, copiado del CALENDARIO." },
+          ...profesionalProp,
+        },
+        required: ["servicioId", "fecha"],
+      },
+    });
+
+    herramientas.push({
+      type: "function",
+      name: "agendar_cita",
+      description: "Agenda una cita nueva cuando el cliente ya confirmó servicio, fecha y hora (y los datos obligatorios del servicio, si tiene). Si la hora está ocupada o fuera de horario, el \"mensaje\" trae las alternativas: dilo tal cual.",
+      parameters: {
+        type: "object",
+        properties: {
+          servicioId: { type: "string", description: "ID del servicio de tu lista (s1, s2…)." },
+          fechaInicio: { type: "string", description: "YYYY-MM-DDTHH:MM:00, hora local en 24 h." },
+          clienteNombre: { type: "string", description: "Nombre del cliente; \"Cliente\" si no lo quiso dar." },
+          ...profesionalProp,
           camposAgenda: {
             type: "object",
             description:
-              "Datos adicionales que pide el servicio elegido. Las LLAVES deben ser los IDs de campo (ej. \"c1\", \"c2\"), NUNCA las etiquetas largas; los valores son lo que dijo el cliente. Inclúyelo SOLO si el servicio tiene campos adicionales; OMÍTELO por completo si el servicio no tiene ninguno." +
-              (obligatoriosCita.length > 0
-                ? ` Además, este negocio pide SIEMPRE estos datos en TODAS sus citas — recolécalos conversando antes de llamar: ${obligatoriosCita.join(", ")}.`
-                : ""),
+              "Solo si el servicio (o el negocio) pide datos extra: llave = id del campo (c1…), valor = lo que dijo el cliente." +
+              (obligatoriosCita.length > 0 ? ` Este negocio pide SIEMPRE: ${obligatoriosCita.join(", ")}.` : ""),
             ...(propsCita ? { properties: propsCita } : {}),
             additionalProperties: { type: "string" },
           },
@@ -502,11 +640,11 @@ export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
     herramientas.push({
       type: "function",
       name: "cancelar_cita",
-      description: "Cancela una cita existente del cliente. Confirma con el cliente antes de cancelar.",
+      description: "Cancela una cita del cliente. Solo si lo pidió de forma clara y ya confirmaste cuál es.",
       parameters: {
         type: "object",
         properties: {
-          citaId: { type: "string", description: "ID exacto de la cita a cancelar" },
+          citaId: { type: "string", description: "ID de la cita (c1, c2… de CITAS VIGENTES)." },
         },
         required: ["citaId"],
       },
@@ -515,14 +653,16 @@ export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
     herramientas.push({
       type: "function",
       name: "reagendar_cita",
-      description: "Modifica la fecha, hora o servicio de una cita existente. Incluye solo los campos que cambian.",
+      description: "Cambia fecha, hora o servicio de una cita existente. Manda solo lo que cambia.",
       parameters: {
         type: "object",
         properties: {
-          citaId: { type: "string", description: "ID exacto de la cita a modificar" },
-          servicioId: { type: "string", description: "Nuevo ID de servicio (solo si cambia)" },
-          fechaInicio: { type: "string", description: "Nueva fecha y hora ISO: YYYY-MM-DDTHH:MM:00 (solo si cambia)" },
-          profesional: { type: "string", description: "Nombre EXACTO del nuevo profesional, solo si el cliente pide cambiarlo." },
+          citaId: { type: "string", description: "ID de la cita (c1, c2… de CITAS VIGENTES)." },
+          servicioId: { type: "string", description: "Nuevo servicio (s1…), solo si cambia." },
+          fechaInicio: { type: "string", description: "Nueva fecha y hora YYYY-MM-DDTHH:MM:00 en 24 h, solo si cambia." },
+          ...(hayProfesionales
+            ? { profesional: { type: "string", description: "Nombre EXACTO del nuevo profesional, solo si el cliente pide cambiarlo." } }
+            : {}),
         },
         required: ["citaId"],
       },
@@ -542,18 +682,18 @@ export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
       herramientas.push({
         type: "function",
         name: "solicitar_reserva",
-        description: "Verifica disponibilidad de una reserva de hospedaje y, según el caso, pide el pago o avisa al negocio. NO confirmas tú la reserva — el resultado de esta función te dice EXACTAMENTE qué decirle al cliente (úsalo como tu respuesta). Llama esta función cuando el cliente ya te dio la unidad y las fechas. Si el negocio pide pago, vuelve a llamarla con pagoReportado=true SOLO cuando el cliente diga que ya pagó.",
+        description: "Verifica disponibilidad de una reserva de hospedaje y, según el caso, pide el pago o avisa al negocio. Llámala cuando tengas la unidad y las fechas, y di el \"mensaje\" tal cual: tú no confirmas la reserva. Si el negocio pide pago, vuelve a llamarla con pagoReportado=true SOLO cuando el cliente diga que ya pagó.",
         parameters: {
           type: "object",
           properties: {
-            detalles: { type: "string", description: "Resumen claro para el negocio (unidad, fechas, personas si las hay)." },
-            fechaEntrada: { type: "string", description: "Primer día de uso en formato YYYY-MM-DD." },
-            fechaSalida: { type: "string", description: "Último día de uso (inclusive) en formato YYYY-MM-DD. Si es un solo día, igual a fechaEntrada." },
-            servicioId: { type: "string", description: "ID exacto de la unidad (de tu lista). Omítelo si el cliente no eligió una específica." },
-            personas: { type: "number", description: "Número de personas. OPCIONAL — omítelo si el cliente no lo menciona (en terrazas/salones puede no aplicar)." },
-            itemNombre: { type: "string", description: "Nombre de la unidad para el negocio, si aplica." },
-            clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural antes de reservar ('¿A nombre de quién hago la reserva?') si aún no lo dijo. Si ya lo dijo, úsalo sin volver a preguntar." },
-            pagoReportado: { type: "boolean", description: "false la primera vez (verificar disponibilidad). Ponlo true ÚNICAMENTE cuando el cliente diga de forma EXPLÍCITA E INEQUÍVOCA que YA realizó el pago (por ejemplo: 'ya transferí', 'ya hice el depósito', 'ya pagué', 'ya te mandé el comprobante'). NUNCA lo pongas true por un 'gracias', 'ok', 'va', 'perfecto', 'ahí va', un silencio o ruido. Si tienes la más mínima duda de si ya pagó, déjalo en false y pregúntale: '¿Ya realizaste el pago?'." },
+            detalles: { type: "string", description: "Resumen para el negocio (unidad, fechas, personas si las hay)." },
+            fechaEntrada: { type: "string", description: "Primer día de uso, YYYY-MM-DD." },
+            fechaSalida: { type: "string", description: "Último día de uso (inclusive), YYYY-MM-DD. Si es un solo día, igual a fechaEntrada." },
+            servicioId: { type: "string", description: "ID exacto de la unidad (de tu lista). Omítelo si no eligió una." },
+            personas: { type: "number", description: "Número de personas, solo si lo mencionó." },
+            itemNombre: { type: "string", description: "Nombre de la unidad, si aplica." },
+            clienteNombre: { type: "string", description: "Nombre del cliente." },
+            pagoReportado: { type: "boolean", description: "false la primera vez. true ÚNICAMENTE si el cliente dice de forma explícita que YA pagó ('ya transferí', 'ya pagué', 'ya mandé el comprobante'). Un 'gracias', 'ok', 'va', silencio o ruido NO es pago; ante la duda, false y pregúntale '¿Ya realizaste el pago?'." },
             ...(camposMotorReserva ? { camposMotor: camposMotorReserva } : {}),
           },
           required: ["detalles", "fechaEntrada", "fechaSalida"],
@@ -564,21 +704,15 @@ export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
       herramientas.push({
         type: "function",
         name: "solicitar_reserva",
-        description: "Envía una solicitud de reserva al negocio para que un humano la valide y confirme. Úsalo cuando el cliente quiera reservar (habitación, mesa, evento, etc.). NO confirmas tú la reserva — solo recolectas los datos y los mandas. Despídete del cliente diciendo que el negocio le confirmará en breve por WhatsApp.",
+        description: "Manda una solicitud de reserva al negocio para que una persona la valide (habitación, mesa, evento…). Tú no la confirmas: recolecta los datos, mándala y dile que el negocio le confirma por WhatsApp.",
         parameters: {
           type: "object",
           properties: {
-            detalles: {
-              type: "string",
-              description: "Resumen completo y claro de lo que pide el cliente (qué quiere reservar, fechas, cantidad de personas, preferencias). Escribe esto como si fuera un mensaje a un recepcionista humano.",
-            },
-            fechaSolicitada: {
-              type: "string",
-              description: "Fecha o rango de fechas que pidió el cliente (formato libre: '15 de mayo', 'del 10 al 12', 'mañana a las 8pm')",
-            },
-            personas: { type: "number", description: "Número de personas si aplica" },
-            itemNombre: { type: "string", description: "Habitación, mesa, servicio o ítem específico que pidió, si aplica" },
-            clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural antes de enviar la solicitud ('¿A nombre de quién?') si aún no lo dijo." },
+            detalles: { type: "string", description: "Resumen claro de lo que pide (qué, fechas, personas, preferencias), como mensaje para un recepcionista." },
+            fechaSolicitada: { type: "string", description: "Fecha o rango que pidió, en texto libre." },
+            personas: { type: "number", description: "Número de personas, si aplica." },
+            itemNombre: { type: "string", description: "Lo que quiere reservar, si es algo específico." },
+            clienteNombre: { type: "string", description: "Nombre del cliente." },
             ...(camposMotorReserva ? { camposMotor: camposMotorReserva } : {}),
           },
           required: ["detalles"],
@@ -594,26 +728,26 @@ export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
     herramientas.push({
       type: "function",
       name: "crear_pedido",
-      description: "Registra un pedido de productos/platillos del catálogo. Llama esta función solo cuando el cliente confirmó qué quiere, las cantidades y si es a domicilio, para recoger o en mesa. Usa los IDs EXACTOS del catálogo. NO inventes productos ni precios: el sistema calcula el total.",
+      description: "Registra un pedido cuando el cliente confirmó qué quiere, cuántos y si es a domicilio, para recoger o en mesa. Usa los IDs EXACTOS del catálogo; el sistema calcula el total.",
       parameters: {
         type: "object",
         properties: {
           items: {
             type: "array",
-            description: "Lista de productos pedidos.",
+            description: "Productos pedidos.",
             items: {
               type: "object",
               properties: {
                 servicioId: { type: "string", description: "ID exacto del producto del catálogo" },
-                cantidad: { type: "number", description: "Cantidad pedida (entero >= 1)" },
+                cantidad: { type: "number", description: "Cantidad (entero >= 1)" },
               },
               required: ["servicioId", "cantidad"],
             },
           },
           tipo: { type: "string", enum: ["domicilio", "recoger", "mesa"], description: "Modalidad de entrega" },
-          direccion: { type: "string", description: "Dirección de entrega (solo si es a domicilio)" },
-          notas: { type: "string", description: "Indicaciones especiales del cliente, si las hay" },
-          clienteNombre: { type: "string", description: "Nombre del cliente. Pregúntaselo de forma natural antes de registrar el pedido ('¿A nombre de quién es el pedido?') si aún no lo dijo." },
+          direccion: { type: "string", description: "Dirección de entrega (solo a domicilio)" },
+          notas: { type: "string", description: "Indicaciones especiales, si las hay" },
+          clienteNombre: { type: "string", description: "Nombre del cliente." },
           ...(camposMotorPedido ? { camposMotor: camposMotorPedido } : {}),
         },
         required: ["items", "tipo"],
@@ -625,19 +759,19 @@ export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
     herramientas.push({
       type: "function",
       name: "escalar_humano",
-      description: "Notifica al dueño del negocio para atención humana. Úsalo cuando: el cliente lo pida directamente, haya emergencia, o no puedas resolver el problema. Si hay varias sucursales/personas configuradas, debes especificar cuál (sucursalEtiqueta) según lo que diga el cliente.",
+      description: "Avisa al equipo del negocio para que una persona atienda al cliente. Si hay varias sucursales/personas, pasa la elegida en sucursalEtiqueta.",
       parameters: {
         type: "object",
         properties: {
           tipo: {
             type: "string",
             enum: ["directo", "emergencia", "no_sabe"],
-            description: "directo=cliente pide persona, emergencia=urgencia médica o crítica, no_sabe=agente no puede ayudar",
+            description: "directo=pide una persona, emergencia=urgencia real, no_sabe=no puedes ayudarle",
           },
           resumen: { type: "string", description: "Breve descripción de la situación para el dueño" },
           sucursalEtiqueta: {
             type: "string",
-            description: "Etiqueta EXACTA de la sucursal o persona a la que pasar (debe coincidir con una de las opciones de la lista del sistema). Opcional — si solo hay una, omitir; si hay varias, preguntar al cliente y pasar la elegida.",
+            description: "Etiqueta EXACTA de la lista de sucursales/personas. Omítela si solo hay una.",
           },
         },
         required: ["tipo", "resumen"],
@@ -649,15 +783,15 @@ export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
   herramientas.push({
     type: "function",
     name: "registrar_pregunta",
-    description: "Registra una pregunta del cliente que no pudiste responder por no tener la información. El dueño del negocio la responderá después. Llama esta función cuando digas que no tienes esa información.",
+    description: "Anota una pregunta del cliente que no puedes responder con tu información; el negocio la contestará después. Llámala ANTES de decir que no tienes el dato y usa su \"mensaje\".",
     parameters: {
       type: "object",
       properties: {
-        pregunta: { type: "string", description: "Las palabras EXACTAS del cliente, tal como las escuchaste. NO interpretes, NO parafrasees, NO 'mejores' la pregunta. Si la transcripción fue confusa, escribe lo más cercano a lo que escuchaste literalmente." },
+        pregunta: { type: "string", description: "Las palabras EXACTAS del cliente, sin parafrasear." },
         categoria: {
           type: "string",
           enum: ["precios", "horarios", "servicios", "ubicacion", "pagos", "politicas", "otro"],
-          description: "Categoría que mejor describe la pregunta",
+          description: "Categoría de la pregunta",
         },
       },
       required: ["pregunta", "categoria"],
@@ -670,7 +804,7 @@ export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
   herramientas.push({
     type: "function",
     name: "colgar_llamada",
-    description: "Termina la llamada telefónica. Llama esta función SOLO cuando el cliente se haya despedido claramente (por ejemplo: 'gracias, adiós', 'ya con eso', 'hasta luego', 'bye') y no quede ninguna acción pendiente. Despídete brevemente ANTES de llamar a la función. NO la llames si el cliente sigue preguntando o si hay una acción a medias.",
+    description: "Termina la llamada. SOLO cuando el cliente se despidió claramente ('gracias, adiós', 'ya con eso', 'bye') y no queda nada a medias. Despídete brevemente ANTES de llamarla.",
     parameters: {
       type: "object",
       properties: {
@@ -687,13 +821,13 @@ export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
     herramientas.push({
       type: "function",
       name: "enviar_ubicacion",
-      description: "Envía la ubicación (link de Google Maps / dirección) al WhatsApp del cliente. Úsalo cuando el cliente pida la ubicación o cómo llegar. Avísale que se la mandas por WhatsApp al número desde el que llama.",
+      description: "Manda la ubicación (Google Maps / dirección) al WhatsApp del número desde el que llama. Úsala cuando pida la ubicación o cómo llegar, y avísale que se la mandas por WhatsApp.",
       parameters: {
         type: "object",
         properties: {
           itemNombre: {
             type: "string",
-            description: "Nombre de la terraza/sucursal específica si el cliente preguntó por una con dirección propia. Opcional.",
+            description: "Terraza/sucursal específica con dirección propia, si preguntó por una. Opcional.",
           },
         },
         required: [],
@@ -708,7 +842,7 @@ export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
   const yaExisten = new Set(herramientas.map((h) => h.name));
   const deMotor = herramientasDeMotor(cfg.accionesMotor || []).filter((h) => {
     if (yaExisten.has(h.name)) {
-      console.warn(`[PIPELINE] Tool de motor "${h.name}" ignorada: ya existe una con ese nombre`);
+      if (!opts.silencioso) console.warn(`[PIPELINE] Tool de motor "${h.name}" ignorada: ya existe una con ese nombre`);
       return false;
     }
     return true;
@@ -719,7 +853,9 @@ export function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[] {
   // datos que manda Odin, no una lista escrita aquí.
   herramientas.push(...herramientasDeCicloVida(cfg.operacionesCliente || []));
 
-  console.log(`[PIPELINE] Herramientas cargadas: ${herramientas.map((h) => h.name).join(", ") || "(ninguna)"}`);
+  if (!opts.silencioso) {
+    console.log(`[PIPELINE] Herramientas cargadas: ${herramientas.map((h) => h.name).join(", ") || "(ninguna)"}`);
+  }
   return herramientas;
 }
 
@@ -734,42 +870,36 @@ export function buildSystemPrompt(
 ): string {
   // ⚠️ ORDEN DEL PROMPT — NO MOVER LO VOLÁTIL HACIA ARRIBA ⚠️
   //
-  // OpenAI cachea automáticamente el PREFIJO del prompt: si dos llamadas
-  // empiezan exactamente igual, esa parte común se cobra a $0.40/1M en vez de
-  // $4/1M. Pero exige coincidencia exacta desde el primer carácter y un mínimo
-  // de 1024 tokens, y el caché muere a los ~5-10 min de inactividad.
+  // OpenAI cachea el PREFIJO del prompt (exacto desde el primer carácter, con
+  // mínimo de 1024 tokens): lo cacheado se cobra a $0.40/1M en vez de $4/1M, y
+  // el prompt se vuelve a leer completo en CADA respuesta de la llamada. Todo
+  // lo que cambia entre llamadas del mismo negocio (fecha y hora, calendario,
+  // contexto de rebote/sucursal, citas y solicitudes de quien llama) vive en
+  // el bloque === CONTEXTO DE ESTA LLAMADA === del FINAL. Si agregas algo que
+  // varíe por llamada o por cliente, va ahí. Se verifica en producción: la
+  // columna `tokens_cacheados` de `conversaciones` debe ser > 0 en llamadas
+  // seguidas al mismo negocio.
   //
-  // Antes, `ahoraStr` (que incluye MINUTOS, o sea distinto en cada llamada) iba
-  // arriba, a ~660 tokens del inicio. Eso dejaba el prefijo estable POR DEBAJO
-  // del mínimo de 1024 → el caché no se activaba NUNCA y cada llamada pagaba
-  // tarifa completa por los ~5-8k tokens de contexto.
-  //
-  // Por eso TODO lo que cambia entre llamadas del mismo negocio (fecha y hora,
-  // contexto de rebote/sucursal, citas de quien llama, receptor por defecto)
-  // vive ahora en un solo bloque === CONTEXTO DE ESTA LLAMADA === al FINAL del
-  // prompt. Las secciones de arriba que lo necesitan apuntan a él.
-  //
-  // Si agregas algo que varíe por llamada o por cliente, va en ese bloque final
-  // — no en medio del prompt. Se puede verificar en producción: la columna
-  // `tokens_cacheados` de `conversaciones` debe ser > 0 en llamadas seguidas al
-  // mismo negocio.
+  // Y cada renglón de aquí se paga en cada turno de cada llamada: antes de
+  // agregar uno, revisa que no esté ya dicho en otra sección o en la
+  // descripción de una tool (esas también se leen en cada turno).
   const tz = cfg.zonaHoraria || "America/Mexico_City";
   const ahora = new Date();
   const ahoraStr = ahora.toLocaleString("es-MX", {
     timeZone: tz,
     weekday: "long", year: "numeric", month: "long", day: "numeric",
-    hour: "2-digit", minute: "2-digit",
+    hour: "numeric", minute: "2-digit", hour12: true,
   });
 
+  const herramientas = construirHerramientas(cfg, { silencioso: true });
   const agendaActiva = cfg.habilidadesActivas?.agenda_citas ?? cfg.habilidades.includes("agenda_citas");
   const escalamientoActivo = cfg.habilidadesActivas?.escalamiento ?? cfg.habilidades.includes("escalamiento");
   const solicitudReservaActiva = cfg.habilidadesActivas?.solicitud_reserva ?? cfg.habilidades.includes("solicitud_reserva");
-  const pedidosActiva = cfg.habilidadesActivas?.pedidos ?? cfg.habilidades.includes("pedidos");
   const verificarDispReserva = cfg.verificarDisponibilidadReserva === true && solicitudReservaActiva;
   const reservaConfirmaAgente = cfg.confirmaAgentePorTipo?.reserva === true;
   // CITAS con anticipo: el negocio exige depósito para apartar la cita. El
-  // agente pide el anticipo y NO promete la cita confirmada (ver AGENDA DE
-  // CITAS). El monto exacto lo calcula el backend al agendar.
+  // agente pide el anticipo y NO promete la cita confirmada. El monto exacto lo
+  // calcula el backend al agendar.
   const requiereAnticipoCitas = cfg.requiereAnticipoCitas === true && agendaActiva;
   const anticipoCitasPctVoz =
     requiereAnticipoCitas && cfg.anticipoCitas?.modalidad === "anticipo"
@@ -801,7 +931,7 @@ export function buildSystemPrompt(
 
   // Catálogo adaptado al vertical: muestra el inventario con la etiqueta
   // correcta para que el agente hable con naturalidad ("habitaciones" vs
-  // "servicios" vs "platillos"). Es aditivo al prompt original.
+  // "servicios" vs "platillos").
   const vertical = cfg.vertical || "servicios";
   const catalogo = cfg.catalogo || [];
   const itemsHospedaje = catalogo.filter((i) => i.tipo === "habitacion");
@@ -813,7 +943,7 @@ export function buildSystemPrompt(
   // Anota precios por día de la semana si difieren del base. El agente lo
   // dice tal cual cuando el cliente pregunta el costo de fechas específicas.
   const DIAS_CORTOS = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
-  const formatearPreciosPorDia = (precios: Record<string, number> | null | undefined, base: number): string => {
+  const formatearPreciosPorDia = (precios: Record<string, number> | null | undefined): string => {
     if (!precios || typeof precios !== "object") return "";
     const parts: string[] = [];
     for (let i = 0; i < 7; i++) {
@@ -823,17 +953,11 @@ export function buildSystemPrompt(
     return parts.length > 0 ? ` — Precios por día: ${parts.join(", ")} (días sin valor cobran el precio base)` : "";
   };
 
+  // Con verificación de disponibilidad el modelo necesita el ID de cada unidad
+  // para pasarlo a solicitar_reserva; sin ella, el ID solo gasta tokens.
   const habitacionesTexto = vertical === "hospedaje" && itemsHospedaje.length > 0
     ? itemsHospedaje.map((h) =>
-        `- ${h.nombre}${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}${formatearPreciosPorDia(h.preciosPorDia, h.precio)}`
-      ).join("\n")
-    : null;
-
-  // Cuando se verifica disponibilidad, el modelo necesita el ID de cada unidad
-  // para pasarlo a solicitar_reserva. Esta variante incluye [ID:...].
-  const habitacionesConId = itemsHospedaje.length > 0
-    ? itemsHospedaje.map((h) =>
-        `- ${h.nombre} [ID:${h.id}]${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}${formatearPreciosPorDia(h.preciosPorDia, h.precio)}`
+        `- ${h.nombre}${verificarDispReserva ? ` [ID:${h.id}]` : ""}${h.capacidad ? ` (capacidad ${h.capacidad})` : ""} — ${formatearMoneda(h.precio)}${h.unidad ? ` ${h.unidad}` : " por noche"}${h.descripcion ? ` — ${h.descripcion}` : ""}${h.direccion ? ` — Dirección: ${h.direccion}` : ""}${formatearPreciosPorDia(h.preciosPorDia)}`
       ).join("\n")
     : null;
 
@@ -846,29 +970,34 @@ export function buildSystemPrompt(
     : null;
 
   // Línea de campos adicionales de un servicio. Vacía si el servicio no pide
-  // nada extra (se agenda como siempre). El [campo:ID] es el dato que va como
-  // llave en camposAgenda — el cliente NUNCA debe escuchar el ID ni la palabra
-  // "campo": el agente pregunta usando la etiqueta de forma natural.
+  // nada extra. El [campo:ID] es la llave en camposAgenda — el cliente NUNCA
+  // debe escuchar el ID ni la palabra "campo".
   const formatearCamposAgenda = (campos: CampoAgenda[] | undefined): string => {
     if (!campos || campos.length === 0) return "";
     const parts = campos.map(
       (c) => `${c.label} [campo:${c.id}, ${c.requerido ? "OBLIGATORIO" : "opcional"}]`,
     );
-    return `\n    Datos a recolectar antes de agendar: ${parts.join("; ")}`;
+    return `\n    Datos a recolectar: ${parts.join("; ")}`;
   };
 
-  const serviciosTexto = cfg.servicios && cfg.servicios.length > 0
-    ? cfg.servicios.map((s) =>
-        `- ${s.nombre} [ID:${s.id}]${s.duracionMinutos ? ` — ${s.duracionMinutos} min` : ""}${s.precio ? ` — $${s.precio.toLocaleString("es-MX")} MXN` : ""}${s.descripcion ? ` (${s.descripcion})` : ""}${formatearCamposAgenda(s.camposAgenda)}`
+  const servicios = cfg.servicios || [];
+  const hayCamposServicio = servicios.some((s) => (s.camposAgenda || []).length > 0);
+  // Lo que se AGENDA: nombre, ID corto y duración. Precio y descripción ya van
+  // en el catálogo; antes viajaban dos veces en cada turno.
+  const serviciosAgendaTexto = servicios.length > 0
+    ? servicios.map((s, i) =>
+        `- ${s.nombre} [ID:${aliasServicio(i)}]${s.duracionMinutos ? ` — ${s.duracionMinutos} min` : ""}${formatearCamposAgenda(s.camposAgenda)}`
       ).join("\n")
     : null;
 
   // El catálogo que el agente RECITA cuando le preguntan qué hay. Odin lo manda
-  // completo y ya formateado (`ofertaTexto`); `serviciosTexto` es sólo lo
-  // AGENDABLE y queda de respaldo para una versión de Odin anterior a este
-  // campo — es exactamente el comportamiento que había antes, así que un
-  // despliegue a destiempo no rompe nada, sólo no arregla nada todavía.
-  const catalogoTexto = (cfg.ofertaTexto || "").trim() || serviciosTexto;
+  // completo y ya formateado (`ofertaTexto`); lo agendable con precio queda de
+  // respaldo para una versión de Odin anterior a ese campo.
+  const catalogoTexto = (cfg.ofertaTexto || "").trim() || (servicios.length > 0
+    ? servicios.map((s) =>
+        `- ${s.nombre}${s.precio ? ` — $${s.precio.toLocaleString("es-MX")} MXN` : ""}${s.descripcion ? ` (${s.descripcion})` : ""}`
+      ).join("\n")
+    : null);
 
   const profesionalesTexto = (cfg.profesionales ?? []).map((p) => {
     const nombres = p.atiendeTodosServicios
@@ -877,70 +1006,56 @@ export function buildSystemPrompt(
     return `- ${p.nombre} — atiende ${nombres}`;
   }).join("\n");
 
-  const horariosTexto = cfg.horarioDetallado && cfg.horarioDetallado.length > 0
-    ? cfg.horarioDetallado.map((h) => `${DIAS_ES[h.diaSemana]}: ${h.horaInicio}–${h.horaFin}`).join(", ")
-    : cfg.horario || null;
+  // Un solo horario, el que usa la agenda. Antes iban el texto libre del dueño
+  // ("Horario general") Y la tabla, y cuando no coincidían (Dentinova: 7 a 7
+  // en uno, 7 a 11 de la noche en otro) el agente decía uno y agendaba con el
+  // otro. El texto queda solo para el negocio que no tiene tabla.
+  const horarioTexto = cfg.horarioDetallado && cfg.horarioDetallado.length > 0
+    ? horarioCompacto(cfg.horarioDetallado)
+    : (cfg.horario || "").trim() || null;
 
   const citasClienteTexto = cfg.citasCliente && cfg.citasCliente.length > 0
-    ? cfg.citasCliente.map((c) => `- [ID:${c.id}] ${c.servicio} — ${c.fechaInicio} — ${c.estado}`).join("\n")
+    ? cfg.citasCliente.map((c, i) => `- [ID:${aliasCita(i)}] ${c.servicio} — ${c.fechaInicio} — ${c.estado}`).join("\n")
     : null;
 
-  // Lo que quien llama ya tiene abierto. Odin ya lo filtró por su teléfono; el
-  // código va con el tipo porque es lo que pide cada tool del ciclo de vida.
-  //
-  // Se pinta como [REF:...] a propósito, igual que los [ID:...] de las citas y
-  // del catálogo: es la marca que el modelo ya reconoce como "esto es interno,
-  // no se dice". Antes decía "referencia ABC12345" y el agente hacía lo lógico
-  // —dictársela al cliente carácter por carácter— y luego se la pedía de vuelta.
+  // Lo que quien llama ya tiene abierto. Se pinta como [REF:...] a propósito:
+  // es la marca que el modelo reconoce como "interno, no se dice". Antes decía
+  // "referencia ABC12345" y el agente se la dictaba al cliente y se la pedía.
   const operacionesResumenTexto = (cfg.operacionesClienteResumen || []).length > 0
     ? (cfg.operacionesClienteResumen || [])
         .map((o) => `- [REF:${o.referencia}] ${o.etiqueta} (tipo ${o.tipo}): ${o.resumen}`)
         .join("\n")
     : null;
 
-  const habilidadesLista: string[] = [];
-  if (agendaActiva) habilidadesLista.push("- agenda_citas");
-  if (escalamientoActivo) habilidadesLista.push("- escalamiento");
-  habilidadesLista.push("- aprendizaje");
-  const habilidadesTexto = habilidadesLista.join("\n");
-
   // ── EL GIRO (motor de nichos) ─────────────────────────────────────────────
-  // `nichoPromptBloque` lo arma Odin con la receta del giro: vocabulario
-  // ("platillos", no "servicios"), reglas y catálogo con IDs. Llegaba en cada
-  // llamada y este server ni lo leía, así que por teléfono el asistente hablaba
-  // como si el negocio fuera genérico.
+  // `nichoPromptBloque` lo arma Odin con la receta del giro (vocabulario,
+  // reglas, catálogo con IDs). Va en la parte ESTABLE del prompt porque no
+  // cambia entre llamadas del mismo negocio.
   //
-  // Va en la parte ESTABLE del prompt —arriba del bloque de contexto— porque no
-  // cambia entre llamadas del mismo negocio: ahí lo cachea OpenAI (ver el aviso
-  // del orden del prompt). Meterlo abajo rompería el prefijo de todos.
-  //
-  // El bloque está redactado para CHAT y habla de marcadores `[ASÍ:{...}]`. Por
-  // teléfono no hay dónde escribir uno: esas operaciones son tools. La nota de
-  // abajo es lo que traduce una gramática a la otra, y sin ella el modelo
-  // "emite" el marcador en voz alta y el cliente escucha un corchete.
+  // Odin ya lo manda redactado para llamada (`nichoBloqueParaVoz`): funciones
+  // en vez de marcadores, sin el JSON de cada marcador. Con un Odin anterior
+  // llega en versión chat y se le pega la traducción — SIEMPRE, no solo cuando
+  // hay tools de motor: la versión chat de "cita por turno" pide "usa el
+  // marcador [AGENDAR_CITA]", y sin traducción el agente concluía que por
+  // teléfono no podía agendar.
   const accionesMotor = cfg.accionesMotor || [];
   const nichoBloque = (cfg.nichoPromptBloque || "").trim();
-  const bloqueGiro = nichoBloque
-    ? `
-=== TU GIRO ===
-${nichoBloque}
-${
-  accionesMotor.length > 0
-    ? `
-IMPORTANTE — ESTO ES UNA LLAMADA, NO UN CHAT:
-Arriba se habla de "marcadores" entre corchetes. Eso es para los mensajes escritos. Por teléfono NO existen: cada una de esas operaciones es una FUNCIÓN que debes invocar.
-${accionesMotor.map((a) => `- Para "${a.descripcion.replace(/\s+/g, " ").trim()}" llama a la función ${a.tool}.`).join("\n")}
-NUNCA digas en voz alta un corchete, un nombre de marcador, un ID ni un JSON. Son internos.
-`
-    : ""
-}`
-    : "";
+  const traduccionLegado = (() => {
+    if (cfg.nichoBloqueParaVoz) return "";
+    const pares = [
+      ...accionesMotor.map((a) => `[${a.marcador}] = ${a.tool}`),
+      ...Object.entries(FUNCION_POR_MARCADOR_LEGADO)
+        .filter(([, fn]) => herramientas.some((h) => h.name === fn))
+        .map(([m, fn]) => `[${m}] = ${fn}`),
+    ];
+    return `\nPOR TELÉFONO NO HAY MARCADORES: donde arriba diga "marcador" o "emite [ALGO]", llama a la función equivalente (${pares.join(", ")}). Ignora el formato JSON de los marcadores. Nunca digas en voz alta un corchete, un ID ni un JSON.`;
+  })();
+  const bloqueGiro = nichoBloque ? `\n=== TU GIRO ===\n${nichoBloque}${traduccionLegado}\n` : "";
 
   // ── DATOS QUE ESTE NEGOCIO PIDE SIEMPRE ───────────────────────────────────
-  // Lo que el dueño configuró de más para cita, reserva y pedido. Va en la
-  // parte ESTABLE del prompt: es del negocio, no de la llamada. Las tools ya lo
-  // llevan en su esquema; esto es para que el agente lo pregunte CONVERSANDO y
-  // no lo descubra hasta que el backend le responda que faltan datos.
+  // Lo que el dueño configuró de más para cita, reserva y pedido. Las tools ya
+  // lo llevan en su esquema; esto es para que el agente lo pregunte
+  // CONVERSANDO y no lo descubra cuando el backend le diga que faltan datos.
   const datosDuenoCfg = cfg.datosDuenoPorTipo || {};
   const NOMBRE_OPERACION_DUENO: Record<string, string> = {
     cita: "agendar una cita",
@@ -952,6 +1067,7 @@ NUNCA digas en voz alta un corchete, un nombre de marcador, un ID ni un JSON. So
     reserva: "camposMotor",
     pedido: "camposMotor",
   };
+  const pedidosActiva = cfg.habilidadesActivas?.pedidos ?? cfg.habilidades.includes("pedidos");
   const bloqueDatosDueno = (() => {
     const partes = (["cita", "reserva", "pedido"] as const)
       .filter((t) => (t === "cita" ? agendaActiva : t === "reserva" ? solicitudReservaActiva : pedidosActiva))
@@ -964,15 +1080,14 @@ NUNCA digas en voz alta un corchete, un nombre de marcador, un ID ni un JSON. So
               `${c.label} [campo:${c.id}, ${c.requerido ? "OBLIGATORIO" : "opcional"}]${c.opciones?.length ? ` — opciones: ${c.opciones.join(", ")}` : ""}${c.ayuda ? ` — ${c.ayuda}` : ""}`,
           )
           .join("; ");
-        return `- Para ${NOMBRE_OPERACION_DUENO[t]}: ${lista}. Pásalos en ${LLAVE_DUENO[t]} usando como LLAVE el ID entre [campo:...].`;
+        return `- Para ${NOMBRE_OPERACION_DUENO[t]}: ${lista}. Van en ${LLAVE_DUENO[t]}.`;
       })
       .filter(Boolean);
     if (partes.length === 0) return "";
     return `
 === DATOS QUE ESTE NEGOCIO PIDE SIEMPRE ===
-Estos datos van ADEMÁS de los normales, en TODAS las operaciones de ese tipo:
 ${partes.join("\n")}
-Pregúntalos conversando y con la etiqueta natural (para "Dirección de recolección" pregunta "¿En qué dirección recogemos?"). NUNCA digas el ID ni la palabra "campo". Los opcionales solo si fluye; no insistas.
+Pregúntalos conversando con la etiqueta natural ("Dirección de recolección" → "¿En qué dirección recogemos?"); la llave es el ID entre [campo:...] y nunca se dice. Los opcionales, solo si fluye.
 `;
   })();
 
@@ -982,48 +1097,34 @@ Pregúntalos conversando y con la etiqueta natural (para "Dirección de recolecc
   const operacionesCliente = cfg.operacionesCliente || [];
   const bloqueCicloVida = operacionesCliente.length > 0
     ? `
-=== SOLICITUDES QUE EL CLIENTE YA TIENE ===
-Este cliente puede consultar, cambiar o cancelar lo que ya registró: ${operacionesCliente.map((o) => o.etiqueta).join(", ")}.
-
-CÓMO SE IDENTIFICA CADA UNA: hablando, como lo haría una persona — por lo que es y para cuándo es ("tu pedido de dos playeras", "tu mesa del viernes a las dos"). Cada una tiene además un código interno que TÚ usas al llamar a las funciones: NUNCA lo digas en voz alta, ni lo deletrees, ni se lo pidas al cliente. Es como el número de expediente del sistema; al cliente no le sirve de nada y deletreárselo por teléfono convierte la llamada en una ventanilla.
-
-PROCEDIMIENTO OBLIGATORIO:
-1. Si el cliente no dice cuál, llama a consultar_operacion SIN referencia para ver su lista y ofrécele máximo dos opciones habladas, descritas con palabras.
-2. Confirma con él cuál es ANTES de cambiar o cancelar nada.
-3. Llama a la función que toca (consultar_operacion, modificar_operacion o cancelar_operacion) y di el "texto" que devuelva TAL CUAL.
-
-REGLAS QUE NO SE ROMPEN:
-- NUNCA confirmes un cambio o una cancelación antes de que la función responda. Si el sistema no lo hizo, díselo con esas palabras y ofrécele pasarlo con una persona.
-- Solo puedes tocar lo de QUIEN ESTÁ LLAMANDO. Si te pide algo de otra persona, no lo intentes: dile que por seguridad solo puedes ver lo de este número.
-- No inventes estados, precios, avances ni fechas de entrega. Lo que no venga en el "texto" de la función, no existe.
-- Frases ambiguas ("olvídalo", "ya no", "no importa") NO son una cancelación. Ante la duda mínima, pregunta.
+=== LO QUE EL CLIENTE YA TIENE REGISTRADO ===
+Puede consultar, cambiar o cancelar: ${operacionesCliente.map((o) => o.etiqueta).join(", ")}.
+- Ubícalo hablando, por lo que es y para cuándo ("tu pedido de dos playeras"). El [REF:...] es interno: va en las funciones y nunca se dice, deletrea ni se le pide.
+- Si no dice cuál, llama a consultar_operacion sin referencia y ofrécele máximo dos opciones con palabras. Confirma cuál es ANTES de cambiar o cancelar.
+- Di el "texto" de la función TAL CUAL. Nunca confirmes un cambio o cancelación que la función no hizo; si no se pudo, dilo y ofrece pasarlo con una persona.
+- Solo puedes tocar lo de este número: si pide algo de otra persona, dile que por seguridad solo ves lo de este número. "Olvídalo" o "ya no" no son una cancelación: pregunta.
 `
     : "";
 
-  // Bloque dinámico al inicio del prompt: si la llamada es un rebote o llegó
-  // por desvío desde una sucursal específica, el agente se comporta distinto.
+  // Si la llamada es un rebote o llegó por desvío desde una sucursal
+  // específica, el agente se comporta distinto. Es de ESTA llamada: va abajo.
   const bloqueContextoLlamada = (() => {
     if (!contextoExtra) return "";
     if (contextoExtra.esRebote) {
       return `
-🚨 CONTEXTO CRÍTICO — ESTA LLAMADA ES UN REBOTE:
-El cliente acaba de pedir atención humana. Su llamada fue desviada al humano, pero NO contestó y la llamada rebotó hacia ti. NO saludes como sesión nueva. NO te presentes otra vez. Di directamente:
+🚨 ESTA LLAMADA ES UN REBOTE: el cliente pidió una persona, se le desvió y nadie contestó. NO saludes ni te presentes otra vez. Di directamente:
 "Disculpa, parece que el equipo no pudo tomar tu llamada en este momento. ¿Quieres que tome tu recado o prefieres que yo te ayude con tu duda?"
-Luego escucha y actúa. NO intentes escalar de nuevo en la misma llamada — el humano ya no contestó.
-`;
+NO intentes escalar de nuevo en esta llamada.`;
     }
     if (contextoExtra.receptorOrigen) {
       const r = contextoExtra.receptorOrigen;
       return `
-CÓMO LLEGÓ ESTA LLAMADA:
-El cliente marcó al número de "${r.etiqueta}" y la llamada se desvió hacia ti porque ahí no contestaron. Menciona "${r.etiqueta}" si aplica para que el cliente se ubique. Si pide hablar con un humano, sugiere primero "${r.etiqueta}" como opción por defecto (pero no insistas si quiere otra).
-`;
+CÓMO LLEGÓ: el cliente marcó a "${r.etiqueta}" y se desvió hacia ti porque ahí no contestaron. Menciónalo si aplica. Si pide una persona y no dice cuál, usa "${r.etiqueta}".`;
     }
     return "";
   })();
 
-  // Lista de receptores para que el agente sepa entre cuáles puede elegir
-  // al escalar. La pone como contexto separado, no como dato del negocio.
+  // Lista de receptores para que el agente sepa entre cuáles puede elegir.
   const receptores = cfg.receptoresEscalamiento || [];
   const receptoresTexto = receptores.length > 0
     ? receptores.map((r) => `- ${r.etiqueta}${r.canal === "whatsapp" ? " (solo por WhatsApp)" : " (por llamada)"}`).join("\n")
@@ -1033,193 +1134,92 @@ El cliente marcó al número de "${r.etiqueta}" y la llamada se desvió hacia ti
   const temas = (cfg.temasTransferencia || []).filter((t) => typeof t === "string" && t.trim());
   const temasTexto = temas.length > 0 ? temas.map((t) => `- "${t}"`).join("\n") : null;
 
+  // El calendario solo si hay algo que se agenda o se fecha.
+  const usaFechas = agendaActiva || solicitudReservaActiva || accionesMotor.length > 0 || operacionesCliente.length > 0;
+
   return `Eres ${cfg.nombreAgente} de ${cfg.nombreNegocio} (${cfg.tipoNegocio}).
 ${cfg.personalidad}.${cfg.tonoAdicional ? ` ${cfg.tonoAdicional}` : ""}
 
-FORMATO OBLIGATORIO — ESTÁS EN UNA LLAMADA TELEFÓNICA:
-- HABLA, no escribas. Tus respuestas se convierten en voz.
-- ABSOLUTAMENTE PROHIBIDO: asteriscos, guiones de lista, negritas (**texto**), numeración (1. 2. 3.), markdown de cualquier tipo.
-- Si tienes varios servicios, dícelos como en una conversación: "tenemos limpieza, radiografía y valoración" — no en lista.
-- Máximo 2 oraciones por respuesta. Directo y natural.
+ESTÁS EN UNA LLAMADA TELEFÓNICA: todo lo que dices se convierte en voz.
+- Nada de markdown, listas, asteriscos ni numeración: varias opciones van en una frase ("tenemos limpieza, radiografía y valoración").
+- Máximo 2 oraciones (~30 palabras) por turno. Con mucha información da máximo tres opciones y pregunta cuál le interesa; nunca recites el catálogo completo.
 
-=== ACTUACIÓN DE VOZ — CÓMO SUENAS (tan importante como lo que dices) ===
-Suenas como una recepcionista mexicana real, de carne y hueso, atendiendo el teléfono del negocio. Nadie debe notar que eres IA por tu forma de hablar.
-- ENTREGA: cálida, segura, con una sonrisa que se escuche. Frases cortas, una idea por frase, ritmo ágil sin sonar apurada.
-- NATURALIDAD: de vez en cuando (no siempre, máximo una por turno) abre con una micro-reacción natural: "claro", "va", "mmm, déjame ver", "perfecto", "ah, sí". Varía SIEMPRE tus arranques: jamás empieces dos turnos seguidos con la misma palabra.
-- CONFIRMACIÓN HUMANA: cuando el cliente te dé un dato importante (fecha, hora, nombre, servicio), repítelo breve y natural antes de continuar: "El sábado a las cuatro, perfecto…". Así confirmas sin sonar a robot que lee un formulario.
-- NÚMEROS EN VOZ ALTA: los teléfonos se dicen de dos en dos dígitos ("cincuenta y cinco… doce… treinta y cuatro…"); los precios con palabras ("quinientos pesos", nunca "500 pesos" leído en frío); las horas SIEMPRE con "de la mañana / de la tarde / de la noche".
-- ADAPTACIÓN: si el cliente habla rápido y va al grano, tú también. Si suena mayor o confundido, baja el ritmo y sé más clara. Si está molesto, suaviza el tono y no lo interrumpas.
-- BREVEDAD RADICAL (por teléfono lo largo desespera): máximo ~30 palabras por turno. Si tienes MUCHA información (una lista de servicios, varios horarios), da máximo TRES opciones y pregunta cuál le interesa — jamás recites el catálogo completo de corrido.
-- IMPERFECCIÓN CONTROLADA: puedes reformular a media frase como un humano ("tenemos el… bueno, mira, lo que más piden es…") pero solo ocasionalmente y sin perder claridad.
-- PROHIBIDO sonar a menú telefónico, a locutora de comercial o a asistente corporativo. Eres una persona del equipo del negocio.
+CÓMO SUENAS: una recepcionista mexicana real, cálida y segura; nadie debe notar que eres IA.
+- Frases cortas, una idea por frase, ritmo ágil. A veces (máximo una por turno) abre con "claro", "va", "mmm, déjame ver" o "perfecto"; nunca empieces dos turnos igual.
+- Cuando te den un dato importante (fecha, hora, nombre, servicio), repítelo breve antes de seguir: "El sábado a las cuatro, perfecto…".
+- Teléfonos de dos en dos dígitos; precios con palabras ("quinientos pesos"); horas con "de la mañana / de la tarde / de la noche".
+- Si va al grano, tú también; si suena mayor o confundido, más despacio y claro; si está molesto, suaviza y no lo interrumpas.
+- Nunca suenes a menú telefónico, locutora ni asistente corporativo: eres del equipo del negocio.
 ${cfg.saludoInicial && cfg.saludoInicial.trim() ? `
-SALUDO INICIAL OBLIGATORIO:
-Tu PRIMER mensaje de la llamada debe transmitir esto (dilo natural, hablado, sin leerlo robótico): "${cfg.saludoInicial.trim()}"
+SALUDO INICIAL: tu PRIMER mensaje debe transmitir esto, dicho natural: "${cfg.saludoInicial.trim()}"
 ` : ""}
-
 DATOS DEL NEGOCIO (solo estos existen):
-${cfg.horario ? `- Horario general: ${cfg.horario}` : ""}
-${cfg.direccion ? `- Dirección: ${cfg.direccion}` : ""}
-${cfg.telefono ? `- Teléfono: ${cfg.telefono}` : ""}
-
+${horarioTexto ? `- Horario de atención: ${horarioTexto}\n` : ""}${cfg.direccion ? `- Dirección: ${cfg.direccion}\n` : ""}${cfg.telefono ? `- Teléfono: ${cfg.telefono}\n` : ""}
 ${cfg.conocimiento ? `BASE DE CONOCIMIENTO (esta es TODA la información que tienes, no existe más):\n${cfg.conocimiento}` : "NO TIENES BASE DE CONOCIMIENTO. No tienes información adicional sobre este negocio."}
-${catalogoTexto ? `\nCATÁLOGO DE SERVICIOS Y PRODUCTOS:\n${catalogoTexto}` : ""}
-${profesionalesTexto ? `\nPROFESIONALES (lista completa):\n${profesionalesTexto}\nSi el cliente pide a alguien, usa su nombre EXACTO en profesional. No ofrezcas a una persona para un servicio que no atiende. Si no pide a nadie, omite profesional y el sistema asignará a quien esté libre.` : ""}
-${habitacionesTexto ? `\nLUGARES Y HABITACIONES DISPONIBLES:\n${verificarDispReserva && habitacionesConId ? habitacionesConId : habitacionesTexto}\n(Refiérete a cada uno por su NOMBRE; no digas "servicios" ni asumas que todo es "habitación" — puede ser terraza, salón o cabaña. Para reservar usa la función solicitar_reserva; SOLO su resultado autoritativo dice si quedó confirmada o pendiente.${verificarDispReserva ? " Los [ID:...] son internos: NUNCA los digas en voz alta." : ""})` : ""}
-${menuTexto ? `\nMENÚ:\n${menuTexto}\n(Cuando hables del menú di "platillos" o el nombre de cada uno, no "servicios".)` : ""}
-${productosTexto ? `\nPRODUCTOS:\n${productosTexto}` : ""}
-${metodosPagoTextoVoz ? `\nMÉTODOS DE PAGO QUE ACEPTA EL NEGOCIO (${modalidadPagoTextoVoz}):\n${metodosPagoTextoVoz}\n(Si te preguntan qué formas de pago aceptan ANTES de reservar, di los TIPOS hablados naturalmente — ej. "aceptamos transferencia bancaria y PayPal". NO dictes números de cuenta, CLABE ni links en voz: dile al cliente que te los envías por WhatsApp. La modalidad aplica a todos los métodos.)` : ""}
+${catalogoTexto ? `\nCATÁLOGO DE SERVICIOS Y PRODUCTOS:\n${catalogoTexto}` : ""}${profesionalesTexto ? `\n\nPROFESIONALES (lista completa):\n${profesionalesTexto}\nSi el cliente pide a alguien, usa su nombre EXACTO en profesional y no se lo ofrezcas para un servicio que no atiende. Si no pide a nadie, omítelo: el sistema asigna a quien esté libre.` : ""}${habitacionesTexto ? `\n\nLUGARES Y HABITACIONES:\n${habitacionesTexto}\n(Llama a cada uno por su NOMBRE: puede ser terraza, salón o cabaña. Para reservar usa solicitar_reserva; solo su resultado dice si quedó confirmada o pendiente.${verificarDispReserva ? " Los [ID:...] son internos: nunca los digas." : ""})` : ""}${menuTexto ? `\n\nMENÚ:\n${menuTexto}\n(Di "platillos" o el nombre de cada uno, no "servicios".)` : ""}${productosTexto ? `\n\nPRODUCTOS:\n${productosTexto}` : ""}${metodosPagoTextoVoz ? `\n\nMÉTODOS DE PAGO (${modalidadPagoTextoVoz}):\n${metodosPagoTextoVoz}\n(Si preguntan cómo pagar, di los TIPOS hablados — "aceptamos transferencia y PayPal". Nunca dictes cuentas, CLABE ni links: se los mandas por WhatsApp.)` : ""}${(cfg.ubicacionUrl || cfg.direccion) ? `\n\nUBICACIÓN: si pide la dirección o cómo llegar, mándasela con enviar_ubicacion por WhatsApp a este número ("te la mando por WhatsApp ahorita"); nunca dictes el link.` : ""}
 
-${(cfg.ubicacionUrl || cfg.direccion) ? `\nUBICACIÓN:\nSi el cliente pide la ubicación, dirección o cómo llegar, usa la función enviar_ubicacion para mandársela por WhatsApp al número desde el que llama. NO dictes el link de Google Maps por voz (no sirve hablado). Dile algo como "te la mando por WhatsApp ahorita".\n` : ""}
-FUNCIONES HABILITADAS (solo puedes hacer esto):
-${habilidadesTexto}
+LO QUE PUEDES HACER POR TELÉFONO: ${capacidadesTexto(cfg, herramientas)}. Si te piden otra cosa, dilo con honestidad${escalamientoActivo ? " y ofrece pasarlo con una persona" : ""}.
 
-INSTRUCCIÓN PRINCIPAL:
-Eres un sistema de recuperación de información, NO un asistente inteligente. Tu ÚNICA función es buscar en los datos de arriba y decir lo que encuentres. Lo que no está en los datos NO EXISTE — aunque sea una pregunta obvia, aunque el cliente insista, aunque cualquier negocio "normalmente" lo supiera.
-
-PROCESO OBLIGATORIO para cada mensaje:
-1. Busca en tu BASE DE CONOCIMIENTO si hay información RELEVANTE para responder (no necesita ser coincidencia exacta de palabras, basta con que el tema sea el mismo). Si la encuentras → respóndela.
-2. ¿No hay nada relevante en el conocimiento? → LLAMA a registrar_pregunta primero, luego usa el "mensaje" del resultado como respuesta.
-3. ¿Piden una acción (agendar, reservar, comprar, cotizar)? → ¿Está en funciones habilitadas? Si NO → Di: "No cuento con esa función."
-
-PROHIBICIONES ABSOLUTAS — violar cualquiera es un error crítico:
-- NUNCA uses tu conocimiento general sobre ningún tipo de negocio, aunque te parezca lógico o evidente
-- NUNCA sugieras procesos, pasos o flujos que no estén escritos arriba
-- NUNCA digas "probablemente", "generalmente", "normalmente", "usualmente", "puedes intentar"
-- NUNCA inventes precios, horarios, descuentos, promociones, métodos de pago, menús, o servicios
-- NUNCA ofrezcas hacer algo que no esté en funciones habilitadas
-- Si el cliente repite una pregunta, la respuesta sigue siendo la misma: no tienes esa información. Insistir no cambia lo que sabes.
-- Si ya registraste una pregunta, NUNCA la respondas después con tu conocimiento general. La respuesta correcta sigue siendo "no tengo esa información".
-
-REGLAS PARA LLAMADA TELEFÓNICA — CRÍTICAS:
-- SIEMPRE habla en ESPAÑOL MEXICANO. NUNCA en inglés ni otro idioma.
-- La transcripción a veces llega distorsionada. Si no tiene sentido o parece ruido, di EXACTAMENTE: "Perdón, no te escuché bien, ¿me lo puedes repetir?"
-- NUNCA inventes ni respondas a algo que no entendiste claramente.
-- Habla como una persona real mexicana por teléfono. Natural y directo.
-- Si te interrumpen, calla y escucha.
-- Si te preguntan quién eres: di tu nombre y el negocio. Nada más.
-
-NOMBRE DEL CLIENTE — IMPORTANTE:
-- Antes de agendar una cita, hacer una reserva o registrar un pedido, pregunta el nombre del cliente de forma natural ("¿A nombre de quién la agendo?") y pásalo en el parámetro clienteNombre de la función.
-- Si el cliente ya dijo su nombre en cualquier momento de la llamada, úsalo — NO lo vuelvas a preguntar.
-- Si no lo quiere dar, no insistas: usa "Cliente".
+REGLAS (romper una es un error grave):
+- Responde SOLO con los datos de arriba: lo que no está ahí no existe, aunque parezca obvio o el cliente insista. Nunca uses conocimiento general ni digas "probablemente", "normalmente" o "puedes intentar". Nunca inventes precios, horarios, promociones, métodos de pago ni servicios.
+- Si no tienes la respuesta, llama primero a registrar_pregunta y di su "mensaje". Si repite algo que ya anotaste, di "Ya lo anoté, el equipo te contactará." y no lo contestes después por tu cuenta. No la uses para citas ni para pasar con una persona.
+- Cada acción la hace una función: llámala y di lo que devuelva. Nunca des algo por hecho (cita, reserva, pedido, cambio, cancelación) antes de que la función lo confirme.
+- Antes de registrar algo, pregunta el nombre natural ("¿a nombre de quién?") si no lo ha dicho; si no lo quiere dar, usa "Cliente". Su teléfono ya lo tienes: nunca lo pidas.
+- Habla siempre en español mexicano. Si la transcripción no tiene sentido, di "Perdón, no te escuché bien, ¿me lo puedes repetir?" y no adivines. Si te interrumpen, calla y escucha. Si preguntan quién eres: tu nombre y el negocio.
 ${agendaActiva ? `
 === AGENDA DE CITAS ===
-HORARIOS DE ATENCIÓN: ${horariosTexto || "No especificado"}
+SERVICIOS PARA CITAS (el [ID:...] va en las funciones; nunca lo digas):
+${serviciosAgendaTexto || "No hay servicios configurados"}
 
-SERVICIOS DISPONIBLES PARA CITAS (usa el ID exacto al agendar):
-${serviciosTexto || "No hay servicios configurados"}
+HORARIOS LIBRES: nunca los inventes ni los deduzcas del horario de atención (no sabes qué está ocupado).
+- Pregunta abierta ("¿qué horarios tienes?", "¿tienes espacio el jueves?", "dame otro horario") → consultar_disponibilidad con servicio y día, y di su "mensaje" tal cual. Si no sabes el servicio, pregúntalo primero.
+- Hora concreta ("el jueves a las 4", "esa de las 11") → NO consultes: agenda (o reagenda) directo. Si está ocupada o fuera de horario, la función te da las opciones: ofrécelas tal cual.
+- Nunca consultes dos veces lo mismo: si eligió una hora de las que te dio el sistema, agéndala. Un rango ("entre 10:00 a.m. y 6:00 p.m.") incluye todas las horas de en medio.
 
-(Las citas que YA tiene quien está llamando están hasta el final, en CONTEXTO DE ESTA LLAMADA. Consúltalas ahí antes de reagendar o cancelar.)
-
-REGLAS AL HABLAR DE HORARIOS (obligatorias):
-- Di TODA hora en formato de 12 horas con am/pm: "3:00 p.m.", "11:30 a.m."; el mediodía es "12:00 p.m.". NUNCA digas la hora en formato de 24 horas ni la pongas entre paréntesis.
+HORAS Y FECHAS:
+- Al cliente, horas en 12 h; en las funciones, 24 h. Nunca digas una hora en 24 h ni la pongas entre paréntesis.
 - ${REGLA_NORMALIZACION_HORARIA}
-- "El [día]" o "el próximo [día]" = la ocurrencia MÁS CERCANA de ese día. Si dudas, confirma repitiendo el día de la semana + el número antes de agendar (ej. "el martes 8, ¿correcto?").
-- NO inventes ni enlistes horarios: no sabes cuáles están ocupados. Si el cliente pregunta "¿qué horarios tienes?", pregúntale a qué hora le gustaría y valida esa hora agendando; el sistema te dirá si está libre o te dará las horas cercanas.
-- EN CUANTO el cliente diga una hora concreta, agéndala o reagéndala de inmediato; NO vuelvas a preguntar disponibilidad ni repitas la misma ventana (eso es un bucle).
+- Sin am/pm, es la que cae dentro del horario de atención ("a las 3" con horario de 9 a 6 = 3 de la tarde); si caben las dos, pregunta.
+- Copia la fecha exacta del CALENDARIO (al final); nunca calcules el día de la semana. "El [día]" = el más cercano. Antes de agendar confirma día y número ("el martes 8, ¿correcto?").
 
-INSTRUCCIONES PARA CITAS:
-1. AGENDAR: El cliente debe confirmar servicio + fecha + hora EXACTA antes de que llames a agendar_cita.
-   - Si el horario está ocupado (409), la función te devuelve un mensaje con SOLO las dos horas más cercanas en am/pm: ofréceselas tal cual ("te puedo a las 2:30 o a las 4, ¿cuál prefieres?"), máximo dos por frase. NUNCA recites listas de horarios. Solo si el cliente pide ver el panorama, menciona las ventanas libres como rangos ("tengo libre de 7 a 9 de la mañana"). Si la función no trae horas cercanas, pregúntale al cliente a qué otra hora le gustaría.
-   - Solo agenda dentro del horario de atención: ${horariosTexto || "No especificado"}
-   - INTERPRETACIÓN AM/PM: por teléfono la gente dice la hora en formato de 12h sin "am/pm". Interpreta SIEMPRE la hora que cae dentro del horario de atención. Ej.: si atiendes de 9 a 6 y el cliente dice "a las 3", es 15:00 (3 de la tarde), NO 03:00. Si la hora cabe en ambos turnos y es ambigua, pregunta "¿a las [hora] de la mañana o de la tarde?" antes de agendar. IMPORTANTE: a la función agendar_cita la hora va SIEMPRE en formato 24h (THH:MM) — ese es un dato interno; pero cuando le HABLES al cliente, di la hora SIEMPRE en 12h con am/pm ("las 3:00 p.m."), nunca en 24h ni entre paréntesis.
-   - Usa la fecha y hora actual para calcular fechas relativas ("mañana", "el martes")
-   - DATOS ADICIONALES DEL SERVICIO: algunos servicios de tu lista tienen una línea "Datos a recolectar antes de agendar". Si el servicio elegido la tiene:
-     · ANTES de llamar a agendar_cita, recolecta conversando TODOS los campos marcados OBLIGATORIO. Pregunta de forma natural usando la etiqueta del campo (ej. para "Dirección de recolección" pregunta "¿En qué dirección recogemos?"). NUNCA digas el ID ni la palabra "campo".
-     · Los campos "opcional" pregúntalos solo si fluye natural; si el cliente no los da, omítelos sin insistir.
-     · Pasa lo recolectado en el parámetro camposAgenda usando como LLAVE el ID entre [campo:...] (ej. "c1"), nunca la etiqueta. Omite los campos opcionales que el cliente no haya dado.
-     · Si el servicio NO tiene esa línea, agenda igual que siempre: NO mandes camposAgenda.
-   - REGLA DE ORO: NUNCA confirmes la cita al cliente hasta que agendar_cita responda con éxito. Si la función te dice que faltan datos, pídeselos al cliente exactamente y vuelve a llamar a agendar_cita; no des la cita por hecha mientras falten.${requiereAnticipoCitas ? `
-   - ANTICIPO OBLIGATORIO PARA APARTAR: este negocio pide un ${anticipoCitasPctVoz} para reservar la cita. NO prometas la cita como confirmada. Recolecta servicio + fecha + hora y llama a agendar_cita como siempre; el sistema aparta el horario, calcula el monto del anticipo y manda los datos de pago por WhatsApp a este mismo número. La función te devuelve un "mensaje" con el monto — dilo TAL CUAL. Deja claro que la cita SOLO queda confirmada cuando el cliente realice el pago; NO dictes números de cuenta ni links en voz (van por WhatsApp).` : ""}
-
-2. CANCELAR: Confirma explícitamente con el cliente antes de llamar a cancelar_cita. El cliente debe pedir cancelar de forma clara y directa. Si hay ambigüedad, pregunta: "¿Quieres cancelar tu cita?"
-
-3. MODIFICAR HORARIO: Si el cliente quiere cambiar la hora o fecha de una cita existente, usa SIEMPRE reagendar_cita. NUNCA canceles y crees una nueva cita para un cambio de horario.
-
-REGLAS CRÍTICAS de citas:
-- NO ejecutes cancelar_cita ni reagendar_cita si el cliente no lo pidió de forma explícita y clara
-- Frases como "olvídenlo", "chiste", "cancillería", o cualquier frase ambigua NO son solicitudes de cita
-- Ante la duda mínima de si el cliente quiere cancelar o no, pregunta antes de actuar
-- NO confirmes una cita hasta tener servicio + fecha + hora exacta del cliente
-- Los IDs deben ser exactamente los que aparecen entre [ID:...] arriba` : ""}
-${escalamientoActivo ? `
-=== ESCALAMIENTO HUMANO — ACCIÓN OBLIGATORIA ===
-REGLA CRÍTICA: Cuando detectes cualquiera de estas situaciones, DEBES llamar a escalar_humano ANTES de responder. Solo después de recibir el resultado de la función puedes hablar. Si no llamas a la función, el equipo no se entera y el cliente queda sin atención.
-
-Situaciones que ACTIVAN escalar_humano:
-1. tipo="directo": El cliente pide explícitamente hablar con una persona, el dueño, un humano, el gerente, o atención personal.
-2. tipo="emergencia": Detectas urgencia médica, amenaza, agresión sostenida, demanda legal, o falla crítica de un servicio ya contratado.
-3. tipo="no_sabe": El cliente insiste en algo que ya registraste como pregunta sin respuesta y la situación requiere atención inmediata.
-${temasTexto ? `
-TRANSFERENCIA INMEDIATA POR TEMA — MÁXIMA PRIORIDAD:
-Si el cliente menciona cualquiera de estos temas/situaciones, NO intentes resolverlo, NO pidas datos, NO ofrezcas reservar: llama a escalar_humano (tipo="directo") DE INMEDIATO y dile que lo comunicas con una persona ahora mismo.
-${temasTexto}
-` : ""}
-${receptoresTexto ? `
-SUCURSALES O PERSONAS A LAS QUE PUEDES ESCALAR:
+AGENDAR: con servicio, fecha y hora confirmados, llama a agendar_cita. Si responde que faltan datos, pídeselos y vuelve a llamarla.${hayCamposServicio ? `
+DATOS DEL SERVICIO: si el servicio elegido tiene "Datos a recolectar", pregunta los OBLIGATORIOS con su etiqueta natural (nunca digas el ID ni "campo") y pásalos en camposAgenda con la clave [campo:...] como llave; los opcionales, solo si fluye.` : ""}${requiereAnticipoCitas ? `
+ANTICIPO: este negocio pide ${anticipoCitasPctVoz} para apartar la cita. Llama a agendar_cita como siempre: el sistema aparta el horario y manda los datos de pago por WhatsApp a este número. Di el "mensaje" con el monto TAL CUAL y deja claro que la cita queda confirmada solo al pagar; no dictes cuentas ni links.` : ""}
+CAMBIAR: reagendar_cita (nunca canceles para crear otra). CANCELAR: cancelar_cita solo si lo pide claro; ante algo ambiguo ("olvídalo", "ya no") pregunta "¿Quieres cancelar tu cita?". Sus citas están en CONTEXTO DE ESTA LLAMADA.
+` : ""}${escalamientoActivo ? `
+=== PASAR CON UNA PERSONA ===
+Llama a escalar_humano ANTES de contestar y luego di su "mensaje" (si no la llamas, el equipo nunca se entera):
+- tipo "directo": pide hablar con una persona, el dueño o el gerente.
+- tipo "emergencia": urgencia médica, amenaza, agresión, demanda o falla grave de algo ya contratado.
+- tipo "no_sabe": insiste en algo que ya anotaste sin respuesta y necesita atención inmediata.${temasTexto ? `
+Si menciona cualquiera de estos temas, no lo resuelvas ni pidas datos: escala DE INMEDIATO (tipo "directo") y dile que lo comunicas con una persona:
+${temasTexto}` : ""}${receptoresTexto ? `
+Puedes pasarlo con:
 ${receptoresTexto}
-
-Si hay varias opciones, pregunta al cliente: "¿Con cuál sucursal/persona quieres hablar?". Si solo hay una, úsala sin preguntar. (Si esta llamada llegó desviada desde una sucursal concreta, lo dice el CONTEXTO DE ESTA LLAMADA al final: ésa es la opción por defecto.)
-Pasa la etiqueta EXACTA como parámetro "sucursalEtiqueta" en la función escalar_humano.
-` : ""}
-
-PROCEDIMIENTO:
-1. ${receptoresTexto ? "Pregunta sucursal (si hay varias)." : ""}Llama a escalar_humano con tipo, resumen${receptoresTexto ? " y sucursalEtiqueta" : ""}
-2. Usa el campo "mensaje" que devuelve la función como tu respuesta al cliente
-3. NO improvises ni digas nada antes de recibir el resultado de la función` : ""}
-
-${verificarDispReserva ? `
-=== RESERVAS DE HOSPEDAJE (CON VERIFICACIÓN DE DISPONIBILIDAD) ===
-${habitacionesConId ? `Las unidades y sus IDs están en HABITACIONES DISPONIBLES de arriba.` : "El negocio aún no tiene unidades cargadas; recolecta los datos sin ID."}
-
-CÓMO FUNCIONA (no prometas el resultado antes de llamar a la función; ${reservaConfirmaAgente ? "si el sistema puede garantizar disponibilidad y no falta pago, puede confirmarla automáticamente" : "la decisión final la toma el negocio"}):
-1. Pregunta al cliente: qué unidad quiere, primer día y último día de uso (ambos inclusive; si es un solo día, son el mismo). El número de personas es OPCIONAL — no insistas si no lo menciona. Convierte las fechas a formato YYYY-MM-DD usando la fecha actual.
-2. Cuando tengas la unidad y las fechas, llama a solicitar_reserva con pagoReportado=false.
-3. La función te devuelve un "mensaje" — dilo TAL CUAL al cliente (puede ser que no hay disponibilidad${metodoPago ? ", o los datos de pago" : ""}, o que el equipo le confirmará).
-${metodoPago ? `4. Como es una llamada y los datos de pago (números de cuenta, links) son difíciles de dictar, dile al cliente que se los ENVIARÁS POR WHATSAPP a este mismo número para que los tenga por escrito.
-5. Llama a solicitar_reserva OTRA VEZ con pagoReportado=true SOLO si el cliente confirma de forma EXPLÍCITA E INEQUÍVOCA que YA hizo el pago ("ya transferí", "ya deposité", "ya pagué", "ya mandé el comprobante"). Recién entonces di el "mensaje" que devuelva.` : `4. Aclara siempre que la confirmación del equipo le llegará por WhatsApp a este mismo número.`}
-
-REGLAS:
-- NUNCA inventes disponibilidad, precios${metodoPago ? " ni datos de pago" : ""}. Eso lo da la función.
-- Después de llamar a solicitar_reserva, di su campo "mensaje" TAL CUAL: distingue "registrada y pendiente" de "confirmada". NUNCA cambies una palabra por la otra.
-- NUNCA digas los [ID:...] en voz alta — son internos.
-- PRECIOS POR DÍA: si una unidad tiene "Precios por día" anotados arriba (Lun, Vie, Sáb, etc.), úsalos cuando el cliente pregunte el costo de un día específico ("¿cuánto cuesta el viernes?"). Días sin valor anotado cobran el PRECIO BASE. Si te piden el total de varios días, suma día por día con su precio correspondiente. El backend hace ese cálculo cuando llamas a solicitar_reserva, así que tu trabajo es solo informarlo bien si te lo preguntan ANTES de reservar.${metodoPago ? `
-- NO asumas que el cliente ya pagó. Un "gracias", "ok", "va", "perfecto", "ahí va", un silencio o un ruido NO son confirmación de pago. Si dudas, deja pagoReportado en false y pregunta: "¿Ya realizaste el pago?".
-- Después de dar los datos de pago, NO vuelvas a llamar a solicitar_reserva hasta que el cliente diga claramente que ya pagó.` : ""}
-` : ""}
-${bloqueGiro}${bloqueDatosDueno}${bloqueCicloVida}
-=== CONOCIMIENTO FALTANTE — ACCIÓN OBLIGATORIA ===
-REGLA CRÍTICA: Cuando el cliente pregunta algo que NO está en tu base de conocimiento, DEBES llamar a registrar_pregunta ANTES de responder. La función confirma el registro y te da el mensaje para el cliente.
-
-PROCEDIMIENTO:
-1. Detecta que no tienes la información en tu base de conocimiento
-2. Llama a registrar_pregunta con la pregunta exacta y su categoría
-3. Usa el campo "mensaje" que devuelve la función como tu respuesta al cliente
-4. NO digas "no tengo esa información" sin haber llamado primero a la función
-
-REGLAS:
-- Solo llama a registrar_pregunta cuando genuinamente no tengas la información
-- No llames a registrar_pregunta por preguntas sobre citas o escalamientos
-- Si el cliente repite una pregunta que ya registraste, NO la registres de nuevo. Di: "Ya lo anoté, el equipo te contactará."
-- NUNCA intentes responder algo que ya quedó registrado como pregunta sin respuesta
-
+Si hay varias y no dice cuál, pregúntale; pasa la etiqueta EXACTA en sucursalEtiqueta.` : ""}
+` : ""}${verificarDispReserva ? `
+=== RESERVAS DE HOSPEDAJE ===
+${habitacionesTexto ? "" : "El negocio aún no tiene unidades cargadas; recolecta los datos sin ID.\n"}No prometas el resultado antes de llamar a la función (${reservaConfirmaAgente ? "si hay lugar y no falta pago, el sistema puede confirmarla" : "la decisión final la toma el negocio"}).
+1. Pregunta la unidad y el primer y último día de uso (inclusive; si es un día, son el mismo). Las personas son opcionales. Copia las fechas del CALENDARIO.
+2. Llama a solicitar_reserva con pagoReportado=false y di su "mensaje" TAL CUAL: distingue "registrada y pendiente" de "confirmada", nunca cambies una por la otra.
+${metodoPago ? `3. Los datos de pago se los mandas por WHATSAPP a este número; no los dictes.
+4. Vuelve a llamarla con pagoReportado=true SOLO cuando diga explícitamente que YA pagó; un "gracias", "ok" o silencio no es pago. Mientras no lo diga, no la vuelvas a llamar.` : `3. Aclara que la confirmación del equipo le llega por WhatsApp a este número.`}
+- Nunca inventes disponibilidad ni precios. Si pregunta el costo de un día con "Precios por día", usa ese precio (los días sin valor cobran el base; para varios días, suma día por día).
+` : ""}${bloqueGiro}${bloqueDatosDueno}${bloqueCicloVida}
 === CONTEXTO DE ESTA LLAMADA ===
-Todo lo anterior es fijo para este negocio. Lo que sigue es de ESTA llamada en concreto y es lo que aplica ahora mismo.
-
-FECHA Y HORA ACTUAL: ${ahoraStr}${bloqueContextoLlamada}${agendaActiva ? (citasClienteTexto ? `
+Lo anterior es fijo del negocio; esto es de esta llamada.
+FECHA Y HORA ACTUAL: ${ahoraStr}${usaFechas ? `
+CALENDARIO (copia de aquí la fecha exacta): ${calendarioVoz(ahora, tz)}` : ""}${bloqueContextoLlamada}${agendaActiva ? (citasClienteTexto ? `
 
 CITAS VIGENTES DE QUIEN LLAMA:
 ${citasClienteTexto}` : `
 
 CITAS VIGENTES DE QUIEN LLAMA: ninguna.`) : ""}${operacionesCliente.length > 0 ? (operacionesResumenTexto ? `
 
-SOLICITUDES VIGENTES DE QUIEN LLAMA (ya verificadas contra su número; úsalas para ubicar de cuál habla). Los [REF:...] son INTERNOS: van en las funciones y NUNCA se dicen en voz alta:
+SOLICITUDES VIGENTES DE QUIEN LLAMA (ya verificadas contra su número; los [REF:...] son internos):
 ${operacionesResumenTexto}` : `
 
-SOLICITUDES VIGENTES DE QUIEN LLAMA: ninguna registrada con este número. Si insiste en que tiene una, dile que a este número no le aparece nada y ofrécele pasarlo con una persona. NO le pidas códigos ni referencias.`) : ""}${escalamientoActivo && receptoresTexto && contextoExtra?.receptorOrigen ? `
-
-ESCALAMIENTO POR DEFECTO: si el cliente pide hablar con una persona y no dice con cuál, usa "${contextoExtra.receptorOrigen.etiqueta}" — fue al número que él marcó originalmente.` : ""}`;
+SOLICITUDES VIGENTES DE QUIEN LLAMA: ninguna con este número. Si insiste, dile que a este número no le aparece nada y ofrécele una persona; no le pidas códigos.`) : ""}`;
 }
 
 // Palabras exclusivamente en inglés que nunca aparecen en español conversacional.
@@ -1424,10 +1424,18 @@ type VentanaLibre = { desde?: string; hasta?: string };
 // las `ventanasLibres` se devuelven formateadas para que el modelo las use solo
 // si el cliente pide el panorama. Si no llegan recomendaciones (backend viejo o
 // sin cercanas), el fallback es preguntar la hora preferida.
+//
+// Odin ya manda el texto armado (`mensaje`, el MISMO que WhatsApp, que sabe
+// ofrecer "esa persona más tarde u otra persona a esa hora"); cuando viene, se
+// usa ése y lo de abajo queda para un Odin anterior.
 function respuestaHorarioOcupado(data: {
+  mensaje?: string;
   recomendaciones?: Recomendaciones;
   ventanasLibres?: VentanaLibre[];
 }): { ok: false; mensaje: string; recomendaciones?: string[]; ventanasLibres?: string[] } {
+  if (typeof data?.mensaje === "string" && data.mensaje.trim()) {
+    return { ok: false, mensaje: data.mensaje.trim() };
+  }
   const cercanas: string[] = [];
   const antes = data?.recomendaciones?.antes;
   const despues = data?.recomendaciones?.despues;
@@ -1649,10 +1657,33 @@ export class PipelineLlamada {
 
     try {
       switch (nombre) {
+        case "consultar_disponibilidad": {
+          // El [CONSULTAR_DISPONIBILIDAD] de WhatsApp: mismo cálculo en Odin
+          // (lib/citas-agenda) y mismo texto. Antes la voz no podía contestar
+          // "¿tienen el jueves?" sin crear la cita.
+          const resp = await fetch(`${odinUrl}/api/voice/disponibilidad`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...odinAuth() },
+            body: JSON.stringify({
+              negocioId,
+              servicioId: resolverServicioId(this.configNegocio, args.servicioId),
+              fecha: args.fecha,
+              profesional: args.profesional,
+            }),
+            signal: AbortSignal.timeout(8000),
+          });
+          const data = (await resp.json().catch(() => ({}))) as { ok?: boolean; mensaje?: string };
+          if (!resp.ok || !data.mensaje) {
+            console.error(`[FUNCIÓN] consultar_disponibilidad → HTTP ${resp.status}:`, data);
+            return { ok: false, mensaje: "No pude revisar la agenda en este momento. Pregúntale a qué hora le gustaría y prueba agendarla, o ofrécele pasarlo con una persona." };
+          }
+          return { ok: data.ok !== false, mensaje: data.mensaje };
+        }
+
         case "agendar_cita": {
           const body: Record<string, any> = {
             negocioId,
-            servicioId: args.servicioId,
+            servicioId: resolverServicioId(this.configNegocio, args.servicioId),
             fechaInicio: args.fechaInicio,
             clienteNombre: nombreClienteFinal,
             clienteTelefono: callerNumber || "desconocido",
@@ -1685,6 +1716,7 @@ export class PipelineLlamada {
           });
           const data = (await resp.json().catch(() => ({}))) as {
             error?: string;
+            mensaje?: string;
             faltantes?: string[];
             slotsDisponibles?: string[];      // legacy: NO usar al hablar
             recomendaciones?: Recomendaciones;
@@ -1714,12 +1746,27 @@ export class PipelineLlamada {
                 mensaje: `Antes de agendar necesito un par de datos más: ${data.faltantes.join(", ")}. ¿Me los puedes dar?`,
               };
             }
-            // 409 Horario ocupado: ofrecemos SOLO las dos horas más cercanas
-            // (recomendaciones) en 12h. Ya NO recitamos slotsDisponibles.
+            // 409 ocupado: las alternativas que da Odin (mismo texto que WhatsApp).
             if (resp.status === 409 || data.recomendaciones || data.ventanasLibres || data.slotsDisponibles) {
               return respuestaHorarioOcupado(data);
             }
-            return { ok: false, mensaje: "No pude registrar la cita. Por favor intenta con otro horario." };
+            // 422 fuera de horario / en el pasado, 404 servicio que no existe:
+            // Odin ya dice qué pasó y qué ofrecer.
+            if (data.mensaje) return { ok: false, mensaje: data.mensaje };
+            // Lo demás es una falla NUESTRA, no del horario. Antes se le decía
+            // al cliente "intenta con otro horario", y él probaba otra hora
+            // sobre un sistema caído.
+            console.error(`[FUNCIÓN] agendar_cita → HTTP ${resp.status}:`, data);
+            return { ok: false, mensaje: "Tuve un problema con el sistema y no pude registrar la cita. Dile al cliente la verdad y ofrécele intentarlo de nuevo o pasarlo con una persona." };
+          }
+          // La cita nueva entra a la lista de esta llamada con su ID corto, por
+          // si en la misma llamada quiere moverla o cancelarla.
+          const citas = (this.configNegocio.citasCliente = [...(this.configNegocio.citasCliente || [])]);
+          let aliasNueva: string | undefined;
+          if (data.citaId) {
+            const servicioNombre = (this.configNegocio.servicios || []).find((s) => s.id === body.servicioId)?.nombre || "Cita";
+            citas.push({ id: data.citaId, servicio: servicioNombre, fechaInicio: fechaHoraNatural(args.fechaInicio), estado: data.estado || "agendada" });
+            aliasNueva = aliasCita(citas.length - 1);
           }
           // 201 con anticipo: la cita NO está confirmada, quedó apartada
           // esperando el pago. Decimos el monto y que los datos van por WhatsApp
@@ -1727,7 +1774,7 @@ export class PipelineLlamada {
           if (data.esperandoPago) {
             return {
               ok: true,
-              citaId: data.citaId,
+              citaId: aliasNueva,
               mensaje: mensajeAnticipoCitaVoz(
                 data.montoAnticipo,
                 data.esMercadoPago === true,
@@ -1737,8 +1784,8 @@ export class PipelineLlamada {
           }
           const detalle = fechaHoraNatural(args.fechaInicio);
           return data.requiereConfirmacion
-            ? { ok: true, citaId: data.citaId, mensaje: `Tu solicitud de cita para ${detalle} quedó registrada, pero todavía está pendiente de confirmación del negocio. Te avisaremos por WhatsApp cuando respondan. ¿Algo más?` }
-            : { ok: true, citaId: data.citaId, mensaje: `Tu cita quedó confirmada para ${detalle}. ¿Hay algo más en lo que te pueda ayudar?` };
+            ? { ok: true, citaId: aliasNueva, mensaje: `Tu solicitud de cita para ${detalle} quedó registrada, pero todavía está pendiente de confirmación del negocio. Te avisaremos por WhatsApp cuando respondan. ¿Algo más?` }
+            : { ok: true, citaId: aliasNueva, mensaje: `Tu cita quedó confirmada para ${detalle}. ¿Hay algo más en lo que te pueda ayudar?` };
         }
 
         case "cancelar_cita": {
@@ -1748,13 +1795,15 @@ export class PipelineLlamada {
             // clienteTelefono: el backend valida que la cita sea de ESTE
             // llamante antes de cancelar (impide cancelar la cita de otro).
             body: JSON.stringify({
-              citaId: args.citaId,
+              citaId: resolverCitaId(this.configNegocio, args.citaId),
+              negocioId,
               accion: "cancelar",
               clienteTelefono: callerNumber || "desconocido",
             }),
             signal: AbortSignal.timeout(8000),
           });
-          if (!resp.ok) return { ok: false, mensaje: "No pude cancelar la cita. Por favor contacta al negocio directamente." };
+          if (resp.status === 404) return { ok: false, mensaje: "No encontré esa cita a tu nombre. ¿Me dices para qué día era?" };
+          if (!resp.ok) return { ok: false, mensaje: "Tuve un problema con el sistema y no pude cancelar la cita. Dile al cliente la verdad y ofrécele pasarlo con una persona." };
           return { ok: true, mensaje: "Tu cita ha sido cancelada. ¿Hay algo más en lo que te pueda ayudar?" };
         }
 
@@ -1763,9 +1812,10 @@ export class PipelineLlamada {
             method: "PATCH",
             headers: { "Content-Type": "application/json", ...odinAuth() },
             body: JSON.stringify({
-              citaId: args.citaId,
+              citaId: resolverCitaId(this.configNegocio, args.citaId),
+              negocioId,
               accion: "reagendar",
-              servicioId: args.servicioId,
+              servicioId: args.servicioId ? resolverServicioId(this.configNegocio, args.servicioId) : undefined,
               fechaInicio: args.fechaInicio,
               profesional: args.profesional,
               // clienteTelefono: el backend valida que la cita sea de ESTE
@@ -1775,18 +1825,26 @@ export class PipelineLlamada {
             signal: AbortSignal.timeout(8000),
           });
           const data = (await resp.json().catch(() => ({}))) as {
+            mensaje?: string;
             slotsDisponibles?: string[];      // legacy: NO usar al hablar
             recomendaciones?: Recomendaciones;
             ventanasLibres?: VentanaLibre[];
           };
           if (!resp.ok) {
-            // 409 Horario ocupado al reagendar: mismas dos horas cercanas en 12h.
             if (resp.status === 409 || data.recomendaciones || data.ventanasLibres || data.slotsDisponibles) {
               return respuestaHorarioOcupado(data);
             }
-            return { ok: false, mensaje: "No pude modificar la cita. Por favor intenta con otro horario." };
+            if (data.mensaje) return { ok: false, mensaje: data.mensaje };
+            if (resp.status === 404) return { ok: false, mensaje: "No encontré esa cita a tu nombre. ¿Me dices para qué día era?" };
+            console.error(`[FUNCIÓN] reagendar_cita → HTTP ${resp.status}:`, data);
+            return { ok: false, mensaje: "Tuve un problema con el sistema y no pude mover la cita. Dile al cliente la verdad y ofrécele intentarlo de nuevo o pasarlo con una persona." };
           }
-          return { ok: true, mensaje: "Tu cita ha sido actualizada. ¿Hay algo más en lo que te pueda ayudar?" };
+          return {
+            ok: true,
+            mensaje: args.fechaInicio
+              ? `Listo, tu cita quedó cambiada para ${fechaHoraNatural(args.fechaInicio)}. ¿Algo más?`
+              : "Tu cita ha sido actualizada. ¿Hay algo más en lo que te pueda ayudar?",
+          };
         }
 
         case "solicitar_reserva": {

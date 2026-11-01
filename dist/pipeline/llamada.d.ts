@@ -73,6 +73,7 @@ export interface ConfigNegocio {
     zonaHoraria?: string;
     voz?: string;
     catalogo?: ItemCatalogo[];
+    ofertaTexto?: string | null;
     servicios?: Servicio[];
     profesionales?: Array<{
         id: string;
@@ -100,6 +101,9 @@ export interface ConfigNegocio {
     nichoActivo?: boolean;
     /** Bloque de prompt del giro (vocabulario, reglas, catálogo con IDs). */
     nichoPromptBloque?: string;
+    /** true = Odin ya redactó el bloque del giro para llamada (funciones, no
+     *  marcadores). Sin él se le pega la traducción de marcadores a funciones. */
+    nichoBloqueParaVoz?: boolean;
     /** Una entrada por operación que este negocio puede cerrar. Se registra una
      *  tool por cada una — no hay lista escrita a mano de motores aquí, para que
      *  un motor nuevo en Odin llegue al teléfono sin desplegar este repo. */
@@ -175,7 +179,27 @@ interface AccionMotorVoz {
     camposGiro: CampoMotorVoz[];
     camposDueno: CampoMotorVoz[];
 }
-export declare function construirHerramientas(cfg: ConfigNegocio): HerramientaVoz[];
+export declare function aliasServicio(i: number): string;
+export declare function aliasCita(i: number): string;
+export declare function resolverServicioId(cfg: ConfigNegocio, id: unknown): string;
+export declare function resolverCitaId(cfg: ConfigNegocio, id: unknown): string;
+/**
+ * "lunes a viernes de 7:00 a.m. a 7:00 p.m.; sábado de 7:00 a.m. a 2:00 p.m.;
+ * domingo cerrado". Antes iban los siete días en 24 h ("Domingo: 07:00–23:00,
+ * Lunes: …") DOS veces, y los días cerrados simplemente no aparecían: el
+ * modelo tenía que deducir que "no está" quería decir "cerrado".
+ */
+export declare function horarioCompacto(horario: HorarioDetallado[]): string;
+/**
+ * Dos semanas de "día = fecha", en la zona del negocio. El modelo no sabe qué
+ * día de la semana cae el 12; lo estima y se equivoca ("mañana martes" un
+ * lunes). WhatsApp ya le daba esta tabla y la voz no. Vive en el bloque del
+ * final porque cambia cada día.
+ */
+export declare function calendarioVoz(ahora: Date, tz: string, dias?: number): string;
+export declare function construirHerramientas(cfg: ConfigNegocio, opts?: {
+    silencioso?: boolean;
+}): HerramientaVoz[];
 export declare function buildSystemPrompt(cfg: ConfigNegocio, contextoExtra?: {
     receptorOrigen?: ReceptorEscalamiento | null;
     esRebote?: boolean;

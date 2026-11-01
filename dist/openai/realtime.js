@@ -41,6 +41,7 @@ const PRECIOS_REALTIME_USD_POR_1M = {
 // registrar_pregunta (se llama en casi cada pregunta sin respuesta; un filler
 // ahí haría sentir lento al agente en la conversación normal).
 const FUNCIONES_CON_ESPERA = new Set([
+    "consultar_disponibilidad",
     "agendar_cita",
     "cancelar_cita",
     "reagendar_cita",
@@ -52,6 +53,7 @@ const FUNCIONES_CON_ESPERA = new Set([
 // mensaje real.
 function fraseEspera(nombre, args) {
     switch (nombre) {
+        case "consultar_disponibilidad":
         case "agendar_cita":
         case "reagendar_cita":
             return "Permíteme, reviso la agenda.";

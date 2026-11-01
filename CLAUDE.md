@@ -22,10 +22,14 @@ solo el servidor de llamadas.
 
    Las tools son de **tres clases**, y la diferencia importa:
 
-   - **Fijas**, escritas en este repo: `agendar_cita`, `cancelar_cita`,
-     `reagendar_cita`, `solicitar_reserva`, `crear_pedido`, `escalar_humano`,
-     `registrar_pregunta`, `colgar_llamada`, `enviar_ubicacion`. Cada una tiene
-     su `case` en `manejarFuncion` y su endpoint propio en Odin.
+   - **Fijas**, escritas en este repo: `consultar_disponibilidad`,
+     `agendar_cita`, `cancelar_cita`, `reagendar_cita`, `solicitar_reserva`,
+     `crear_pedido`, `escalar_humano`, `registrar_pregunta`, `colgar_llamada`,
+     `enviar_ubicacion`. Cada una tiene su `case` en `manejarFuncion` y su
+     endpoint propio en Odin. Cuando Odin manda `mensaje` en una respuesta
+     (ocupado, fuera de horario, servicio inexistente), se dice ese texto: es el
+     mismo que WhatsApp. Un error que no es del horario NO se le cuenta al
+     cliente como "intenta con otro horario".
    - **De motor** (CREAR), que llegan como DATOS en `accionesMotor` de
      `config-llamada` (`reservar_mesa`, `registrar_orden`,
      `registrar_prospecto`, `registrar_viaje`, `registrar_membresia`,
@@ -49,6 +53,23 @@ solo el servidor de llamadas.
    en qué estado y de quién lo decide Odin en `operaciones-cliente.ts`, que es
    el mismo módulo que usa WhatsApp. Este repo solo declara la tool y repite el
    `texto` que devuelve la respuesta.
+
+## El prompt se paga en cada turno
+
+La Realtime API vuelve a leer el prompt Y el esquema de las tools en cada
+respuesta de la llamada. Por eso (nov-2026, tras las pruebas de Dentinova):
+
+- **Servicios y citas van con IDs cortos** (`s1`, `c1`), no con UUID.
+  `resolverServicioId` / `resolverCitaId` los traducen antes de pegarle a Odin;
+  un UUID que llegue tal cual se respeta. Además de tokens, evitan el 404 de un
+  UUID mal copiado.
+- **Un solo horario** (`horarioCompacto`, de la tabla) y un **calendario** de
+  14 días en el bloque del final (`calendarioVoz`): el modelo no calcula qué
+  día cae el 12.
+- **Nada dicho dos veces**: el precio va en el catálogo y no en la lista de
+  agenda; el JSON de un marcador no va en el prompt si ya va en la tool.
+- **Lo que varía por llamada va al final** (`=== CONTEXTO DE ESTA LLAMADA ===`)
+  para que el prefijo se cachee. `tests/prompt-voz.test.ts` lo fija.
 
 ## Las dos reglas de los datos del cliente
 
