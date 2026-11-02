@@ -11,6 +11,8 @@ export declare class OpenAIRealtime {
     private onItemCreated;
     private onInterrupcion;
     private onFunctionCall;
+    private onCaida;
+    private onErrorOpenAI;
     private conectado;
     private systemPrompt;
     private tools;
@@ -63,6 +65,12 @@ export declare class OpenAIRealtime {
     setOnItemCreated(callback: (itemId: string) => void): void;
     setOnInterrupcion(callback: () => void): void;
     setOnFunctionCall(callback: (name: string, args: any, callId: string) => Promise<any>): void;
+    /** OpenAI cerró la sesión a media llamada sin que nosotros la cerráramos
+     *  (sin saldo, error del servidor). El pipeline decide qué oye el cliente. */
+    setOnCaida(callback: (motivo: string) => void): void;
+    /** Todo error que reporta OpenAI (evento "error", respuesta fallida, cierre).
+     *  El pipeline decide si es falta de crédito y avisa al equipo. */
+    setOnErrorOpenAI(callback: (detalle: string) => void): void;
     private acumularUso;
     costoUsdOpenAI(): number;
     resumenUso(): {

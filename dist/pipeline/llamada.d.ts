@@ -204,6 +204,7 @@ export declare function buildSystemPrompt(cfg: ConfigNegocio, contextoExtra?: {
     receptorOrigen?: ReceptorEscalamiento | null;
     esRebote?: boolean;
 }): string;
+export declare function esSinCreditoOpenAI(texto: unknown): boolean;
 export declare class PipelineLlamada {
     private ws;
     private realtime;
@@ -235,6 +236,8 @@ export declare class PipelineLlamada {
     private esTranscripcionValida;
     private colgarTwilioCall;
     private rechazarPorSaldo;
+    private agenteCaido;
+    private atenderSinAgente;
     private manejarFuncion;
     private iniciarTecleo;
     private detenerTecleo;

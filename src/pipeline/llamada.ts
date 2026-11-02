@@ -1222,6 +1222,40 @@ ${operacionesResumenTexto}` : `
 SOLICITUDES VIGENTES DE QUIEN LLAMA: ninguna con este número. Si insiste, dile que a este número no le aparece nada y ofrécele una persona; no le pidas códigos.`) : ""}`;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OPENAI SIN CRÉDITO → aviso al equipo
+//
+// Cuando la cuenta de OpenAI se queda sin crédito se caen TODAS las llamadas de
+// todos los negocios, y el 1-nov-2026 nadie se enteró hasta probar. El correo
+// lo manda Odin (`/api/voice/alerta-proveedor`, con su propio freno de un
+// aviso cada 6 h); aquí solo se evita pegarle en cada llamada fallida.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function esSinCreditoOpenAI(texto: unknown): boolean {
+  return /insufficient_quota|credit_balance_exhausted|exceeded your current quota|no credits remaining/i.test(String(texto ?? ""));
+}
+
+const MIN_ENTRE_REPORTES_MS = 10 * 60_000;
+let ultimoReporteSinCredito = 0;
+
+function reportarSiSinCredito(detalle: string): void {
+  if (!esSinCreditoOpenAI(detalle)) return;
+  const ahora = Date.now();
+  if (ahora - ultimoReporteSinCredito < MIN_ENTRE_REPORTES_MS) return;
+  ultimoReporteSinCredito = ahora;
+  console.error(`[PIPELINE] OpenAI SIN CRÉDITO — avisando al equipo: ${detalle.slice(0, 200)}`);
+  fetch(`${config.odinAppUrl}/api/voice/alerta-proveedor`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...odinAuth() },
+    body: JSON.stringify({ proveedor: "openai", detalle: detalle.slice(0, 1000) }),
+    signal: AbortSignal.timeout(8000),
+  }).catch((e) => {
+    // Si no llegó, que el siguiente fallo lo vuelva a intentar.
+    ultimoReporteSinCredito = 0;
+    console.error("[PIPELINE] No se pudo avisar a Odin del crédito de OpenAI:", e?.message || e);
+  });
+}
+
 // Palabras exclusivamente en inglés que nunca aparecen en español conversacional.
 const ENGLISH_STOPWORDS = new Set([
   "the", "this", "that", "there", "their", "they", "these", "those",
@@ -1635,6 +1669,37 @@ export class PipelineLlamada {
       await client.calls(this.callSid).update({ twiml });
     } catch (e: any) {
       console.error("[PIPELINE] No se pudo aplicar TwiML de rechazo:", e?.message || e);
+      try { this.ws.close(); } catch {}
+    }
+  }
+
+  // El agente no puede atender (OpenAI no conectó o se cayó a media llamada:
+  // sin saldo, caída del servicio). Antes el cliente se quedaba en una línea
+  // MUDA hasta que colgaba — con un cliente real, lo peor que puede pasar. Se
+  // le dice algo y se cuelga. A diferencia del rechazo por saldo de Xambee, la
+  // llamada sí se registra (webhook de cierre) para que quede rastro.
+  private agenteCaido = false;
+  private async atenderSinAgente(motivo: string): Promise<void> {
+    if (this.agenteCaido || this.saldoBloqueado) return;
+    this.agenteCaido = true;
+    this.detenerTecleo();
+    this.detenerAmbiente();
+    console.error(`[PIPELINE] Agente sin OpenAI (${motivo}) — despidiendo la llamada ${this.callSid}`);
+    try { this.realtime.cerrar(); } catch {}
+    if (!this.callSid) {
+      try { this.ws.close(); } catch {}
+      return;
+    }
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="es-MX" voice="Polly.Mia">Lo sentimos, en este momento no podemos atender su llamada. Por favor intente de nuevo en unos minutos o escríbanos por WhatsApp.</Say>
+  <Hangup/>
+</Response>`;
+    try {
+      const client = twilio(config.twilioAccountSid, config.twilioAuthToken);
+      await client.calls(this.callSid).update({ twiml });
+    } catch (e: any) {
+      console.error("[PIPELINE] No se pudo aplicar TwiML de despedida:", e?.message || e);
       try { this.ws.close(); } catch {}
     }
   }
@@ -2473,6 +2538,11 @@ export class PipelineLlamada {
       this.limpiarAudioTwilio();
     });
     this.realtime.setOnFunctionCall((nombre, args, callId) => this.manejarFuncion(nombre, args, callId));
+    this.realtime.setOnCaida((motivo) => {
+      reportarSiSinCredito(motivo);
+      this.atenderSinAgente(motivo).catch(() => {});
+    });
+    this.realtime.setOnErrorOpenAI((detalle) => reportarSiSinCredito(detalle));
     this.realtime.setOnItemCreated((itemId) => {
       this.historialOrdenado.push({ role: "user", content: "", itemId, pending: true });
     });
@@ -2534,7 +2604,16 @@ export class PipelineLlamada {
         }
       })
       .catch(() => {});
-    const conexionPromise = this.realtime.abrirConexion();
+    // Si OpenAI no conecta ni con el modelo de respaldo, no se lanza: antes el
+    // error subía hasta index.ts y la llamada quedaba abierta y muda.
+    const conexionPromise = this.realtime.abrirConexion().then(
+      () => true,
+      (err: any) => {
+        console.error("[PIPELINE] OpenAI no conectó:", err?.message || err);
+        reportarSiSinCredito(String(err?.message || err));
+        return false;
+      },
+    );
 
     // FAST-PATH DE CACHÉ: si este número+cliente llamó hace <60s (rellamadas,
     // cortes, pruebas), la config del negocio ya la tenemos — saludo CON
@@ -2546,7 +2625,10 @@ export class PipelineLlamada {
 
     let configRapida: ConfigNegocio | null;
     if (configCacheada) {
-      await conexionPromise;
+      if (!(await conexionPromise)) {
+        await this.atenderSinAgente("no conectó");
+        return;
+      }
       configRapida = configCacheada;
       console.log(`[PIPELINE] Config desde CACHÉ (${Math.round((Date.now() - enCache!.ts) / 1000)}s) — saludo con memoria inmediato`);
       // Refresh de fondo: cuando llegue la config fresca, se re-aplica (citas
@@ -2569,13 +2651,18 @@ export class PipelineLlamada {
       });
     } else {
       // Race del fetch contra timeout 1.5s. La conexión OpenAI corre en paralelo.
-      const [r] = await Promise.all([
+      const [r, conecto] = await Promise.all([
         Promise.race([
           fetchPromise,
           new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
         ]),
         conexionPromise,
       ]);
+      // El negocio sin saldo de Xambee tiene su propio mensaje: va primero.
+      if (!conecto && !r?.bloqueado) {
+        await this.atenderSinAgente("no conectó");
+        return;
+      }
       configRapida = r;
     }
 

@@ -71,6 +71,16 @@ respuesta de la llamada. Por eso (nov-2026, tras las pruebas de Dentinova):
 - **Lo que varía por llamada va al final** (`=== CONTEXTO DE ESTA LLAMADA ===`)
   para que el prefijo se cachee. `tests/prompt-voz.test.ts` lo fija.
 
+## Cuando OpenAI falla, nunca una línea muda
+
+- Si OpenAI no conecta o se cae a media llamada (`atenderSinAgente`), el cliente
+  oye un mensaje corto y se cuelga. Antes se quedaba en silencio hasta colgar.
+- Si el error es falta de crédito (`insufficient_quota`), se avisa a Odin
+  (`/api/voice/alerta-proveedor`) y Odin manda el correo al equipo. Aquí no hay
+  SMTP: el freno de avisos vive en Odin.
+- Una respuesta que no termina mientras el modelo arma una función suelta esa
+  función (`funcionActual`); antes el agente quedaba mudo el resto de la llamada.
+
 ## Las dos reglas de los datos del cliente
 
 Valen para las tres clases de tool y las aplica **Odin**, no este repo:

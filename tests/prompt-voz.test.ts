@@ -4,6 +4,7 @@ import {
   buildSystemPrompt,
   calendarioVoz,
   construirHerramientas,
+  esSinCreditoOpenAI,
   horarioCompacto,
   resolverCitaId,
   resolverServicioId,
@@ -116,4 +117,13 @@ test("un bloque de giro en versión chat se traduce aunque no haya tools de moto
   assert.match(legado, /POR TELÉFONO NO HAY MARCADORES/);
   assert.match(legado, /\[AGENDAR_CITA\] = agendar_cita/);
   assert.ok(!buildSystemPrompt(consultorio()).includes("POR TELÉFONO NO HAY MARCADORES"));
+});
+
+test("OpenAI sin crédito se reconoce en cada forma en que llega (y un rate limit no)", () => {
+  // Las tres formas reales del log del 1-nov: el evento "error", el motivo del
+  // cierre y el mensaje con que falla la conexión.
+  assert.ok(esSinCreditoOpenAI('{"type":"insufficient_quota","code":"credit_balance_exhausted","message":"You have no credits remaining."}'));
+  assert.ok(esSinCreditoOpenAI("1013 insufficient_quota.credit_balance_exhausted"));
+  assert.ok(esSinCreditoOpenAI("WS cerrado antes de session.created (code 1013 insufficient_quota.credit_balance_exhausted)"));
+  assert.ok(!esSinCreditoOpenAI('{"type":"rate_limit_exceeded"}'));
 });

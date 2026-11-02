@@ -117,6 +117,8 @@ export class OpenAIRealtime {
   private onItemCreated: ((itemId: string) => void) | null = null;
   private onInterrupcion: (() => void) | null = null;
   private onFunctionCall: ((name: string, args: any, callId: string) => Promise<any>) | null = null;
+  private onCaida: ((motivo: string) => void) | null = null;
+  private onErrorOpenAI: ((detalle: string) => void) | null = null;
   private conectado: boolean = false;
   private systemPrompt: string;
   private tools: HerramientaVoz[];
@@ -191,9 +193,10 @@ export class OpenAIRealtime {
   private conectarModelo(modelo: string): Promise<void> {
     return new Promise((resolve, reject) => {
       const url = `wss://api.openai.com/v1/realtime?model=${modelo}`;
-      this.ws = new WebSocket(url, {
+      const socket = new WebSocket(url, {
         headers: { "Authorization": `Bearer ${config.openaiApiKey}` },
       });
+      this.ws = socket;
 
       let inicializado = false;
 
@@ -221,8 +224,18 @@ export class OpenAIRealtime {
 
       this.ws.on("close", (code, reason) => {
         console.log(`[REALTIME] Cerrado: ${code} ${reason}`);
-        this.conectado = false;
-        if (!inicializado) reject(new Error(`WS cerrado antes de session.created (code ${code})`));
+        if (!inicializado) {
+          this.conectado = false;
+          reject(new Error(`WS cerrado antes de session.created (code ${code} ${reason})`));
+          return;
+        }
+        // `cerrar()` suelta `this.ws` antes de cerrar: si sigue siendo este
+        // socket, el cierre NO fue nuestro. Sin aviso, el cliente se quedaba
+        // en una línea muda hasta colgar (pasó al acabarse el saldo de OpenAI).
+        if (this.ws === socket) {
+          this.conectado = false;
+          this.onCaida?.(`${code} ${reason}`);
+        }
       });
     });
   }
@@ -455,9 +468,31 @@ export class OpenAIRealtime {
         // Cuenta el consumo de ESTE response (incluye cancelados y frases de
         // espera: la API igual cobra los tokens que alcanzó a generar).
         this.acumularUso(msg.response?.usage);
-        const cancelada = msg.response?.status === "cancelled";
+        const estado = msg.response?.status;
+        const cancelada = estado === "cancelled";
         const eraFiller = this.fillerActivo;
         this.fillerActivo = false;
+
+        // Una respuesta que OpenAI no terminó (sin saldo, límite, error del
+        // modelo) llega aquí SIN audio y sin evento "error": el agente se quedaba
+        // callado y el log no decía por qué. Ahora queda escrito el motivo.
+        if (estado === "failed" || estado === "incomplete") {
+          const detalle = JSON.stringify(msg.response?.status_details ?? {});
+          console.error(`[REALTIME] Respuesta ${estado}:`, detalle);
+          this.onErrorOpenAI?.(detalle);
+        }
+
+        // Si la respuesta no terminó mientras el modelo armaba una función, el
+        // "...arguments.done" nunca llega. `funcionActual` se quedaba puesto para
+        // siempre y bloqueaba TODA respuesta posterior (ver
+        // intentarRespuestaUsuarioProgramada): el agente quedaba mudo el resto de
+        // la llamada. La función nunca se ejecutó; se suelta.
+        if (estado !== "completed" && this.funcionActual) {
+          console.warn(`[REALTIME] La función ${this.funcionActual.name} quedó a medias (respuesta ${estado}); se descarta`);
+          this.funcionActual = null;
+          this.funcionLentaPendiente = null;
+          this.funcionLentaArgs = null;
+        }
 
         if (cancelada) {
           console.log("[REALTIME] Respuesta cancelada");
@@ -557,6 +592,7 @@ export class OpenAIRealtime {
         // solo en el siguiente response.done.
         if (msg.error?.code === "conversation_already_has_active_response") break;
         console.error("[REALTIME] Error:", JSON.stringify(msg.error));
+        this.onErrorOpenAI?.(JSON.stringify(msg.error ?? {}));
         break;
 
       case "rate_limits.updated":
@@ -706,6 +742,12 @@ export class OpenAIRealtime {
   setOnItemCreated(callback: (itemId: string) => void) { this.onItemCreated = callback; }
   setOnInterrupcion(callback: () => void) { this.onInterrupcion = callback; }
   setOnFunctionCall(callback: (name: string, args: any, callId: string) => Promise<any>) { this.onFunctionCall = callback; }
+  /** OpenAI cerró la sesión a media llamada sin que nosotros la cerráramos
+   *  (sin saldo, error del servidor). El pipeline decide qué oye el cliente. */
+  setOnCaida(callback: (motivo: string) => void) { this.onCaida = callback; }
+  /** Todo error que reporta OpenAI (evento "error", respuesta fallida, cierre).
+   *  El pipeline decide si es falta de crédito y avisa al equipo. */
+  setOnErrorOpenAI(callback: (detalle: string) => void) { this.onErrorOpenAI = callback; }
 
   // Acumula el usage de un response.done. La API reporta el desglose de tokens
   // de entrada (audio/texto, cacheados o no) y de salida.
