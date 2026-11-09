@@ -962,14 +962,13 @@ function odinAuth() {
         ? { Authorization: `Bearer ${config_1.config.voiceServerSecret}` }
         : {};
 }
-// Fetch con timeout largo + 1 reintento. Antes el timeout era 4s y
-// con cold start de Vercel siempre fallaba → agente sin datos del negocio.
-async function fetchConfigConRetry(url, timeoutMs = 10000) {
+// Hasta dos intentos antes de dar el mensaje de indisponibilidad.
+async function fetchConfigConRetry(url) {
     for (let intento = 1; intento <= 2; intento++) {
         try {
             const resp = await fetch(url, {
                 headers: odinAuth(),
-                signal: AbortSignal.timeout(timeoutMs),
+                signal: AbortSignal.timeout(5000),
             });
             if (resp.ok)
                 return await resp.json();
@@ -1045,13 +1044,6 @@ function mensajeAnticipoCitaVoz(monto, esMercadoPago, whatsappEnviado) {
         : `En un momento te llegan ${via} por WhatsApp a este mismo número.`;
     return `Para apartar tu cita necesitas un anticipo${montoTxt}. ${envio} En cuanto lo realices, tu cita queda confirmada y el equipo te avisa. ¿Hay algo más en lo que te pueda ayudar?`;
 }
-// ── Caché de config por número+cliente (TTL corto) ──────────────────────────
-// La config del negocio tarda 1.5-3.5s en llegar de Odin (queries a Supabase);
-// sin caché, la 2ª llamada seguida saludaba genérico otra vez. La clave incluye
-// al CLIENTE porque la config trae SUS citas vigentes (no se comparte entre
-// llamantes). El fetch de fondo siempre re-aplica datos frescos.
-const configCache = new Map();
-const CONFIG_CACHE_TTL_MS = 60_000;
 // Normaliza un número telefónico para comparación (solo dígitos, sin +).
 /**
  * Los datos del dueño tal como los recolectó el modelo, listos para viajar.
@@ -1195,9 +1187,8 @@ class PipelineLlamada {
     // agendar/reservar/pedir). Reemplaza el "Llamada entrante" hardcodeado en
     // citas, conversaciones y notificaciones al gerente.
     nombreCliente = "";
-    // true = el negocio no tiene créditos: la llamada se rechazó con mensaje
-    // corto y NO se manda webhook de cierre (no hay nada que cobrar/guardar).
-    saldoBloqueado = false;
+    // Solo se guarda/cobra una llamada que Odin autorizó.
+    llamadaAutorizada = false;
     // ── TECLEO de espera ("está buscando en el sistema") ─────────────────────
     // Suena SOLO en la espera silenciosa: después de la frase de espera y
     // mientras el fetch de la herramienta sigue corriendo. Se corta al instante
@@ -1310,48 +1301,15 @@ class PipelineLlamada {
             catch { }
         }
     }
-    // GATE DE CRÉDITOS: el negocio no tiene saldo. Cortamos la llamada con un
-    // mensaje corto de Twilio (<Say>) en vez de atender gratis con OpenAI
-    // Realtime corriendo. Sin webhook de cierre (saldoBloqueado lo omite).
-    async rechazarPorSaldo() {
-        this.saldoBloqueado = true;
-        this.detenerTecleo();
-        this.detenerAmbiente();
-        console.warn(`[PIPELINE] Negocio ${this.negocioId || "?"} SIN créditos — rechazando llamada ${this.callSid}`);
-        try {
-            this.realtime.cerrar();
-        }
-        catch { }
-        const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say language="es-MX" voice="Polly.Mia">Lo sentimos, por el momento no podemos atender su llamada. Por favor intente más tarde o escríbanos por WhatsApp.</Say>
-  <Hangup/>
-</Response>`;
-        try {
-            const client = (0, twilio_1.default)(config_1.config.twilioAccountSid, config_1.config.twilioAuthToken);
-            await client.calls(this.callSid).update({ twiml });
-        }
-        catch (e) {
-            console.error("[PIPELINE] No se pudo aplicar TwiML de rechazo:", e?.message || e);
-            try {
-                this.ws.close();
-            }
-            catch { }
-        }
-    }
-    // El agente no puede atender (OpenAI no conectó o se cayó a media llamada:
-    // sin saldo, caída del servicio). Antes el cliente se quedaba en una línea
-    // MUDA hasta que colgaba — con un cliente real, lo peor que puede pasar. Se
-    // le dice algo y se cuelga. A diferencia del rechazo por saldo de Xambee, la
-    // llamada sí se registra (webhook de cierre) para que quede rastro.
+    // Si Odin rechaza la llamada o falla OpenAI, Twilio reproduce el aviso y cuelga.
     agenteCaido = false;
     async atenderSinAgente(motivo) {
-        if (this.agenteCaido || this.saldoBloqueado)
+        if (this.agenteCaido || this.finalizada)
             return;
         this.agenteCaido = true;
         this.detenerTecleo();
         this.detenerAmbiente();
-        console.error(`[PIPELINE] Agente sin OpenAI (${motivo}) — despidiendo la llamada ${this.callSid}`);
+        console.warn(`[PIPELINE] Agente no disponible (${motivo}) — despidiendo la llamada ${this.callSid}`);
         try {
             this.realtime.cerrar();
         }
@@ -2181,19 +2139,6 @@ class PipelineLlamada {
         });
     }
     async iniciar() {
-        this.registrarCallbacks();
-        // VOZ: leer del registro local (push desde Odin cuando el dueño cambia voz).
-        // Si está, usamos esa para el saludo. Si no, fallback a la voz que llegue
-        // del fetch (si llega a tiempo) o "marin" por defecto. Es independiente
-        // del fetch de config — la voz se decide ANTES del saludo siempre.
-        const vozRegistrada = this.numeroTwilio ? (0, registro_voz_1.obtenerVozPorNumero)(this.numeroTwilio) : null;
-        if (vozRegistrada) {
-            this.configNegocio.voz = vozRegistrada;
-        }
-        // Iniciamos el fetch de config Y la conexión OpenAI EN PARALELO.
-        // Antes esperaba race primero (1.5s) y después conexión (600ms) en serie.
-        // Ahora ambos arrancan al mismo tiempo: cuando termine el más lento de
-        // los dos, ya tenemos todo listo. Ahorra ~600ms en la mayoría de casos.
         const params = new URLSearchParams();
         if (this.negocioId)
             params.set("negocioId", this.negocioId);
@@ -2201,128 +2146,46 @@ class PipelineLlamada {
             params.set("numeroTwilio", this.numeroTwilio);
         if (this.callerNumber)
             params.set("callerNumber", this.callerNumber);
+        // Odin comprueba el interruptor del agente y el saldo en cada llamada.
         const url = `${config_1.config.odinAppUrl}/api/voice/config-llamada?${params.toString()}`;
-        const fetchPromise = fetchConfigConRetry(url, 10000);
-        // El fetch SIEMPRE refresca la caché al resolver (aunque llegue tarde):
-        // la siguiente llamada del mismo cliente saluda con memoria al instante.
-        const cacheKey = `${this.numeroTwilio}|${this.callerNumber}`;
-        fetchPromise
-            .then((c) => {
-            if (c && !c.bloqueado && c.negocioId) {
-                configCache.set(cacheKey, { config: c, ts: Date.now() });
-            }
-        })
-            .catch(() => { });
-        // Si OpenAI no conecta ni con el modelo de respaldo, no se lanza: antes el
-        // error subía hasta index.ts y la llamada quedaba abierta y muda.
-        const conexionPromise = this.realtime.abrirConexion().then(() => true, (err) => {
-            console.error("[PIPELINE] OpenAI no conectó:", err?.message || err);
-            reportarSiSinCredito(String(err?.message || err));
-            return false;
+        const configActual = await fetchConfigConRetry(url);
+        if (this.finalizada || this.ws.readyState !== ws_1.default.OPEN)
+            return;
+        if (configActual?.bloqueado) {
+            await this.atenderSinAgente("negocio desactivado o sin saldo");
+            return;
+        }
+        if (!configActual?.negocioId || typeof configActual.habilidades !== "string") {
+            await this.atenderSinAgente("configuración del negocio no disponible");
+            return;
+        }
+        this.llamadaAutorizada = true;
+        this.negocioId = configActual.negocioId;
+        this.configNegocio = { ...this.configNegocio, ...configActual };
+        const vozRegistrada = this.numeroTwilio ? (0, registro_voz_1.obtenerVozPorNumero)(this.numeroTwilio) : null;
+        if (vozRegistrada)
+            this.configNegocio.voz = vozRegistrada;
+        this.calcularContextoSucursal();
+        const prompt = buildSystemPrompt(this.configNegocio, {
+            receptorOrigen: this.receptorOrigen,
+            esRebote: this.esRebote,
         });
-        // FAST-PATH DE CACHÉ: si este número+cliente llamó hace <60s (rellamadas,
-        // cortes, pruebas), la config del negocio ya la tenemos — saludo CON
-        // memoria sin esperar el fetch (en logs de prod tardaba 1.5-3.5s y el
-        // saludo salía genérico). El fetch de fondo re-aplica datos frescos.
-        const enCache = configCache.get(cacheKey);
-        const configCacheada = enCache && Date.now() - enCache.ts < CONFIG_CACHE_TTL_MS ? enCache.config : null;
-        let configRapida;
-        if (configCacheada) {
-            if (!(await conexionPromise)) {
-                await this.atenderSinAgente("no conectó");
-                return;
-            }
-            configRapida = configCacheada;
-            console.log(`[PIPELINE] Config desde CACHÉ (${Math.round((Date.now() - enCache.ts) / 1000)}s) — saludo con memoria inmediato`);
-            // Refresh de fondo: cuando llegue la config fresca, se re-aplica (citas
-            // vigentes del cliente, cambios de catálogo) sin tocar la voz.
-            fetchPromise.then((fresca) => {
-                if (!fresca)
-                    return;
-                if (fresca.bloqueado) {
-                    if (fresca.negocioId)
-                        this.negocioId = fresca.negocioId;
-                    this.rechazarPorSaldo().catch(() => { });
-                    return;
-                }
-                this.configNegocio = { ...this.configNegocio, ...fresca };
-                if (fresca.negocioId)
-                    this.negocioId = fresca.negocioId;
-                this.calcularContextoSucursal();
-                this.realtime.actualizarConfiguracion(buildSystemPrompt(this.configNegocio, { receptorOrigen: this.receptorOrigen, esRebote: this.esRebote }), construirHerramientas(this.configNegocio));
-                console.log("[PIPELINE] Config fresca re-aplicada sobre la cacheada");
-            });
+        const tools = construirHerramientas(this.configNegocio);
+        this.registrarCallbacks();
+        try {
+            await this.realtime.abrirConexion();
         }
-        else {
-            // Race del fetch contra timeout 1.5s. La conexión OpenAI corre en paralelo.
-            const [r, conecto] = await Promise.all([
-                Promise.race([
-                    fetchPromise,
-                    new Promise((resolve) => setTimeout(() => resolve(null), 1500)),
-                ]),
-                conexionPromise,
-            ]);
-            // El negocio sin saldo de Xambee tiene su propio mensaje: va primero.
-            if (!conecto && !r?.bloqueado) {
-                await this.atenderSinAgente("no conectó");
-                return;
-            }
-            configRapida = r;
+        catch (err) {
+            const motivo = err instanceof Error ? err.message : String(err);
+            reportarSiSinCredito(motivo);
+            await this.atenderSinAgente(`OpenAI no conectó: ${motivo}`);
+            return;
         }
-        if (configRapida) {
-            // GATE DE CRÉDITOS: sin saldo → mensaje corto y colgar. Nada de OpenAI.
-            if (configRapida.bloqueado) {
-                if (configRapida.negocioId)
-                    this.negocioId = configRapida.negocioId;
-                await this.rechazarPorSaldo();
-                return;
-            }
-            // Llegó a tiempo: saludo con memoria. La voz priorizamos el registro
-            // local (más reciente), si no la del fetch, si no marin.
-            this.configNegocio = { ...this.configNegocio, ...configRapida };
-            if (configRapida.negocioId)
-                this.negocioId = configRapida.negocioId;
-            if (vozRegistrada)
-                this.configNegocio.voz = vozRegistrada;
-            this.calcularContextoSucursal();
-            const prompt = buildSystemPrompt(this.configNegocio, {
-                receptorOrigen: this.receptorOrigen,
-                esRebote: this.esRebote,
-            });
-            const tools = construirHerramientas(this.configNegocio);
-            this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin", this.configNegocio.velocidadVoz ?? null);
-            console.log(`[PIPELINE] Saludo con memoria + voz=${this.configNegocio.voz || "marin"} — ${this.configNegocio.nombreNegocio}${this.receptorOrigen ? ` (origen=${this.receptorOrigen.etiqueta})` : ""}${this.esRebote ? " (REBOTE)" : ""}`);
-        }
-        else {
-            const prompt = buildSystemPrompt(this.configNegocio);
-            const tools = construirHerramientas(this.configNegocio);
-            this.realtime.configurarSesion(prompt, tools, this.configNegocio.voz || "marin", this.configNegocio.velocidadVoz ?? null);
-            console.log(`[PIPELINE] Saludo con defaults — config llegará en background (voz=${this.configNegocio.voz || "marin"})`);
-            fetchPromise.then((configCompleta) => {
-                if (!configCompleta) {
-                    console.warn("[PIPELINE] Config nunca llegó — agente seguirá con defaults");
-                    return;
-                }
-                // GATE DE CRÉDITOS (config tardía): cortar aunque el saludo ya sonó.
-                if (configCompleta.bloqueado) {
-                    if (configCompleta.negocioId)
-                        this.negocioId = configCompleta.negocioId;
-                    this.rechazarPorSaldo().catch(() => { });
-                    return;
-                }
-                this.configNegocio = { ...this.configNegocio, ...configCompleta };
-                if (configCompleta.negocioId)
-                    this.negocioId = configCompleta.negocioId;
-                this.calcularContextoSucursal();
-                const promptC = buildSystemPrompt(this.configNegocio, {
-                    receptorOrigen: this.receptorOrigen,
-                    esRebote: this.esRebote,
-                });
-                const toolsC = construirHerramientas(this.configNegocio);
-                this.realtime.actualizarConfiguracion(promptC, toolsC);
-                console.log(`[PIPELINE] Memoria del negocio aplicada (post-saludo): ${configCompleta.nombreNegocio}${this.receptorOrigen ? ` (origen=${this.receptorOrigen.etiqueta})` : ""}${this.esRebote ? " (REBOTE)" : ""}`);
-            });
-        }
+        if (this.finalizada || this.ws.readyState !== ws_1.default.OPEN)
+            return;
+        const voz = this.configNegocio.voz || "marin";
+        this.realtime.configurarSesion(prompt, tools, voz, this.configNegocio.velocidadVoz);
+        console.log(`[PIPELINE] Saludo con memoria + voz=${voz} — ${this.configNegocio.nombreNegocio}`);
     }
     recibirMensajeTwilio(mensaje) {
         switch (mensaje.event) {
@@ -2383,12 +2246,8 @@ class PipelineLlamada {
         this.detenerTecleo();
         this.detenerAmbiente();
         this.realtime.cerrar();
-        // Llamada rechazada por falta de créditos: no hubo conversación real —
-        // nada que guardar ni cobrar.
-        if (this.saldoBloqueado) {
-            console.log(`[PIPELINE] Llamada ${this.callSid} rechazada por saldo — webhook omitido`);
+        if (!this.llamadaAutorizada)
             return;
-        }
         const duracionSegundos = Math.round((Date.now() - this.inicioLlamada) / 1000);
         const historial = this.historialOrdenado
             .filter((t) => !t.pending && t.content.trim().length > 0)

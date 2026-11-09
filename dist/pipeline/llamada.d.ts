@@ -221,7 +221,7 @@ export declare class PipelineLlamada {
     private esRebote;
     private turnos;
     private nombreCliente;
-    private saldoBloqueado;
+    private llamadaAutorizada;
     private tecleoTimer;
     private tecleoDesde;
     private tecleoIdx;
@@ -235,7 +235,6 @@ export declare class PipelineLlamada {
     private calcularContextoSucursal;
     private esTranscripcionValida;
     private colgarTwilioCall;
-    private rechazarPorSaldo;
     private agenteCaido;
     private atenderSinAgente;
     private manejarFuncion;

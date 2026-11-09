@@ -159,7 +159,8 @@ class OpenAIRealtime {
             this.modeloActivo = MODELO_PREFERIDO;
         }
         catch (err) {
-            if (MODELO_PREFERIDO === MODELO_FALLBACK)
+            // cerrar() deja el socket en null cuando la llamada ya terminó.
+            if (!this.ws || MODELO_PREFERIDO === MODELO_FALLBACK)
                 throw err;
             console.warn(`[REALTIME] ${MODELO_PREFERIDO} no disponible (${err?.message || err}) → fallback a ${MODELO_FALLBACK}`);
             await this.conectarModelo(MODELO_FALLBACK);

@@ -1,5 +1,23 @@
 import { Request, Response } from "express";
-import { config } from "../utils/config";
+import twilio from "twilio";
+import { config, urlPublicaHttps } from "../utils/config";
+
+export function urlMediaStream(): string {
+  return `${urlPublicaHttps().replace(/^https:/, "wss:")}/ws`;
+}
+
+export function firmaTwilioValida(
+  firma: string | string[] | undefined,
+  url: string,
+  params: Record<string, unknown> = {},
+): boolean {
+  if (!config.twilioAuthToken || typeof firma !== "string" || !firma) return false;
+  try {
+    return twilio.validateRequest(config.twilioAuthToken, firma, url, params);
+  } catch {
+    return false;
+  }
+}
 
 // Genera TwiML que le dice a Twilio:
 // 1. Conectar el audio bidireccional por WebSocket al voice server
@@ -7,26 +25,34 @@ import { config } from "../utils/config";
 //    que recibió la llamada (req.body.To). El pipeline usará uno u otro para
 //    cargar la config del negocio correcto.
 export function handleIncomingCall(req: Request, res: Response) {
+  // Traefik termina TLS y conserva el Host público del webhook.
+  const host = req.get("host");
+  const esPost = req.method === "POST";
+  if (!host || (esPost && !req.is("application/x-www-form-urlencoded")) ||
+      !firmaTwilioValida(req.get("x-twilio-signature"), `https://${host}${req.originalUrl}`, esPost ? req.body : {})) {
+    res.sendStatus(403);
+    return;
+  }
+
   // negocioId puede venir por query (modo legacy) o no venir (lookup por número)
-  const negocioId = (req.query.negocioId as string) || "";
+  const negocioId = String(req.query.negocioId || "");
 
   // Twilio manda el número que llamó (From) y el número Twilio que recibió (To)
-  const callerNumber = String(req.body?.From || req.body?.Caller || "").replace("+", "");
-  const numeroTwilio = String(req.body?.To || req.body?.Called || "");
+  const params = esPost ? req.body : req.query;
+  const callerNumber = String(params.From || params.Caller || "").replace("+", "");
+  const numeroTwilio = String(params.To || params.Called || "");
   // Si la llamada llegó por desvío, Twilio incluye ForwardedFrom con el
   // número que originalmente fue marcado (ej. el número de la terraza/sucursal
   // antes de que rebotara al Twilio). Lo usamos para detectar de qué sucursal
   // viene el cliente y dar contexto al agente.
-  const forwardedFrom = String(req.body?.ForwardedFrom || "").replace("+", "");
-
-  const wsUrl = config.voiceServerUrl.replace("wss://", "").replace("ws://", "").replace("https://", "").replace("http://", "");
+  const forwardedFrom = String(params.ForwardedFrom || "").replace("+", "");
 
   // Si el WebSocket falla o se cierra, Twilio ejecuta el <Say> como fallback
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect action="/twiml-fallback" method="POST">
-    <Stream url="wss://${wsUrl}/ws">
-      <Parameter name="negocioId" value="${negocioId}" />
+    <Stream url="${urlMediaStream()}">
+      <Parameter name="negocioId" value="${escapeXml(negocioId)}" />
       <Parameter name="numeroTwilio" value="${escapeXml(numeroTwilio)}" />
       <Parameter name="callerNumber" value="${escapeXml(callerNumber)}" />
       <Parameter name="forwardedFrom" value="${escapeXml(forwardedFrom)}" />

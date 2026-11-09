@@ -3,7 +3,7 @@ import { timingSafeEqual } from "crypto";
 import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { config } from "./utils/config";
-import { handleIncomingCall, handleFallback } from "./twilio/twiml";
+import { firmaTwilioValida, handleIncomingCall, handleFallback, urlMediaStream } from "./twilio/twiml";
 import { configurarNegocio, obtenerEstado, obtenerConfig, listarNegocios } from "./api/configurar";
 import { previewVoz } from "./api/preview-voz";
 import { setVozHandler } from "./api/registro-voz";
@@ -181,9 +181,23 @@ app.get("/api/preview-voz", previewVoz);
 // ═══ WebSocket Server ═══
 
 const server = createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ noServer: true });
 
-const llamadasActivas: Map<string, PipelineLlamada> = new Map();
+server.on("upgrade", (req, socket, head) => {
+  if (req.url !== "/ws") {
+    socket.destroy();
+    return;
+  }
+
+  const firma = req.headers["x-twilio-signature"];
+  const url = urlMediaStream();
+  // Twilio puede incluir una barra final al firmar el handshake WSS.
+  if (!firmaTwilioValida(firma, url) && !firmaTwilioValida(firma, `${url}/`)) {
+    socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+});
 
 wss.on("connection", (ws: WebSocket) => {
   console.log("[WS] Nueva conexión WebSocket de Twilio");
@@ -201,6 +215,7 @@ wss.on("connection", (ws: WebSocket) => {
       }
 
       if (mensaje.event === "start") {
+        if (pipeline) return;
         callSid = mensaje.start?.callSid || "";
         const params = mensaje.start?.customParameters || {};
         const negocioId = String(params.negocioId || "");
@@ -223,7 +238,6 @@ wss.on("connection", (ws: WebSocket) => {
         // Registrar el streamSid ANTES de conectar a OpenAI para que el saludo no se descarte
         pipeline.recibirMensajeTwilio(mensaje);
         await pipeline.iniciar();
-        llamadasActivas.set(callSid, pipeline);
         return;
       }
 
@@ -242,9 +256,6 @@ wss.on("connection", (ws: WebSocket) => {
     // llamada se finaliza igual — transcripción, nombre y créditos JAMÁS se
     // pierden. Es idempotente: si "stop" ya la finalizó, no hace nada.
     pipeline?.finalizarPorCierreDeSocket();
-    if (callSid) {
-      llamadasActivas.delete(callSid);
-    }
   });
 
   ws.on("error", (err) => {
@@ -338,7 +349,7 @@ server.listen(config.port, () => {
 ║           ODIN VOICE SERVER                ║
 ║                                            ║
 ║   Puerto:  ${config.port}                         ║
-║   WS:      ${config.voiceServerUrl}/ws     ║
+║   WS:      ${urlMediaStream()}     ║
 ║   Estado:  ONLINE                          ║
 ╚════════════════════════════════════════════╝
   `);
