@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.urlMediaStream = urlMediaStream;
 exports.firmaTwilioValida = firmaTwilioValida;
+exports.requerirFirmaTwilio = requerirFirmaTwilio;
 exports.handleIncomingCall = handleIncomingCall;
 exports.handleFallback = handleFallback;
 const twilio_1 = __importDefault(require("twilio"));
@@ -22,12 +23,7 @@ function firmaTwilioValida(firma, url, params = {}) {
         return false;
     }
 }
-// Genera TwiML que le dice a Twilio:
-// 1. Conectar el audio bidireccional por WebSocket al voice server
-// 2. Pasar como parámetros: el negocioId (si vino en query) y el número Twilio
-//    que recibió la llamada (req.body.To). El pipeline usará uno u otro para
-//    cargar la config del negocio correcto.
-function handleIncomingCall(req, res) {
+function requerirFirmaTwilio(req, res, next) {
     // Traefik termina TLS y conserva el Host público del webhook.
     const host = req.get("host");
     const esPost = req.method === "POST";
@@ -36,10 +32,14 @@ function handleIncomingCall(req, res) {
         res.sendStatus(403);
         return;
     }
+    next();
+}
+// Genera el TwiML que abre el stream y pasa los datos de la llamada.
+function handleIncomingCall(req, res) {
     // negocioId puede venir por query (modo legacy) o no venir (lookup por número)
     const negocioId = String(req.query.negocioId || "");
     // Twilio manda el número que llamó (From) y el número Twilio que recibió (To)
-    const params = esPost ? req.body : req.query;
+    const params = req.method === "POST" ? req.body : req.query;
     const callerNumber = String(params.From || params.Caller || "").replace("+", "");
     const numeroTwilio = String(params.To || params.Called || "");
     // Si la llamada llegó por desvío, Twilio incluye ForwardedFrom con el

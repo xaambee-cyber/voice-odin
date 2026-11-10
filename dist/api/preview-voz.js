@@ -12,8 +12,7 @@ const VOCES_VALIDAS = new Set([
 const PROMPT_PREVIEW = "Habla en español mexicano de forma natural y profesional. " +
     "Di EXACTAMENTE: 'Hola, soy tu asistente virtual. Así sonaré al contestar tus llamadas.' " +
     "No agregues nada más. Habla con tono cálido, natural y a velocidad normal.";
-// Cache simple en memoria: voz → buffer WAV. Las voces no cambian, así que
-// la primera vez generamos el preview y luego lo servimos directo.
+// La misma promesa sirve a los pedidos concurrentes y conserva el WAV listo.
 const cache = new Map();
 async function previewVoz(req, res) {
     const voz = String(req.query.voz || "marin");
@@ -21,16 +20,19 @@ async function previewVoz(req, res) {
         return res.status(400).json({ error: "Voz no válida" });
     }
     try {
-        let wav = cache.get(voz);
-        if (!wav) {
-            const mulaw = await generarPreview(voz);
-            wav = construirWAV(decodificarMulaw(mulaw));
-            cache.set(voz, wav);
-            console.log(`[PREVIEW] Generado y cacheado preview de "${voz}" (${wav.length} bytes)`);
+        let pendiente = cache.get(voz);
+        if (!pendiente) {
+            pendiente = generarPreview(voz).then((mulaw) => {
+                const wav = construirWAV(decodificarMulaw(mulaw));
+                console.log(`[PREVIEW] Generado y cacheado preview de "${voz}" (${wav.length} bytes)`);
+                return wav;
+            }).catch((err) => {
+                cache.delete(voz);
+                throw err;
+            });
+            cache.set(voz, pendiente);
         }
-        else {
-            console.log(`[PREVIEW] Sirviendo preview cacheado de "${voz}"`);
-        }
+        const wav = await pendiente;
         res.set({
             "Content-Type": "audio/wav",
             "Cache-Control": "public, max-age=86400",

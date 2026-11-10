@@ -3,7 +3,7 @@ import { timingSafeEqual } from "crypto";
 import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { config } from "./utils/config";
-import { firmaTwilioValida, handleIncomingCall, handleFallback, urlMediaStream } from "./twilio/twiml";
+import { firmaTwilioValida, handleIncomingCall, handleFallback, requerirFirmaTwilio, urlMediaStream } from "./twilio/twiml";
 import { configurarNegocio, obtenerEstado, obtenerConfig, listarNegocios } from "./api/configurar";
 import { previewVoz } from "./api/preview-voz";
 import { setVozHandler } from "./api/registro-voz";
@@ -69,8 +69,8 @@ app.get("/", (req, res) => {
 });
 
 // Twilio llama aquí cuando entra una llamada → devuelve TwiML
-app.post("/twiml", handleIncomingCall);
-app.get("/twiml", handleIncomingCall);
+app.post("/twiml", requerirFirmaTwilio, handleIncomingCall);
+app.get("/twiml", requerirFirmaTwilio, handleIncomingCall);
 
 // Fallback si el WebSocket no conecta
 app.post("/twiml-fallback", handleFallback);
@@ -85,10 +85,8 @@ app.post("/twiml-fallback", handleFallback);
 // primero. (El `action` del <Dial> no sirve para esto: solo corre si la llamada
 // padre sigue viva, y si el cliente cuelga primero nunca llega.)
 //
-// No lleva `requireSecret`: quien pega aquí es Twilio, que no puede portar
-// nuestro bearer. La protección real es el mapa de transferencias en vuelo — un
-// ParentCallSid que no salió de un <Dial> nuestro no existe ahí y se ignora.
-app.post("/transferencia-estado", (req, res) => {
+// La firma autentica a Twilio y el mapa liga el callback a la transferencia.
+app.post("/transferencia-estado", requerirFirmaTwilio, (req, res) => {
   // En el callback de la hija, CallSid es la pierna saliente y ParentCallSid la
   // llamada original del cliente — que es la que conoce Odin.
   const callSidPadre = String(req.body?.ParentCallSid || "");

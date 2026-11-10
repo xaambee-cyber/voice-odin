@@ -7,11 +7,8 @@
 // entrante del cliente ($0.0100/min) y la saliente al receptor ($0.0473/min)
 // hasta que el humano cuelgue. Antes ese tramo no se cobraba a nadie.
 //
-// El <Dial> ahora lleva un `action`; cuando termina, Twilio pega a
-// /transferencia-fin con DialCallDuration. Este mapa es lo que conecta ese
-// callback con la llamada que lo originó: si el callSid no está aquí, la
-// petición no salió de una transferencia nuestra y se ignora (protege contra
-// requests forjados sin tener que validar la firma de Twilio detrás de Traefik).
+// Al terminar la pierna humana, Twilio manda un statusCallback firmado a
+// /transferencia-estado. Este mapa lo liga a la llamada que lo originó.
 //
 // Es memoria de proceso a propósito: si el server reinicia a media transferencia
 // se pierde el cobro de ese tramo. Falla a favor del cliente, que es el lado
@@ -37,9 +34,8 @@ export function registrarTransferencia(t: TransferenciaActiva): void {
 }
 
 /**
- * Devuelve la transferencia y la SACA del mapa (one-shot). Un segundo callback
- * con el mismo callSid — reintento de Twilio, request forjado — devuelve null y
- * no llega a cobrar. Odin dedupea aparte por `transferencia_segundos`.
+ * Devuelve la transferencia y la saca del mapa. Un reintento de Twilio
+ * devuelve null; Odin dedupea aparte por `transferencia_segundos`.
  */
 export function tomarTransferencia(callSid: string): TransferenciaActiva | null {
   const t = activas.get(callSid);

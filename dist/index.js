@@ -69,8 +69,8 @@ app.get("/", (req, res) => {
     });
 });
 // Twilio llama aquí cuando entra una llamada → devuelve TwiML
-app.post("/twiml", twiml_1.handleIncomingCall);
-app.get("/twiml", twiml_1.handleIncomingCall);
+app.post("/twiml", twiml_1.requerirFirmaTwilio, twiml_1.handleIncomingCall);
+app.get("/twiml", twiml_1.requerirFirmaTwilio, twiml_1.handleIncomingCall);
 // Fallback si el WebSocket no conecta
 app.post("/twiml-fallback", twiml_1.handleFallback);
 // ═══ Fin de una transferencia a humano ═══
@@ -83,10 +83,8 @@ app.post("/twiml-fallback", twiml_1.handleFallback);
 // primero. (El `action` del <Dial> no sirve para esto: solo corre si la llamada
 // padre sigue viva, y si el cliente cuelga primero nunca llega.)
 //
-// No lleva `requireSecret`: quien pega aquí es Twilio, que no puede portar
-// nuestro bearer. La protección real es el mapa de transferencias en vuelo — un
-// ParentCallSid que no salió de un <Dial> nuestro no existe ahí y se ignora.
-app.post("/transferencia-estado", (req, res) => {
+// La firma autentica a Twilio y el mapa liga el callback a la transferencia.
+app.post("/transferencia-estado", twiml_1.requerirFirmaTwilio, (req, res) => {
     // En el callback de la hija, CallSid es la pierna saliente y ParentCallSid la
     // llamada original del cliente — que es la que conoce Odin.
     const callSidPadre = String(req.body?.ParentCallSid || "");

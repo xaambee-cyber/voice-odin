@@ -11,9 +11,8 @@ const PROMPT_PREVIEW =
   "Di EXACTAMENTE: 'Hola, soy tu asistente virtual. Así sonaré al contestar tus llamadas.' " +
   "No agregues nada más. Habla con tono cálido, natural y a velocidad normal.";
 
-// Cache simple en memoria: voz → buffer WAV. Las voces no cambian, así que
-// la primera vez generamos el preview y luego lo servimos directo.
-const cache = new Map<string, Buffer>();
+// La misma promesa sirve a los pedidos concurrentes y conserva el WAV listo.
+const cache = new Map<string, Promise<Buffer>>();
 
 export async function previewVoz(req: Request, res: Response) {
   const voz = String(req.query.voz || "marin");
@@ -22,15 +21,19 @@ export async function previewVoz(req: Request, res: Response) {
   }
 
   try {
-    let wav = cache.get(voz);
-    if (!wav) {
-      const mulaw = await generarPreview(voz);
-      wav = construirWAV(decodificarMulaw(mulaw));
-      cache.set(voz, wav);
-      console.log(`[PREVIEW] Generado y cacheado preview de "${voz}" (${wav.length} bytes)`);
-    } else {
-      console.log(`[PREVIEW] Sirviendo preview cacheado de "${voz}"`);
+    let pendiente = cache.get(voz);
+    if (!pendiente) {
+      pendiente = generarPreview(voz).then((mulaw) => {
+        const wav = construirWAV(decodificarMulaw(mulaw));
+        console.log(`[PREVIEW] Generado y cacheado preview de "${voz}" (${wav.length} bytes)`);
+        return wav;
+      }).catch((err) => {
+        cache.delete(voz);
+        throw err;
+      });
+      cache.set(voz, pendiente);
     }
+    const wav = await pendiente;
 
     res.set({
       "Content-Type": "audio/wav",
