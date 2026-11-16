@@ -1,5 +1,7 @@
 import WebSocket from "ws";
 import { HerramientaVoz } from "../openai/realtime";
+/** Quién lleva la llamada. Twilio es el de siempre; Telnyx corre en paralelo. */
+export type ProveedorTelefonia = "twilio" | "telnyx";
 interface CampoAgenda {
     id: string;
     label: string;
@@ -231,7 +233,8 @@ export declare class PipelineLlamada {
     private static readonly TECLEO_MAX_MS;
     private ambienteTimer;
     private ambienteIdx;
-    constructor(ws: WebSocket, negocioId: string, configNegocio: ConfigNegocio, callerNumber?: string, numeroTwilio?: string, callSid?: string, forwardedFrom?: string);
+    private proveedor;
+    constructor(ws: WebSocket, negocioId: string, configNegocio: ConfigNegocio, callerNumber?: string, numeroTwilio?: string, callSid?: string, forwardedFrom?: string, proveedor?: ProveedorTelefonia);
     private calcularContextoSucursal;
     private esTranscripcionValida;
     private colgarTwilioCall;
@@ -246,6 +249,15 @@ export declare class PipelineLlamada {
     private registrarCallbacks;
     iniciar(): Promise<void>;
     recibirMensajeTwilio(mensaje: any): void;
+    /**
+     * Mensajes del WebSocket de Telnyx. Mismos eventos que Twilio (start, media,
+     * stop) con otra forma: el id del stream va arriba (`stream_id`) y cada
+     * `media` dice su `track`. Pedimos solo `inbound_track`, pero si algún día
+     * llegara el `outbound` (nuestra propia voz) no se le manda a OpenAI: el
+     * agente se oiría a sí mismo y se interrumpiría.
+     */
+    recibirMensajeTelnyx(mensaje: any): void;
+    private enviarAudioTelnyx;
     private enviarAudioTwilio;
     private limpiarAudioTwilio;
     interrumpir(): void;

@@ -54,6 +54,36 @@ solo el servidor de llamadas.
    el mismo módulo que usa WhatsApp. Este repo solo declara la tool y repite el
    `texto` que devuelve la respuesta.
 
+## Dos proveedores de telefonía: Twilio y Telnyx (nov-2026)
+
+Twilio sigue siendo el de siempre y **no se tocó**: `/twiml`, `/ws`,
+`/transferencia-estado`. Telnyx corre EN PARALELO para números comprados en
+Telnyx (Odin guarda `config_voz.proveedor_numero = "telnyx"`). Usa su API
+nativa (Call Control), no TeXML:
+
+- `POST /telnyx/webhook` (`src/telnyx/webhook.ts`): todos los avisos de la Call
+  Control Application. Firma ed25519 obligatoria (`TELNYX_PUBLIC_KEY`).
+  `call.initiated` → pregunta a Odin `config-llamada?soloGate=1`; si el agente
+  o la línea están apagados **rechaza sin contestar** (ocupado, sin costo, el
+  equivalente del `<Reject/>` de Twilio). Si no, `answer` con audio μ-law
+  bidireccional hacia `/ws-telnyx` y el contexto en `client_state`.
+- `/ws-telnyx?ccid=…&t=…`: el token es un HMAC del call_control_id con
+  `VOICE_SERVER_SECRET`. El mismo `PipelineLlamada` atiende, con
+  `proveedor = "telnyx"`: cambian el formato de los frames, el `clear`, colgar
+  (`hangup`), la despedida (`speak` con Polly.Mia y colgar en
+  `call.speak.ended`) y la transferencia (`transfer` + `streaming_stop`).
+- **Desvío / sucursal**: el `ForwardedFrom` de Twilio aquí es la cabecera SIP
+  `Diversion` (`sip_headers` de `call.initiated`) → `numeroDeDiversion`.
+- **Tramo humano**: la pierna de la transferencia lleva `client_state`
+  `{k:"tr"}`; `call.answered`/`call.hangup` miden los segundos y se reporta a
+  Odin con la misma `reportarTransferencia` que Twilio. Al terminar, se cuelga
+  al cliente (como el `<Dial>` sin más verbos).
+- Costo de telefonía: `costoTelefoniaTelnyxUsd` (US$0.0105/min local), viaja en
+  el mismo `costoTwilioUsd` del cierre + `proveedorTelefonia`.
+- Pruebas: `npm test` (`tests/telnyx.test.ts`).
+- Env nuevas: `TELNYX_API_KEY`, `TELNYX_PUBLIC_KEY`. Guía completa (portal,
+  documentos, LADAs): `docs/GUIA-TELNYX-VOZ.md` en el repo de Odin.
+
 ## El prompt se paga en cada turno
 
 La Realtime API vuelve a leer el prompt Y el esquema de las tools en cada

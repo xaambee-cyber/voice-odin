@@ -6,6 +6,12 @@ import { registrarTransferencia, tomarTransferencia } from "../api/transferencia
 import { obtenerVozPorNumero } from "../api/registro-voz";
 import { FRAMES_TECLEO, FRAMES_AMBIENTE, MS_POR_FRAME, AMBIENTE_ACTIVO } from "../utils/sonidos";
 import { REGLA_NORMALIZACION_HORARIA } from "../utils/normalizar-hora";
+import * as telnyxApi from "../telnyx/api";
+import { despedirYColgar } from "../telnyx/webhook";
+import { codificarEstado, costoTelefoniaTelnyxUsd } from "../telnyx/eventos";
+
+/** Quién lleva la llamada. Twilio es el de siempre; Telnyx corre en paralelo. */
+export type ProveedorTelefonia = "twilio" | "telnyx";
 
 // Campo adicional que el negocio definió para agendar un servicio concreto
 // (ej. "Dirección de recolección"). La llave que se manda al backend es `id`
@@ -1536,6 +1542,10 @@ export class PipelineLlamada {
   // el resto del buffer.
   private ambienteTimer: ReturnType<typeof setInterval> | null = null;
   private ambienteIdx: number = 0;
+  // Twilio o Telnyx. Con Telnyx, `callSid` guarda el call_control_id (con él se
+  // cuelga y se transfiere, y Odin dedupea el cierre por ese valor) y
+  // `numeroTwilio` guarda el número de Telnyx que recibió la llamada.
+  private proveedor: ProveedorTelefonia;
 
   constructor(
     ws: WebSocket,
@@ -1545,7 +1555,9 @@ export class PipelineLlamada {
     numeroTwilio: string = "",
     callSid: string = "",
     forwardedFrom: string = "",
+    proveedor: ProveedorTelefonia = "twilio",
   ) {
+    this.proveedor = proveedor;
     this.ws = ws;
     this.negocioId = negocioId;
     this.numeroTwilio = numeroTwilio;
@@ -1630,6 +1642,16 @@ export class PipelineLlamada {
       try { this.ws.close(); } catch {}
       return;
     }
+    if (this.proveedor === "telnyx") {
+      const r = await telnyxApi.colgar(this.callSid);
+      if (r.ok) {
+        console.log(`[FUNCIÓN] colgar_llamada: llamada ${this.callSid} colgada vía Telnyx`);
+      } else {
+        console.error("[FUNCIÓN] colgar_llamada: error con Telnyx, cerrando WS:", r.error);
+        try { this.ws.close(); } catch {}
+      }
+      return;
+    }
     try {
       const client = twilio(config.twilioAccountSid, config.twilioAuthToken);
       await client.calls(this.callSid).update({ status: "completed" });
@@ -1651,6 +1673,11 @@ export class PipelineLlamada {
     try { this.realtime.cerrar(); } catch {}
     if (!this.callSid) {
       try { this.ws.close(); } catch {}
+      return;
+    }
+    if (this.proveedor === "telnyx") {
+      // Mismo aviso, misma voz (Polly.Mia); cuelga al terminar de hablarlo.
+      await despedirYColgar(this.callSid);
       return;
     }
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -2090,6 +2117,47 @@ export class PipelineLlamada {
             return { ok: true, mensaje: `Listo, ya le mandé un mensaje detallado a ${a} por WhatsApp con tu solicitud. Te van a contactar en breve. ¿Algo más en lo que te pueda ayudar?` };
           }
 
+          if (transferTo && this.callSid && this.proveedor === "telnyx") {
+            // Mismo flujo que el <Dial> de Twilio de abajo, con Call Control:
+            //  - el agente dice "te paso con un asesor" con su propia voz y a
+            //    los 3500 ms se transfiere;
+            //  - `from` es nuestro número de Telnyx (el callerId) — el
+            //    anti-rebote depende de eso, igual que con Twilio;
+            //  - 15 s de timbre y luego se rinde;
+            //  - la pierna nueva lleva client_state para que el webhook mida el
+            //    tramo humano y lo cobre por /api/webhooks/voice-transferencia.
+            // Si la transferencia entra, se corta el audio hacia OpenAI (con
+            // Twilio lo cortaba el <Dial>): el pipeline cierra y cobra el tramo IA.
+            const ccidSnapshot = this.callSid;
+            const negocioIdSnapshot = negocioId;
+            const destino = transferTo;
+            console.log(`[FUNCIÓN] escalar_humano: programando transfer (Telnyx) → ${destino} en 3500ms (from=${this.numeroTwilio || "?"})`);
+            setTimeout(async () => {
+              registrarTransferencia({
+                callSid: ccidSnapshot,
+                negocioId: negocioIdSnapshot,
+                destino,
+                inicioMs: Date.now(),
+              });
+              const r = await telnyxApi.transferir(ccidSnapshot, {
+                to: destino,
+                from: this.numeroTwilio,
+                timeoutSecs: 15,
+                targetLegClientState: codificarEstado({ k: "tr", a: ccidSnapshot, nid: negocioIdSnapshot }),
+              });
+              if (!r.ok) {
+                // No hubo pierna saliente: nada que cobrar, y el agente sigue en la línea.
+                tomarTransferencia(ccidSnapshot);
+                console.error("[FUNCIÓN] escalar_humano: Telnyx rechazó la transferencia:", r.error);
+                return;
+              }
+              console.log(`[FUNCIÓN] escalar_humano: Telnyx transfiriendo → ${destino}`);
+              const parar = await telnyxApi.detenerStream(ccidSnapshot);
+              if (!parar.ok) console.warn("[FUNCIÓN] escalar_humano: no se pudo cortar el audio hacia la IA:", parar.error);
+            }, 3500);
+            return { ok: true, mensaje: "Perfecto, te paso con un asesor. Un momento, no cuelgues." };
+          }
+
           if (transferTo && this.callSid) {
             try {
               // callerId DEBE ser un número que la cuenta Twilio posee — el
@@ -2479,6 +2547,10 @@ export class PipelineLlamada {
 
   // Frame μ-law pre-generado directo a Twilio (misma vía que la voz).
   private enviarFrameCrudo(base64Frame: string) {
+    if (this.proveedor === "telnyx") {
+      this.enviarAudioTelnyx(base64Frame);
+      return;
+    }
     if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
       this.ws.send(JSON.stringify({
         event: "media",
@@ -2599,7 +2671,47 @@ export class PipelineLlamada {
     }
   }
 
+  /**
+   * Mensajes del WebSocket de Telnyx. Mismos eventos que Twilio (start, media,
+   * stop) con otra forma: el id del stream va arriba (`stream_id`) y cada
+   * `media` dice su `track`. Pedimos solo `inbound_track`, pero si algún día
+   * llegara el `outbound` (nuestra propia voz) no se le manda a OpenAI: el
+   * agente se oiría a sí mismo y se interrumpiría.
+   */
+  recibirMensajeTelnyx(mensaje: any) {
+    switch (mensaje.event) {
+      case "start":
+        // Telnyx no exige el id del stream al mandar audio, pero el pipeline lo
+        // usa como "ya hay stream": sin él no sale ni un frame.
+        this.streamSid = String(mensaje.stream_id || mensaje.start?.call_control_id || "telnyx");
+        console.log(`[TELNYX] Stream iniciado: ${this.streamSid}`);
+        this.iniciarAmbiente();
+        break;
+      case "media": {
+        const track = mensaje.media?.track;
+        if (mensaje.media?.payload && (!track || track === "inbound")) {
+          this.realtime.enviarAudio(mensaje.media.payload);
+        }
+        break;
+      }
+      case "stop":
+        console.log("[TELNYX] Stream detenido");
+        this.finalizarLlamada();
+        break;
+    }
+  }
+
+  private enviarAudioTelnyx(base64Audio: string) {
+    if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
+      this.ws.send(JSON.stringify({ event: "media", media: { payload: base64Audio } }));
+    }
+  }
+
   private enviarAudioTwilio(base64Audio: string) {
+    if (this.proveedor === "telnyx") {
+      this.enviarAudioTelnyx(base64Audio);
+      return;
+    }
     if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
       this.ws.send(JSON.stringify({
         event: "media",
@@ -2610,6 +2722,13 @@ export class PipelineLlamada {
   }
 
   private limpiarAudioTwilio() {
+    if (this.proveedor === "telnyx") {
+      if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
+        this.ws.send(JSON.stringify({ event: "clear" }));
+        console.log("[TELNYX] Buffer limpiado (interrupción)");
+      }
+      return;
+    }
     if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
       this.ws.send(JSON.stringify({ event: "clear", streamSid: this.streamSid }));
       console.log("[TWILIO] Buffer limpiado (interrupción)");
@@ -2668,7 +2787,12 @@ export class PipelineLlamada {
     // Twilio entrante MX ($0.0100/min) redondeado al minuto, que es como Twilio
     // factura de verdad. Una llamada de 8 s cuesta el minuto completo — por eso
     // el cobro al negocio tiene un mínimo.
-    const costoTwilioAprox = Number((Math.ceil(minutos) * 0.01).toFixed(6));
+    // Con Telnyx: entrada local + Voice API + streaming (lib telnyx/eventos),
+    // con el mismo redondeo al minuto. Viaja en el mismo campo: es "lo que
+    // costó la telefonía", sea del proveedor que sea.
+    const costoTwilioAprox = this.proveedor === "telnyx"
+      ? costoTelefoniaTelnyxUsd(duracionSegundos)
+      : Number((Math.ceil(minutos) * 0.01).toFixed(6));
 
     // ¿El agente alcanzó a hablar? Si OpenAI generó audio, hubo servicio. Si no
     // (sesión murió antes del saludo, TwiML de fallback), Odin no cobra.
@@ -2678,6 +2802,11 @@ export class PipelineLlamada {
       usoVoz,
     );
 
+    const latencia = this.realtime.resumenLatencia();
+    console.log(
+      `[LATENCIA] Llamada (${this.proveedor}): mediana ${latencia.medianaMs ?? "?"} ms · promedio ${latencia.promedioMs ?? "?"} ms · ` +
+        `máx ${latencia.maximaMs ?? "?"} ms en ${latencia.turnos} turnos (espera nuestra ${latencia.esperaMedianaMs ?? "?"} ms · modelo ${latencia.modeloMedianaMs ?? "?"} ms)`,
+    );
     console.log(`[PIPELINE] Llamada finalizada — ${duracionSegundos}s, ${this.turnos} turnos`);
     console.log(`[PIPELINE] Enviando ${historial.length} mensajes a Odin`);
     if (historial.length > 0) console.log("[PIPELINE] Historial:\n" + transcripcion);
@@ -2704,6 +2833,8 @@ export class PipelineLlamada {
       // Desglose para auditar margen por negocio en xambee-admin.
       costoOpenaiUsd: costoUsd,
       costoTwilioUsd: costoTwilioAprox,
+      proveedorTelefonia: this.proveedor,
+      latencia,
       tokensEntrada: usoVoz.audioIn + usoVoz.textIn,
       tokensSalida: usoVoz.audioOut + usoVoz.textOut,
       tokensCacheados: usoVoz.cachedAudioIn + usoVoz.cachedTextIn,

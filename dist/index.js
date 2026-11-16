@@ -14,8 +14,18 @@ const preview_voz_1 = require("./api/preview-voz");
 const registro_voz_1 = require("./api/registro-voz");
 const transferencias_1 = require("./api/transferencias");
 const llamada_1 = require("./pipeline/llamada");
+const webhook_1 = require("./telnyx/webhook");
+const firma_1 = require("./telnyx/firma");
+const eventos_1 = require("./telnyx/eventos");
 const app = (0, express_1.default)();
-app.use(express_1.default.json());
+// `rawBody` lo necesita la firma ed25519 de Telnyx (se firma el cuerpo EXACTO
+// que mandaron; re-serializar el JSON la rompería). Para el resto de las rutas
+// no cambia nada: req.body sigue siendo el JSON ya parseado.
+app.use(express_1.default.json({
+    verify: (req, _res, buf) => {
+        req.rawBody = buf;
+    },
+}));
 app.use(express_1.default.urlencoded({ extended: true }));
 // CORS — permitir que el panel de Odin llame al voice server (preview de voz).
 // Permitimos *.vercel.app y xambee.com (con/sin www).
@@ -152,6 +162,10 @@ async function reportarTransferencia(transferencia, duracionSegundos, estado) {
     }
     console.error(`[TRANSFER] AGOTÓ reintentos — tramo humano de ${transferencia.callSid} sin cobrar`);
 }
+// ═══ Telnyx (segundo proveedor, en paralelo a Twilio) ═══
+// Avisos de Call Control de los números de Telnyx. La firma ed25519 la valida
+// el handler; aquí no lleva `requerirFirmaTwilio` porque no viene de Twilio.
+app.post("/telnyx/webhook", (0, webhook_1.crearWebhookTelnyx)(reportarTransferencia));
 // API para Odin (server-to-server → requieren secreto compartido)
 app.post("/api/configurar", requireSecret, configurar_1.configurarNegocio);
 app.get("/api/estado/:negocioId", requireSecret, configurar_1.obtenerEstado);
@@ -163,7 +177,22 @@ app.get("/api/preview-voz", preview_voz_1.previewVoz);
 // ═══ WebSocket Server ═══
 const server = (0, http_1.createServer)(app);
 const wss = new ws_1.WebSocketServer({ noServer: true });
+const wssTelnyx = new ws_1.WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
+    // Audio de Telnyx: /ws-telnyx?ccid=…&t=…  El token es un HMAC del
+    // call_control_id con nuestro secreto (lo pusimos nosotros en la URL al
+    // contestar), así que nadie más puede abrir un stream contra OpenAI.
+    if ((req.url || "").startsWith("/ws-telnyx")) {
+        const q = new URL(req.url || "", "http://local").searchParams;
+        const ccid = q.get("ccid") || "";
+        if (!(0, firma_1.tokenStreamValido)(ccid, q.get("t"))) {
+            socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+            return;
+        }
+        req.ccidTelnyx = ccid;
+        wssTelnyx.handleUpgrade(req, socket, head, (ws) => wssTelnyx.emit("connection", ws, req));
+        return;
+    }
     if (req.url !== "/ws") {
         socket.destroy();
         return;
@@ -225,6 +254,63 @@ wss.on("connection", (ws) => {
         console.error("[WS] Error:", err);
     });
 });
+// ═══ WebSocket de audio de Telnyx ═══
+// Mismo PipelineLlamada que Twilio, con proveedor "telnyx": cambia solo cómo
+// se mandan los frames y cómo se cuelga/transfiere. El contexto (número,
+// llamante, sucursal de desvío) viene en el client_state que pusimos al contestar.
+wssTelnyx.on("connection", (ws, req) => {
+    console.log("[WS-TELNYX] Nueva conexión de audio de Telnyx");
+    const ccidUrl = req.ccidTelnyx || "";
+    let pipeline = null;
+    let ccid = "";
+    ws.on("message", async (data) => {
+        try {
+            const mensaje = JSON.parse(data.toString());
+            if (mensaje.event === "connected")
+                return;
+            if (mensaje.event === "start") {
+                if (pipeline)
+                    return;
+                const st = mensaje.start || {};
+                ccid = String(st.call_control_id || "");
+                // El token se firmó para UNA llamada: el stream debe ser de esa misma.
+                if (!ccid || ccid !== ccidUrl) {
+                    console.error(`[WS-TELNYX] call_control_id del stream (${ccid || "?"}) no coincide con el token — se cierra`);
+                    ws.close();
+                    return;
+                }
+                const estado = (0, eventos_1.decodificarEstado)(st.client_state);
+                const datos = estado?.k === "in" ? estado : null;
+                const numero = datos?.n || (0, eventos_1.normalizarE164)(st.to);
+                const callerNumber = datos ? datos.c : (0, eventos_1.numeroLlamante)(st.from);
+                const forwardedFrom = datos?.f || "";
+                console.log(`[WS-TELNYX] Llamada ${ccid} → numero: ${numero || "?"}, caller: ${callerNumber || "desconocido"}${forwardedFrom ? `, forwardedFrom: ${forwardedFrom}` : ""}`);
+                pipeline = new llamada_1.PipelineLlamada(ws, "", (0, configurar_1.obtenerConfig)("default"), callerNumber, numero, ccid, forwardedFrom, "telnyx");
+                pipeline.recibirMensajeTelnyx(mensaje);
+                await pipeline.iniciar();
+                return;
+            }
+            if (mensaje.event === "error") {
+                console.error("[WS-TELNYX] Error de Telnyx en el stream:", JSON.stringify(mensaje.payload || mensaje).slice(0, 300));
+                return;
+            }
+            if (pipeline)
+                pipeline.recibirMensajeTelnyx(mensaje);
+        }
+        catch (err) {
+            console.error("[WS-TELNYX] Error procesando mensaje:", err);
+        }
+    });
+    ws.on("close", () => {
+        console.log(`[WS-TELNYX] Conexión cerrada — ${ccid || "sin llamada"}`);
+        pipeline?.finalizarPorCierreDeSocket();
+    });
+    ws.on("error", (err) => console.error("[WS-TELNYX] Error:", err));
+});
+setInterval(webhook_1.purgarContestosViejos, 60 * 60 * 1000);
+if (config_1.config.telnyxApiKey && !config_1.config.telnyxPublicKey) {
+    console.error("⚠️  [CONFIG] Hay TELNYX_API_KEY pero falta TELNYX_PUBLIC_KEY — las llamadas de Telnyx se rechazarán (no se puede verificar la firma)");
+}
 // ═══ Warmup periódico de Vercel ═══
 // Cada 4 minutos hacemos un ping al endpoint de config para mantener la
 // función serverless caliente. Sin esto, una llamada que entra después de

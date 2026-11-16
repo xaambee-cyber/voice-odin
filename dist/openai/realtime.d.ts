@@ -36,6 +36,10 @@ export declare class OpenAIRealtime {
     private resultadoPendiente;
     private esperaInterrumpida;
     private respuestaTimer;
+    private finHablaMs;
+    private transcripcionMs;
+    private pedidoMs;
+    private latencias;
     /** Esperamos brevemente el transcript para poder anotar AM/PM antes de responder. */
     private esperandoTranscripcionHasta;
     /** Última hora explícita: red determinista para los argumentos de funciones. */
@@ -51,6 +55,17 @@ export declare class OpenAIRealtime {
     private alResolverFuncion;
     private intentarHablarResultado;
     private crearRespuesta;
+    private registrarLatencia;
+    /** Mediana, promedio y máximo de los turnos de la llamada (ms). */
+    resumenLatencia(): {
+        turnos: number;
+        medianaMs: number | null;
+        promedioMs: number | null;
+        maximaMs: number | null;
+        esperaMedianaMs: number | null;
+        modeloMedianaMs: number | null;
+        modeloTranscripcion: string;
+    };
     private cancelarDebounceRespuesta;
     private programarRespuestaUsuario;
     private intentarRespuestaUsuarioProgramada;

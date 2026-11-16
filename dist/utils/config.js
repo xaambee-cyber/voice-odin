@@ -12,6 +12,13 @@ exports.config = {
     twilioAccountSid: process.env.TWILIO_ACCOUNT_SID || "",
     twilioAuthToken: process.env.TWILIO_AUTH_TOKEN || "",
     twilioPhoneNumber: process.env.TWILIO_PHONE_NUMBER || "",
+    // Telnyx (segundo proveedor de telefonía, en paralelo a Twilio). Un número de
+    // Telnyx manda sus llamadas a /telnyx/webhook (Call Control); los de Twilio
+    // siguen entrando por /twiml exactamente igual que siempre.
+    //   TELNYX_API_KEY     llave v2 de la cuenta (contestar, colgar, transferir).
+    //   TELNYX_PUBLIC_KEY  llave PÚBLICA ed25519 de la cuenta: verifica cada aviso.
+    telnyxApiKey: process.env.TELNYX_API_KEY || "",
+    telnyxPublicKey: process.env.TELNYX_PUBLIC_KEY || "",
     // Deepgram
     deepgramApiKey: process.env.DEEPGRAM_API_KEY || "",
     // Claude

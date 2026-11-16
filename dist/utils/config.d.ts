@@ -2,6 +2,8 @@ export declare const config: {
     twilioAccountSid: string;
     twilioAuthToken: string;
     twilioPhoneNumber: string;
+    telnyxApiKey: string;
+    telnyxPublicKey: string;
     deepgramApiKey: string;
     anthropicApiKey: string;
     openaiApiKey: string;

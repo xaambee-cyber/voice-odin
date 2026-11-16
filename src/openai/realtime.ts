@@ -104,6 +104,14 @@ const VAD_EAGERNESS = (["low", "medium", "high", "auto"].includes(process.env.VO
   ? process.env.VOZ_VAD_EAGERNESS
   : "medium") as "low" | "medium" | "high" | "auto";
 
+// Modelo que transcribe al cliente. Importa para la LATENCIA: tras cada turno el
+// agente espera esa transcripción (hasta 1.2 s, ver speech_stopped) para poder
+// insertar la anotación de horas AM/PM antes de responder. whisper-1 entrega el
+// texto de golpe al final; "gpt-4o-mini-transcribe" suele terminar antes y
+// cuesta la mitad. Se deja por env para probarlo sin tocar código: el default
+// sigue siendo el de siempre.
+const MODELO_TRANSCRIPCION = process.env.VOZ_TRANSCRIPCION_MODELO || "whisper-1";
+
 // Auto-sanación anti-mudez: si `respondiendo` se queda atorado en true (un
 // response.done perdido tras una cancelación), el agente quedaría CALLADO para
 // siempre. Si al ir a responder llevamos más de este tiempo sin actividad real
@@ -159,6 +167,15 @@ export class OpenAIRealtime {
   // Debounce para agrupar la entrada del cliente en una sola respuesta. Se
   // reinicia cada vez que el cliente (re)empieza a hablar.
   private respuestaTimer: ReturnType<typeof setTimeout> | null = null;
+  // ── LATENCIA por turno (solo se mide, no cambia el comportamiento) ───────
+  // Desde que el cliente deja de hablar (speech_stopped) hasta que sale el
+  // primer audio del agente, partido en: cuánto esperamos NOSOTROS antes de
+  // pedir la respuesta (debounce + transcripción) y cuánto tarda el MODELO.
+  // Sin esto no se puede comparar proveedor, VAD o modelo con números.
+  private finHablaMs: number | null = null;
+  private transcripcionMs: number | null = null;
+  private pedidoMs: number | null = null;
+  private latencias: { totalMs: number; esperaMs: number; modeloMs: number; transcripcionMs: number | null }[] = [];
   /** Esperamos brevemente el transcript para poder anotar AM/PM antes de responder. */
   private esperandoTranscripcionHasta: number = 0;
   /** Última hora explícita: red determinista para los argumentos de funciones. */
@@ -269,7 +286,7 @@ export class OpenAIRealtime {
       audio: {
         input: {
           format: FORMATO_AUDIO_TWILIO,
-          transcription: { model: "whisper-1", language: "es" },
+          transcription: { model: MODELO_TRANSCRIPCION, language: "es" },
           turn_detection: {
             type: "semantic_vad",
             // eagerness configurable (default "medium"): "low" causaba esperas
@@ -387,6 +404,7 @@ export class OpenAIRealtime {
       case "response.output_audio.delta":
       case "response.audio.delta": // backward compat por si alterna
         this.ultimaActividadRespuesta = Date.now();
+        if (msg.delta && this.finHablaMs != null && this.pedidoMs != null) this.registrarLatencia();
         if (msg.delta && this.onAudioDelta) {
           this.onAudioDelta(msg.delta);
         }
@@ -402,6 +420,7 @@ export class OpenAIRealtime {
         break;
 
       case "conversation.item.input_audio_transcription.completed":
+        if (this.finHablaMs != null && this.transcripcionMs == null) this.transcripcionMs = Date.now();
         this.esperandoTranscripcionHasta = 0;
         if (msg.transcript && this.ws && this.conectado) {
           const hora = ultimaHoraExplicita(msg.transcript);
@@ -453,6 +472,10 @@ export class OpenAIRealtime {
         // El cliente terminó (por ahora). Espera un poco por si sigue hablando y
         // recién entonces responde UNA sola vez con todo lo que dijo.
         this.esperandoTranscripcionHasta = Date.now() + 1200;
+        // Si el cliente habló en varios fragmentos, cuenta desde el ÚLTIMO.
+        this.finHablaMs = Date.now();
+        this.transcripcionMs = null;
+        this.pedidoMs = null;
         this.programarRespuestaUsuario();
         break;
 
@@ -651,7 +674,50 @@ export class OpenAIRealtime {
     // Va a hablar: la espera silenciosa (tecleo) termina aquí SIEMPRE.
     this.onEspera?.(false);
     this.respondiendo = true;
+    if (this.finHablaMs != null && this.pedidoMs == null) this.pedidoMs = Date.now();
     this.ws.send(JSON.stringify({ type: "response.create" }));
+  }
+
+  private registrarLatencia() {
+    const ahora = Date.now();
+    const fin = this.finHablaMs!;
+    const pedido = this.pedidoMs!;
+    const fila = {
+      totalMs: ahora - fin,
+      esperaMs: pedido - fin,
+      modeloMs: ahora - pedido,
+      transcripcionMs: this.transcripcionMs != null ? this.transcripcionMs - fin : null,
+    };
+    this.latencias.push(fila);
+    this.finHablaMs = null;
+    this.transcripcionMs = null;
+    this.pedidoMs = null;
+    console.log(
+      `[LATENCIA] turno ${this.latencias.length}: ${fila.totalMs} ms ` +
+        `(espera nuestra ${fila.esperaMs} ms` +
+        `${fila.transcripcionMs != null ? ` · transcripción ${fila.transcripcionMs} ms` : ""}` +
+        ` · modelo hasta primer audio ${fila.modeloMs} ms)`,
+    );
+  }
+
+  /** Mediana, promedio y máximo de los turnos de la llamada (ms). */
+  resumenLatencia() {
+    const mediana = (xs: number[]) => {
+      if (xs.length === 0) return null;
+      const o = [...xs].sort((a, b) => a - b);
+      const m = Math.floor(o.length / 2);
+      return o.length % 2 ? o[m] : Math.round((o[m - 1] + o[m]) / 2);
+    };
+    const total = this.latencias.map((l) => l.totalMs);
+    return {
+      turnos: this.latencias.length,
+      medianaMs: mediana(total),
+      promedioMs: total.length ? Math.round(total.reduce((a, b) => a + b, 0) / total.length) : null,
+      maximaMs: total.length ? Math.max(...total) : null,
+      esperaMedianaMs: mediana(this.latencias.map((l) => l.esperaMs)),
+      modeloMedianaMs: mediana(this.latencias.map((l) => l.modeloMs)),
+      modeloTranscripcion: MODELO_TRANSCRIPCION,
+    };
   }
 
   private cancelarDebounceRespuesta() {
