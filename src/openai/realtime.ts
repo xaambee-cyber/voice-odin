@@ -91,11 +91,11 @@ const PROTEGER_FRASE_MS = 4000;
 // agente responda. Sirve para AGRUPAR varios fragmentos cortos ("ok"… "ok"…) en
 // una sola respuesta en vez de contestar a cada uno. Cada vez que el cliente
 // (re)empieza a hablar, este temporizador se reinicia.
-// 250ms (antes 450, y antes 600): el VAD semántico YA decide fin-de-turno por
-// contenido; este debounce es solo el colchón anti-fragmentos y cada ms de aquí
+// 150ms (antes 450, y antes 600): el detector YA esperó su silencio para cerrar
+// el turno; este debounce es solo el colchón anti-fragmentos y cada ms de aquí
 // es latencia pura que el cliente oye (nov-2026: la meta es ~1 s por turno).
 // Override: VOZ_DEBOUNCE_MS.
-const DEBOUNCE_RESPUESTA_MS = Number(process.env.VOZ_DEBOUNCE_MS) || 250;
+const DEBOUNCE_RESPUESTA_MS = Number(process.env.VOZ_DEBOUNCE_MS) || 150;
 
 // Cuánto esperamos COMO MÁXIMO la transcripción del cliente antes de pedir la
 // respuesta. Se espera para insertar la anotación de horas AM/PM (fix de
@@ -104,7 +104,9 @@ const DEBOUNCE_RESPUESTA_MS = Number(process.env.VOZ_DEBOUNCE_MS) || 250;
 // si no llega a tiempo, se responde igual y la anotación entra en cuanto
 // llegue (sirve para la confirmación, que es cuando se agenda).
 // Override: VOZ_ESPERA_TRANSCRIPCION_MS.
-const ESPERA_TRANSCRIPCION_MS = Number(process.env.VOZ_ESPERA_TRANSCRIPCION_MS) || 500;
+// 300 ms: en la primera llamada con 500, la espera nuestra midió 467 ms de
+// mediana — casi siempre se agotaba el techo.
+const ESPERA_TRANSCRIPCION_MS = Number(process.env.VOZ_ESPERA_TRANSCRIPCION_MS) || 300;
 
 // Eagerness del VAD semántico: qué tan rápido decide que el cliente terminó.
 // "low" era MUY conservador → esperas variables de 1-3s según cómo sonara la
@@ -122,6 +124,16 @@ const VAD_EAGERNESS = (["low", "medium", "high", "auto"].includes(process.env.VO
 // cuesta la mitad. Default desde nov-2026: el rápido. Para volver al de antes,
 // VOZ_TRANSCRIPCION_MODELO=whisper-1.
 const MODELO_TRANSCRIPCION = process.env.VOZ_TRANSCRIPCION_MODELO || "gpt-4o-mini-transcribe";
+
+// Tipo de detector de fin de turno: "server_vad" (por silencio, default desde
+// nov-2026) o "semantic_vad" (VOZ_VAD=semantico). Con el de silencio:
+//   VOZ_VAD_SILENCIO_MS  cuánto silencio cierra el turno (default 500).
+//   VOZ_VAD_UMBRAL       sensibilidad 0-1 al ruido de fondo (default 0.55: un
+//                        poco más alto que 0.5 porque la línea telefónica mete
+//                        ruido y no queremos que un golpe cuente como habla).
+const VAD_TIPO = (process.env.VOZ_VAD || "").toLowerCase().startsWith("sem") ? "semantic_vad" : "server_vad";
+const VAD_SILENCIO_MS = Number(process.env.VOZ_VAD_SILENCIO_MS) || 500;
+const VAD_UMBRAL = Math.min(0.95, Math.max(0.2, Number(process.env.VOZ_VAD_UMBRAL) || 0.55));
 
 // Auto-sanación anti-mudez: si `respondiendo` se queda atorado en true (un
 // response.done perdido tras una cancelación), el agente quedaría CALLADO para
@@ -304,13 +316,22 @@ export class OpenAIRealtime {
           format: FORMATO_AUDIO_TWILIO,
           transcription: { model: MODELO_TRANSCRIPCION, language: "es" },
           turn_detection: {
-            type: "semantic_vad",
-            // eagerness configurable (default "medium"): "low" causaba esperas
-            // de 1-3s VARIABLES según cómo sonara la frase del cliente — la
-            // principal causa de latencia inconsistente. Las interrupciones
-            // falsas del agente las siguen conteniendo graceUntil + los guards
-            // de speech_started, no el eagerness.
-            eagerness: VAD_EAGERNESS,
+            // Detector de fin de turno. Desde nov-2026 por SILENCIO (server_vad):
+            // las llamadas de prueba con el semántico medían 1.5 s de mediana
+            // DESPUÉS de que decidía, pero el cliente sentía 5-6 s, porque el
+            // semántico esperaba segundos cuando la frase le parecía incompleta
+            // ("OK, OK, OK", "No, no, no"). Por silencio la espera es fija y
+            // predecible. VOZ_VAD=semantico vuelve al anterior (con
+            // VOZ_VAD_EAGERNESS). Las interrupciones falsas las siguen
+            // conteniendo graceUntil + los guards de speech_started.
+            ...(VAD_TIPO === "server_vad"
+              ? {
+                  type: "server_vad" as const,
+                  threshold: VAD_UMBRAL,
+                  prefix_padding_ms: 300,
+                  silence_duration_ms: VAD_SILENCIO_MS,
+                }
+              : { type: "semantic_vad" as const, eagerness: VAD_EAGERNESS }),
             // create_response:false → NOSOTROS creamos la respuesta, no OpenAI.
             // Así agrupamos TODO lo que el cliente dijo (aunque lo diga en varios
             // fragmentos cortos como "ok"… "ok"…) en UNA sola respuesta, en vez de
