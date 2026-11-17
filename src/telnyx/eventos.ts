@@ -93,10 +93,15 @@ export const TARIFA_TELNYX_MX_USD = {
   streaming: 0.0035,
 } as const;
 
-export function costoTelefoniaTelnyxUsd(segundos: number, tipo: "local" | "movil" = "local"): number {
+export function costoTelefoniaTelnyxUsd(
+  segundos: number,
+  tipo: "local" | "movil" = "local",
+  /** false con el motor de Telnyx (Conversation Relay): no hay stream de audio nuestro. */
+  conStreaming = true,
+): number {
   const minutos = Math.ceil(Math.max(0, segundos) / 60);
   const entrada = tipo === "movil" ? TARIFA_TELNYX_MX_USD.entradaMovil : TARIFA_TELNYX_MX_USD.entradaLocal;
-  const porMinuto = entrada + TARIFA_TELNYX_MX_USD.voiceApi + TARIFA_TELNYX_MX_USD.streaming;
+  const porMinuto = entrada + TARIFA_TELNYX_MX_USD.voiceApi + (conStreaming ? TARIFA_TELNYX_MX_USD.streaming : 0);
   return Number((minutos * porMinuto).toFixed(6));
 }
 
@@ -108,7 +113,13 @@ export function costoTelefoniaTelnyxUsd(segundos: number, tipo: "local" | "movil
  * apagados, rechazamos SIN contestar (ocupado, sin costo). Sin saldo sí se
  * contesta, para decirle al cliente que no podemos atenderlo — igual que Twilio.
  */
-export type GateLlamada = { bloqueado?: boolean; motivo?: string } | null;
+export type GateLlamada = {
+  bloqueado?: boolean;
+  motivo?: string;
+  /** Voz elegida en el panel. Si es de Telnyx ("Telnyx.Ultra.…"), se contesta con su motor. */
+  voz?: string;
+  velocidadVoz?: number | null;
+} | null;
 
 export function debeRechazarSinContestar(gate: GateLlamada): boolean {
   if (!gate?.bloqueado) return false;

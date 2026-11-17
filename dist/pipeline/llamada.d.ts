@@ -1,5 +1,6 @@
 import WebSocket from "ws";
 import { HerramientaVoz } from "../openai/realtime";
+import type { TipoMotor } from "../voz/motor";
 /** Quién lleva la llamada. Twilio es el de siempre; Telnyx corre en paralelo. */
 export type ProveedorTelefonia = "twilio" | "telnyx";
 interface CampoAgenda {
@@ -207,9 +208,19 @@ export declare function buildSystemPrompt(cfg: ConfigNegocio, contextoExtra?: {
     esRebote?: boolean;
 }): string;
 export declare function esSinCreditoOpenAI(texto: unknown): boolean;
+/** Opciones de la llamada que no vienen del proveedor. */
+export interface OpcionesLlamada {
+    /** "relay" = motor de Telnyx (sus voces + Claude). Default: OpenAI Realtime. */
+    motor?: TipoMotor;
+    /** Llamada de prueba que el dueño lanzó desde el panel. */
+    prueba?: boolean;
+}
 export declare class PipelineLlamada {
     private ws;
+    /** Quien escucha, piensa y habla (OpenAI Realtime o el motor de Telnyx). */
     private realtime;
+    private motor;
+    private esPrueba;
     private streamSid;
     private callSid;
     private configNegocio;
@@ -234,7 +245,9 @@ export declare class PipelineLlamada {
     private ambienteTimer;
     private ambienteIdx;
     private proveedor;
-    constructor(ws: WebSocket, negocioId: string, configNegocio: ConfigNegocio, callerNumber?: string, numeroTwilio?: string, callSid?: string, forwardedFrom?: string, proveedor?: ProveedorTelefonia);
+    constructor(ws: WebSocket, negocioId: string, configNegocio: ConfigNegocio, callerNumber?: string, numeroTwilio?: string, callSid?: string, forwardedFrom?: string, proveedor?: ProveedorTelefonia, opciones?: OpcionesLlamada);
+    /** Frames del WebSocket de Conversation Relay (prompt, interrupt, dtmf…). */
+    recibirFrameRelay(mensaje: any): void;
     private calcularContextoSucursal;
     private esTranscripcionValida;
     private colgarTwilioCall;

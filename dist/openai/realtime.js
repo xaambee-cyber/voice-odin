@@ -3,7 +3,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.OpenAIRealtime = void 0;
+exports.OpenAIRealtime = exports.FUNCIONES_CON_ESPERA = void 0;
+exports.fraseEspera = fraseEspera;
 const ws_1 = __importDefault(require("ws"));
 const config_1 = require("../utils/config");
 const normalizar_hora_1 = require("../utils/normalizar-hora");
@@ -40,7 +41,7 @@ const PRECIOS_REALTIME_USD_POR_1M = {
 // transferencia cronometrada que una frase de espera descuadraría) ni
 // registrar_pregunta (se llama en casi cada pregunta sin respuesta; un filler
 // ahí haría sentir lento al agente en la conversación normal).
-const FUNCIONES_CON_ESPERA = new Set([
+exports.FUNCIONES_CON_ESPERA = new Set([
     "consultar_disponibilidad",
     "agendar_cita",
     "cancelar_cita",
@@ -558,7 +559,7 @@ class OpenAIRealtime {
                     // Si la función tira a la red (puede tardar), prepárate para decir la
                     // frase de espera cuando termine de emitirse el function_call. Reset del
                     // estado para arrancar limpio en cada función.
-                    if (FUNCIONES_CON_ESPERA.has(nombreFn)) {
+                    if (exports.FUNCIONES_CON_ESPERA.has(nombreFn)) {
                         this.funcionLentaPendiente = nombreFn;
                         this.funcionLentaArgs = null;
                         this.resultadoPendiente = null;
@@ -843,7 +844,13 @@ class OpenAIRealtime {
     }
     // Desglose de tokens + costo, para el log de fin de llamada y diagnóstico.
     resumenUso() {
-        return { ...this.uso, costoUsd: this.costoUsdOpenAI() };
+        // Si OpenAI generó audio, el agente habló: hubo servicio y Odin cobra.
+        return {
+            ...this.uso,
+            modelo: this.modeloActivo,
+            costoUsd: this.costoUsdOpenAI(),
+            huboContacto: this.uso.audioOut > 0,
+        };
     }
     cerrar() {
         this.cancelarDebounceRespuesta();

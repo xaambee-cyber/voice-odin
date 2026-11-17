@@ -6,6 +6,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.verificarFirmaTelnyx = verificarFirmaTelnyx;
 exports.tokenStream = tokenStream;
 exports.tokenStreamValido = tokenStreamValido;
+exports.firmarSaliente = firmarSaliente;
+exports.leerSaliente = leerSaliente;
 const crypto_1 = __importDefault(require("crypto"));
 const config_1 = require("../utils/config");
 // ═══════════════════════════════════════════════════════════════════════════
@@ -81,5 +83,25 @@ function tokenStreamValido(callControlId, token, secreto = secretoStream()) {
     const esperado = Buffer.from(tokenStream(callControlId, secreto));
     const recibido = Buffer.from(token);
     return esperado.length === recibido.length && crypto_1.default.timingSafeEqual(esperado, recibido);
+}
+const VIDA_SALIENTE_MS = 10 * 60_000;
+function firmarSaliente(datos, ahoraMs = Date.now(), secreto = secretoStream()) {
+    const pr = Buffer.from(JSON.stringify({ n: datos.n, c: datos.c, e: ahoraMs + VIDA_SALIENTE_MS, x: crypto_1.default.randomBytes(6).toString("hex") }), "utf8").toString("base64url");
+    return { pr, t: tokenStream(`pr:${pr}`, secreto) };
+}
+function leerSaliente(pr, t, ahoraMs = Date.now(), secreto = secretoStream()) {
+    if (!pr || !tokenStreamValido(`pr:${pr}`, t, secreto))
+        return null;
+    try {
+        const d = JSON.parse(Buffer.from(pr, "base64url").toString("utf8"));
+        if (typeof d?.n !== "string" || typeof d?.c !== "string" || typeof d?.e !== "number")
+            return null;
+        if (d.e < ahoraMs)
+            return null;
+        return { n: d.n, c: d.c };
+    }
+    catch {
+        return null;
+    }
 }
 //# sourceMappingURL=firma.js.map

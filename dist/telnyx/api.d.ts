@@ -17,6 +17,32 @@ export declare function contestar(callControlId: string, opts: {
     streamUrl: string;
     clientState: string;
 }): Promise<ResultadoComando>;
+/**
+ * Contesta con el motor de voz de TELNYX (Conversation Relay): Telnyx
+ * transcribe y habla con sus voces; a nosotros solo nos llega texto por el
+ * WebSocket de `relay.url`. No se abre el stream de audio de OpenAI.
+ */
+export declare function contestarConRelay(callControlId: string, opts: {
+    relay: Record<string, unknown>;
+    clientState: string;
+}): Promise<ResultadoComando>;
+/** Termina Conversation Relay en la llamada (Telnyx cierra nuestro WebSocket). */
+export declare function detenerRelay(callControlId: string): Promise<ResultadoComando>;
+/**
+ * Llamada SALIENTE (la de prueba del panel). `stream` o `relay` deciden el
+ * motor igual que al contestar una entrante; los dos arrancan solos cuando la
+ * persona contesta. `time_limit_secs` corta la llamada pase lo que pase.
+ */
+export declare function marcar(opts: {
+    connectionId: string;
+    to: string;
+    from: string;
+    timeLimitSecs: number;
+    streamUrl?: string;
+    relay?: Record<string, unknown>;
+}): Promise<ResultadoComando & {
+    callControlId?: string;
+}>;
 /** Rechaza SIN contestar: el cliente oye ocupado y no se cobra la llamada. */
 export declare function rechazar(callControlId: string): Promise<ResultadoComando>;
 export declare function colgar(callControlId: string): Promise<ResultadoComando>;

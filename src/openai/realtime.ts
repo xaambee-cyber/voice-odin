@@ -1,5 +1,6 @@
 import WebSocket from "ws";
 import { config } from "../utils/config";
+import type { MotorVoz, ResumenLatencia, UsoMotor } from "../voz/motor";
 import {
   anotacionHorariaParaAgente,
   esAnotacionHoraria,
@@ -52,7 +53,7 @@ const PRECIOS_REALTIME_USD_POR_1M = {
 // transferencia cronometrada que una frase de espera descuadraría) ni
 // registrar_pregunta (se llama en casi cada pregunta sin respuesta; un filler
 // ahí haría sentir lento al agente en la conversación normal).
-const FUNCIONES_CON_ESPERA = new Set<string>([
+export const FUNCIONES_CON_ESPERA = new Set<string>([
   "consultar_disponibilidad",
   "agendar_cita",
   "cancelar_cita",
@@ -64,7 +65,7 @@ const FUNCIONES_CON_ESPERA = new Set<string>([
 // con su propia voz Realtime (sin corte de voz). Cortas a propósito: entre menos
 // audio suene, menos riesgo de que el eco/ruido la corte o se encime con el
 // mensaje real.
-function fraseEspera(nombre: string, args: any): string {
+export function fraseEspera(nombre: string, args: any): string {
   switch (nombre) {
     case "consultar_disponibilidad":
     case "agendar_cita":
@@ -141,7 +142,7 @@ const VAD_UMBRAL = Math.min(0.95, Math.max(0.2, Number(process.env.VOZ_VAD_UMBRA
 // de respuesta (created/delta/done), asumimos flag rancio y respondemos igual.
 const RESPUESTA_RANCIA_MS = 6000;
 
-export class OpenAIRealtime {
+export class OpenAIRealtime implements MotorVoz {
   private ws: WebSocket | null = null;
   private onAudioDelta: ((base64Audio: string) => void) | null = null;
   private onTranscript: ((texto: string, role: "user" | "assistant", itemId?: string) => void) | null = null;
@@ -742,7 +743,7 @@ export class OpenAIRealtime {
   }
 
   /** Mediana, promedio y máximo de los turnos de la llamada (ms). */
-  resumenLatencia() {
+  resumenLatencia(): ResumenLatencia {
     const mediana = (xs: number[]) => {
       if (xs.length === 0) return null;
       const o = [...xs].sort((a, b) => a - b);
@@ -896,8 +897,14 @@ export class OpenAIRealtime {
   }
 
   // Desglose de tokens + costo, para el log de fin de llamada y diagnóstico.
-  resumenUso() {
-    return { ...this.uso, costoUsd: this.costoUsdOpenAI() };
+  resumenUso(): UsoMotor {
+    // Si OpenAI generó audio, el agente habló: hubo servicio y Odin cobra.
+    return {
+      ...this.uso,
+      modelo: this.modeloActivo,
+      costoUsd: this.costoUsdOpenAI(),
+      huboContacto: this.uso.audioOut > 0,
+    };
   }
 
   cerrar() {

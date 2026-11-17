@@ -9,6 +9,9 @@ import { REGLA_NORMALIZACION_HORARIA } from "../utils/normalizar-hora";
 import * as telnyxApi from "../telnyx/api";
 import { despedirYColgar } from "../telnyx/webhook";
 import { codificarEstado, costoTelefoniaTelnyxUsd } from "../telnyx/eventos";
+import { MotorRelayTelnyx } from "../telnyx/relay";
+import { costoRelayUsd, vozParaOpenAI } from "../telnyx/relay-config";
+import type { MotorVoz, TipoMotor } from "../voz/motor";
 
 /** Quién lleva la llamada. Twilio es el de siempre; Telnyx corre en paralelo. */
 export type ProveedorTelefonia = "twilio" | "telnyx";
@@ -1495,9 +1498,20 @@ function respuestaHorarioOcupado(data: {
   return out;
 }
 
+/** Opciones de la llamada que no vienen del proveedor. */
+export interface OpcionesLlamada {
+  /** "relay" = motor de Telnyx (sus voces + Claude). Default: OpenAI Realtime. */
+  motor?: TipoMotor;
+  /** Llamada de prueba que el dueño lanzó desde el panel. */
+  prueba?: boolean;
+}
+
 export class PipelineLlamada {
   private ws: WebSocket;
-  private realtime: OpenAIRealtime;
+  /** Quien escucha, piensa y habla (OpenAI Realtime o el motor de Telnyx). */
+  private realtime: MotorVoz;
+  private motor: TipoMotor;
+  private esPrueba: boolean;
   private streamSid: string = "";
   private callSid: string;
   private configNegocio: ConfigNegocio;
@@ -1556,8 +1570,12 @@ export class PipelineLlamada {
     callSid: string = "",
     forwardedFrom: string = "",
     proveedor: ProveedorTelefonia = "twilio",
+    opciones: OpcionesLlamada = {},
   ) {
     this.proveedor = proveedor;
+    // El motor de Telnyx solo existe en líneas de Telnyx (es su Conversation Relay).
+    this.motor = opciones.motor === "relay" && proveedor === "telnyx" ? "relay" : "openai";
+    this.esPrueba = opciones.prueba === true;
     this.ws = ws;
     this.negocioId = negocioId;
     this.numeroTwilio = numeroTwilio;
@@ -1567,9 +1585,21 @@ export class PipelineLlamada {
     this.forwardedFrom = forwardedFrom;
     this.inicioLlamada = Date.now();
 
-    const prompt = buildSystemPrompt(configNegocio);
-    const herramientas = construirHerramientas(configNegocio);
-    this.realtime = new OpenAIRealtime(prompt, herramientas, configNegocio.voz || "marin");
+    if (this.motor === "relay") {
+      // El WebSocket ES el de Telnyx: por él llega el texto del cliente y sale
+      // el del agente. Prompt y herramientas se le dan en iniciar(), con la
+      // configuración real del negocio.
+      this.realtime = new MotorRelayTelnyx(ws);
+    } else {
+      const prompt = buildSystemPrompt(configNegocio);
+      const herramientas = construirHerramientas(configNegocio);
+      this.realtime = new OpenAIRealtime(prompt, herramientas, vozParaOpenAI(configNegocio.voz));
+    }
+  }
+
+  /** Frames del WebSocket de Conversation Relay (prompt, interrupt, dtmf…). */
+  recibirFrameRelay(mensaje: any) {
+    if (this.realtime instanceof MotorRelayTelnyx) this.realtime.recibirFrame(mensaje);
   }
 
   // Después de que llega la config completa, calculamos:
@@ -1677,6 +1707,10 @@ export class PipelineLlamada {
     }
     if (this.proveedor === "telnyx") {
       // Mismo aviso, misma voz (Polly.Mia); cuelga al terminar de hablarlo.
+      // Con el motor de Telnyx, cerrar el WebSocket termina el relay; se le da
+      // un respiro para que Telnyx lo suelte antes de hablar (una llamada solo
+      // admite una cosa hablando a la vez).
+      if (this.motor === "relay") await new Promise((r) => setTimeout(r, 600));
       await despedirYColgar(this.callSid);
       return;
     }
@@ -2131,7 +2165,12 @@ export class PipelineLlamada {
             const ccidSnapshot = this.callSid;
             const negocioIdSnapshot = negocioId;
             const destino = transferTo;
-            console.log(`[FUNCIÓN] escalar_humano: programando transfer (Telnyx) → ${destino} en 3500ms (from=${this.numeroTwilio || "?"})`);
+            // Con el motor de Telnyx la frase "te paso con un asesor" se genera
+            // DESPUÉS de este resultado (Claude escribe → Telnyx la dice): 5 s
+            // para que alcance a sonar completa antes del timbre.
+            const esRelay = this.realtime instanceof MotorRelayTelnyx;
+            const retrasoMs = esRelay ? 5000 : 3500;
+            console.log(`[FUNCIÓN] escalar_humano: programando transfer (Telnyx${esRelay ? ", motor Telnyx" : ""}) → ${destino} en ${retrasoMs}ms (from=${this.numeroTwilio || "?"})`);
             setTimeout(async () => {
               registrarTransferencia({
                 callSid: ccidSnapshot,
@@ -2152,9 +2191,17 @@ export class PipelineLlamada {
                 return;
               }
               console.log(`[FUNCIÓN] escalar_humano: Telnyx transfiriendo → ${destino}`);
-              const parar = await telnyxApi.detenerStream(ccidSnapshot);
-              if (!parar.ok) console.warn("[FUNCIÓN] escalar_humano: no se pudo cortar el audio hacia la IA:", parar.error);
-            }, 3500);
+              // La IA sale de la línea: con el motor de Telnyx se detiene el
+              // relay (si no, seguiría escuchando la plática con el humano); con
+              // el de OpenAI, el stream de audio.
+              const parar = esRelay
+                ? await telnyxApi.detenerRelay(ccidSnapshot)
+                : await telnyxApi.detenerStream(ccidSnapshot);
+              if (!parar.ok) {
+                console.warn("[FUNCIÓN] escalar_humano: no se pudo cortar la IA de la línea:", parar.error);
+                if (esRelay) this.realtime.cerrar();
+              }
+            }, retrasoMs);
             return { ok: true, mensaje: "Perfecto, te paso con un asesor. Un momento, no cuelgues." };
           }
 
@@ -2385,9 +2432,17 @@ export class PipelineLlamada {
         }
 
         case "colgar_llamada": {
-          // Esperar ~2s para que termine de hablar la despedida antes de colgar.
-          // El modelo ya emitió la frase de despedida antes de invocar la función.
-          setTimeout(() => { this.colgarTwilioCall(); }, 2000);
+          // Esperar a que termine de hablar la despedida antes de colgar. El
+          // modelo ya la emitió antes de invocar la función.
+          //  - OpenAI: ~2 s (el audio ya va en el búfer del proveedor).
+          //  - Telnyx: la voz se genera DESPUÉS del texto, así que se espera lo
+          //    que le falte por decir (estimado por caracteres) + un margen.
+          let esperaMs = 2000;
+          if (this.realtime instanceof MotorRelayTelnyx) {
+            this.realtime.marcarColgado();
+            esperaMs = Math.min(9000, this.realtime.msHablaPendiente() + 900);
+          }
+          setTimeout(() => { this.colgarTwilioCall(); }, esperaMs);
           return { ok: true, mensaje: "Hasta luego." };
         }
 
@@ -2494,7 +2549,9 @@ export class PipelineLlamada {
 
   // ── Tecleo de espera ──────────────────────────────────────────────────────
   private iniciarTecleo() {
-    if (this.tecleoTimer || !TECLEO_ACTIVO) return;
+    // Con el motor de Telnyx no hay audio nuestro en la línea: la espera la
+    // cubre la frase hablada.
+    if (this.tecleoTimer || !TECLEO_ACTIVO || this.motor === "relay") return;
     // Arranca en un punto aleatorio del loop para que dos esperas seguidas
     // no suenen idénticas.
     this.tecleoIdx = Math.floor(Math.random() * FRAMES_TECLEO.length);
@@ -2551,7 +2608,7 @@ export class PipelineLlamada {
 
   // ── Room tone (opt-in) ────────────────────────────────────────────────────
   private iniciarAmbiente() {
-    if (!AMBIENTE_ACTIVO || this.ambienteTimer) return;
+    if (!AMBIENTE_ACTIVO || this.ambienteTimer || this.motor === "relay") return;
     this.ambienteTimer = setInterval(() => {
       // El tecleo manda: cuando suena, el ambiente se pausa (ya trae su aire).
       if (this.tecleoTimer) return;
@@ -2651,6 +2708,7 @@ export class PipelineLlamada {
     this.configNegocio = { ...this.configNegocio, ...configActual };
     const vozRegistrada = this.numeroTwilio ? obtenerVozPorNumero(this.numeroTwilio) : null;
     if (vozRegistrada) this.configNegocio.voz = vozRegistrada;
+    if (this.esPrueba && !this.nombreCliente) this.nombreCliente = "Llamada de prueba";
     this.calcularContextoSucursal();
 
     const prompt = buildSystemPrompt(this.configNegocio, {
@@ -2664,14 +2722,16 @@ export class PipelineLlamada {
     } catch (err) {
       const motivo = err instanceof Error ? err.message : String(err);
       reportarSiSinCredito(motivo);
-      await this.atenderSinAgente(`OpenAI no conectó: ${motivo}`);
+      await this.atenderSinAgente(`${this.motor === "relay" ? "Claude" : "OpenAI"} no conectó: ${motivo}`);
       return;
     }
 
     if (this.finalizada || this.ws.readyState !== WebSocket.OPEN) return;
-    const voz = this.configNegocio.voz || "marin";
+    // La voz del motor de Telnyx ya quedó puesta al contestar (va en el relay);
+    // el de OpenAI solo entiende sus propias voces.
+    const voz = this.motor === "relay" ? String(this.configNegocio.voz || "") : vozParaOpenAI(this.configNegocio.voz);
     this.realtime.configurarSesion(prompt, tools, voz, this.configNegocio.velocidadVoz);
-    console.log(`[PIPELINE] Saludo con memoria + voz=${voz} — ${this.configNegocio.nombreNegocio}`);
+    console.log(`[PIPELINE] Saludo con memoria + motor=${this.motor} voz=${voz} — ${this.configNegocio.nombreNegocio}${this.esPrueba ? " (LLAMADA DE PRUEBA)" : ""}`);
   }
 
   recibirMensajeTwilio(mensaje: any) {
@@ -2840,7 +2900,10 @@ export class PipelineLlamada {
     // minuto de Twilio se registra aparte (es infra, no proveedor de IA).
     const usoVoz = this.realtime.resumenUso();
     const minutos = duracionSegundos / 60;
-    const costoWhisper = minutos * 0.4 * 0.006;
+    const esRelay = this.motor === "relay";
+    // whisper solo existe en el motor de OpenAI; con el de Telnyx, transcribir
+    // es parte de su cobro por minuto (va en telefonía).
+    const costoWhisper = esRelay ? 0 : minutos * 0.4 * 0.006;
     const costoUsd = Number((usoVoz.costoUsd + costoWhisper).toFixed(6));
     // Twilio entrante MX ($0.0100/min) redondeado al minuto, que es como Twilio
     // factura de verdad. Una llamada de 8 s cuesta el minuto completo — por eso
@@ -2848,15 +2911,20 @@ export class PipelineLlamada {
     // Con Telnyx: entrada local + Voice API + streaming (lib telnyx/eventos),
     // con el mismo redondeo al minuto. Viaja en el mismo campo: es "lo que
     // costó la telefonía", sea del proveedor que sea.
+    // Con el motor de Telnyx se suma lo de Conversation Relay (plataforma,
+    // reconocimiento y la voz Ultra por carácter) y no hay stream de audio.
     const costoTwilioAprox = this.proveedor === "telnyx"
-      ? costoTelefoniaTelnyxUsd(duracionSegundos)
+      ? Number((
+          costoTelefoniaTelnyxUsd(duracionSegundos, "local", !esRelay) +
+          (esRelay ? costoRelayUsd(duracionSegundos, usoVoz.caracteresTts || 0) : 0)
+        ).toFixed(6))
       : Number((Math.ceil(minutos) * 0.01).toFixed(6));
 
-    // ¿El agente alcanzó a hablar? Si OpenAI generó audio, hubo servicio. Si no
-    // (sesión murió antes del saludo, TwiML de fallback), Odin no cobra.
-    const huboContacto = usoVoz.audioOut > 0;
+    // ¿El agente alcanzó a hablar? Si generó voz, hubo servicio. Si no (sesión
+    // murió antes del saludo, TwiML de fallback), Odin no cobra.
+    const huboContacto = usoVoz.huboContacto;
     console.log(
-      `[PIPELINE] Costo voz — OpenAI $${costoUsd} (realtime $${usoVoz.costoUsd.toFixed(6)} + whisper $${costoWhisper.toFixed(6)}) · Twilio ~$${costoTwilioAprox} · tokens`,
+      `[PIPELINE] Costo voz (${this.motor}) — IA $${costoUsd} (${usoVoz.modelo || "?"} $${usoVoz.costoUsd.toFixed(6)}${esRelay ? "" : ` + whisper $${costoWhisper.toFixed(6)}`}) · telefonía ~$${costoTwilioAprox} · tokens`,
       usoVoz,
     );
 
@@ -2892,6 +2960,10 @@ export class PipelineLlamada {
       costoOpenaiUsd: costoUsd,
       costoTwilioUsd: costoTwilioAprox,
       proveedorTelefonia: this.proveedor,
+      motorVoz: this.motor,
+      modeloIa: usoVoz.modelo || null,
+      caracteresTts: usoVoz.caracteresTts ?? null,
+      esPrueba: this.esPrueba,
       latencia,
       tokensEntrada: usoVoz.audioIn + usoVoz.textIn,
       tokensSalida: usoVoz.audioOut + usoVoz.textOut,

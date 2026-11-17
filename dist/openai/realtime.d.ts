@@ -1,10 +1,13 @@
+import type { MotorVoz, ResumenLatencia, UsoMotor } from "../voz/motor";
 export interface HerramientaVoz {
     type: "function";
     name: string;
     description: string;
     parameters: any;
 }
-export declare class OpenAIRealtime {
+export declare const FUNCIONES_CON_ESPERA: Set<string>;
+export declare function fraseEspera(nombre: string, args: any): string;
+export declare class OpenAIRealtime implements MotorVoz {
     private ws;
     private onAudioDelta;
     private onTranscript;
@@ -58,15 +61,7 @@ export declare class OpenAIRealtime {
     private crearRespuesta;
     private registrarLatencia;
     /** Mediana, promedio y máximo de los turnos de la llamada (ms). */
-    resumenLatencia(): {
-        turnos: number;
-        medianaMs: number | null;
-        promedioMs: number | null;
-        maximaMs: number | null;
-        esperaMedianaMs: number | null;
-        modeloMedianaMs: number | null;
-        modeloTranscripcion: string;
-    };
+    resumenLatencia(): ResumenLatencia;
     private cancelarDebounceRespuesta;
     private programarRespuestaUsuario;
     private intentarRespuestaUsuarioProgramada;
@@ -89,15 +84,7 @@ export declare class OpenAIRealtime {
     setOnErrorOpenAI(callback: (detalle: string) => void): void;
     private acumularUso;
     costoUsdOpenAI(): number;
-    resumenUso(): {
-        costoUsd: number;
-        audioIn: number;
-        textIn: number;
-        cachedAudioIn: number;
-        cachedTextIn: number;
-        audioOut: number;
-        textOut: number;
-    };
+    resumenUso(): UsoMotor;
     cerrar(): void;
     get estaConectado(): boolean;
 }

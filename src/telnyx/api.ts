@@ -74,6 +74,79 @@ export function contestar(
   });
 }
 
+/**
+ * Contesta con el motor de voz de TELNYX (Conversation Relay): Telnyx
+ * transcribe y habla con sus voces; a nosotros solo nos llega texto por el
+ * WebSocket de `relay.url`. No se abre el stream de audio de OpenAI.
+ */
+export function contestarConRelay(
+  callControlId: string,
+  opts: { relay: Record<string, unknown>; clientState: string },
+): Promise<ResultadoComando> {
+  return comando(callControlId, "answer", {
+    conversation_relay_config: opts.relay,
+    client_state: opts.clientState,
+    // Distinto del `answer` normal: si Telnyx rechaza el relay, el plan B
+    // (contestar con el stream de OpenAI) no puede chocar con este command_id.
+    command_id: `answer-relay-${callControlId}`,
+  });
+}
+
+/** Termina Conversation Relay en la llamada (Telnyx cierra nuestro WebSocket). */
+export function detenerRelay(callControlId: string): Promise<ResultadoComando> {
+  return comando(callControlId, "conversation_relay_stop", { command_id: `relay-stop-${callControlId}` });
+}
+
+/**
+ * Llamada SALIENTE (la de prueba del panel). `stream` o `relay` deciden el
+ * motor igual que al contestar una entrante; los dos arrancan solos cuando la
+ * persona contesta. `time_limit_secs` corta la llamada pase lo que pase.
+ */
+export async function marcar(opts: {
+  connectionId: string;
+  to: string;
+  from: string;
+  timeLimitSecs: number;
+  streamUrl?: string;
+  relay?: Record<string, unknown>;
+}): Promise<ResultadoComando & { callControlId?: string }> {
+  if (!config.telnyxApiKey) return { ok: false, status: 0, error: "Falta TELNYX_API_KEY" };
+  const cuerpo: Record<string, unknown> = {
+    connection_id: opts.connectionId,
+    to: opts.to,
+    from: opts.from,
+    timeout_secs: 30,
+    time_limit_secs: opts.timeLimitSecs,
+  };
+  if (opts.relay) cuerpo.conversation_relay_config = opts.relay;
+  else if (opts.streamUrl) {
+    Object.assign(cuerpo, {
+      stream_url: opts.streamUrl,
+      stream_track: "inbound_track",
+      stream_codec: "PCMU",
+      stream_bidirectional_mode: "rtp",
+      stream_bidirectional_codec: "PCMU",
+    });
+  }
+  try {
+    const r = await fetch(`${BASE}/calls`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.telnyxApiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(cuerpo),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const json = (await r.json().catch(() => null)) as { data?: { call_control_id?: string } } | null;
+    if (!r.ok) return { ok: false, status: r.status, error: resumenError(json) || `HTTP ${r.status}` };
+    return { ok: true, status: r.status, callControlId: json?.data?.call_control_id };
+  } catch (e) {
+    return { ok: false, status: 0, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 /** Rechaza SIN contestar: el cliente oye ocupado y no se cobra la llamada. */
 export function rechazar(callControlId: string): Promise<ResultadoComando> {
   return comando(callControlId, "reject", { cause: "USER_BUSY", command_id: `reject-${callControlId}` });

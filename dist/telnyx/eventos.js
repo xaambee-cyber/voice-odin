@@ -92,10 +92,12 @@ exports.TARIFA_TELNYX_MX_USD = {
     voiceApi: 0.002,
     streaming: 0.0035,
 };
-function costoTelefoniaTelnyxUsd(segundos, tipo = "local") {
+function costoTelefoniaTelnyxUsd(segundos, tipo = "local", 
+/** false con el motor de Telnyx (Conversation Relay): no hay stream de audio nuestro. */
+conStreaming = true) {
     const minutos = Math.ceil(Math.max(0, segundos) / 60);
     const entrada = tipo === "movil" ? exports.TARIFA_TELNYX_MX_USD.entradaMovil : exports.TARIFA_TELNYX_MX_USD.entradaLocal;
-    const porMinuto = entrada + exports.TARIFA_TELNYX_MX_USD.voiceApi + exports.TARIFA_TELNYX_MX_USD.streaming;
+    const porMinuto = entrada + exports.TARIFA_TELNYX_MX_USD.voiceApi + (conStreaming ? exports.TARIFA_TELNYX_MX_USD.streaming : 0);
     return Number((minutos * porMinuto).toFixed(6));
 }
 function debeRechazarSinContestar(gate) {

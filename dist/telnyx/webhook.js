@@ -34,6 +34,9 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.urlStreamTelnyx = urlStreamTelnyx;
+exports.urlRelayTelnyx = urlRelayTelnyx;
+exports.urlSalienteTelnyx = urlSalienteTelnyx;
+exports.parametrosRelay = parametrosRelay;
 exports.despedirYColgar = despedirYColgar;
 exports.purgarContestosViejos = purgarContestosViejos;
 exports.crearWebhookTelnyx = crearWebhookTelnyx;
@@ -41,6 +44,7 @@ const config_1 = require("../utils/config");
 const transferencias_1 = require("../api/transferencias");
 const telnyx = __importStar(require("./api"));
 const firma_1 = require("./firma");
+const relay_config_1 = require("./relay-config");
 const eventos_1 = require("./eventos");
 // ═══════════════════════════════════════════════════════════════════════════
 // POST /telnyx/webhook — el "/twiml" de Telnyx.
@@ -69,6 +73,26 @@ function urlStreamTelnyx(callControlId) {
     const base = (0, config_1.urlPublicaHttps)().replace(/^https:/, "wss:");
     const q = new URLSearchParams({ ccid: callControlId, t: (0, firma_1.tokenStream)(callControlId) });
     return `${base}/ws-telnyx?${q.toString()}`;
+}
+/** Ruta del WebSocket del motor de Telnyx (Conversation Relay), con el mismo token. */
+function urlRelayTelnyx(callControlId) {
+    const base = (0, config_1.urlPublicaHttps)().replace(/^https:/, "wss:");
+    const q = new URLSearchParams({ ccid: callControlId, t: (0, firma_1.tokenStream)(callControlId) });
+    return `${base}/relay-telnyx?${q.toString()}`;
+}
+/** Igual, para una llamada saliente (de prueba): firma número y destino en vez del ccid. */
+function urlSalienteTelnyx(ruta, firmado) {
+    const base = (0, config_1.urlPublicaHttps)().replace(/^https:/, "wss:");
+    return `${base}/${ruta}?${new URLSearchParams(firmado).toString()}`;
+}
+/** Lo que el pipeline necesita saber de la llamada, en `custom_parameters` del relay. */
+function parametrosRelay(datos) {
+    return {
+        n: datos.n,
+        c: datos.c,
+        f: datos.f || "",
+        ...(datos.prueba ? { prueba: "1" } : {}),
+    };
 }
 const DESPEDIDA = "Lo sentimos, en este momento no podemos atender su llamada. Por favor intente de nuevo en unos minutos o escríbanos por WhatsApp.";
 /** Despide con voz y cuelga al terminar; si Telnyx no puede hablar, cuelga ya. */
@@ -117,10 +141,28 @@ async function atenderEntrante(p) {
         console.log(`[TELNYX] ${numero}: ${gate?.motivo} → rechazada sin contestar${r.ok ? "" : ` (fallo: ${r.error})`}`);
         return;
     }
-    const r = await telnyx.contestar(ccid, {
-        streamUrl: urlStreamTelnyx(ccid),
-        clientState: (0, eventos_1.codificarEstado)({ k: "in", n: numero, c: caller, f: forwardedFrom }),
-    });
+    const clientState = (0, eventos_1.codificarEstado)({ k: "in", n: numero, c: caller, f: forwardedFrom });
+    // Voz de Telnyx elegida en el panel → motor de Telnyx (sus voces premium y su
+    // reconocimiento; Claude piensa). Cualquier otra → el motor de OpenAI de
+    // siempre. Si Odin no contestó el gate, también el de siempre: es el que
+    // sabe arreglárselas sin saber nada de antemano.
+    if ((0, relay_config_1.esVozTelnyx)(gate?.voz)) {
+        const relay = (0, relay_config_1.configRelay)({
+            url: urlRelayTelnyx(ccid),
+            voz: gate.voz,
+            velocidad: gate?.velocidadVoz,
+            parametros: parametrosRelay({ n: numero, c: caller, f: forwardedFrom }),
+        });
+        const r = await telnyx.contestarConRelay(ccid, { relay, clientState });
+        if (r.ok) {
+            console.log(`[TELNYX] ${numero}: contestada con el motor de Telnyx (voz ${gate.voz})`);
+            return;
+        }
+        // Si Telnyx rechaza la configuración del relay (voz que ya no existe, etc.)
+        // la llamada NO se pierde: se contesta con el motor de siempre.
+        console.error(`[TELNYX] Relay rechazado para ${ccid} (${r.error}) — se contesta con el motor de OpenAI`);
+    }
+    const r = await telnyx.contestar(ccid, { streamUrl: urlStreamTelnyx(ccid), clientState });
     if (!r.ok)
         console.error(`[TELNYX] No se pudo contestar ${ccid}: ${r.error}`);
 }
@@ -176,6 +218,12 @@ async function procesarEvento(evento, alTerminarTransferencia) {
         case "call.speak.ended": {
             if (estado?.k === "colgar")
                 await telnyx.colgar(ccid);
+            return;
+        }
+        case "call.conversation.ended": {
+            // Fin del motor de Telnyx. Si fue porque NOSOTROS cerramos (fin normal,
+            // transferencia, despedida), no hay nada que hacer: el pipeline ya cerró.
+            console.log(`[TELNYX] Relay terminado en ${ccid}: ${String(p?.reason || "?")}`);
             return;
         }
         case "streaming.failed": {

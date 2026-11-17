@@ -1,0 +1,123 @@
+import Anthropic from "@anthropic-ai/sdk";
+import WebSocket from "ws";
+import { type HerramientaVoz } from "../openai/realtime";
+import { type MotorVoz, type ResumenLatencia, type UsoMotor } from "../voz/motor";
+/**
+ * Modelo que piensa. Haiku 5.5 por la meta de ~1 s por turno: es el de menor
+ * tiempo al primer token y en una llamada cada décima de segundo se oye.
+ * Para probar otro sin tocar código: VOZ_RELAY_MODELO=claude-sonnet-5-5.
+ */
+export declare const MODELO_RELAY: string;
+export declare function costoClaudeUsd(modelo: string, uso: {
+    entrada: number;
+    salida: number;
+    cacheLeido: number;
+    cacheEscrito: number;
+}): number;
+/**
+ * Parámetros de razonamiento por modelo. En una llamada no hay tiempo para
+ * "pensar" antes de hablar: se apaga donde se puede y el esfuerzo va bajo
+ * (respuestas cortas, menos preámbulo). Cada familia lo acepta distinto:
+ *  - Haiku 5.5: `disabled` se acepta con esfuerzo high o menor.
+ *  - Sonnet 5.5: `disabled` da 400; lo equivalente es `between_tools`.
+ *  - Opus 5.5: no se puede apagar; solo se baja el esfuerzo.
+ *  - Haiku 4.5 / Sonnet 4.6: sin `thinking` no piensa; no aceptan `effort`… salvo Sonnet 4.6.
+ */
+export declare function parametrosRazonamiento(modelo: string, pensar?: boolean): Record<string, unknown>;
+/** Las herramientas del motor de OpenAI, en el formato de Claude (mismo esquema JSON). */
+export declare function herramientasClaude(tools: HerramientaVoz[]): Anthropic.Tool[];
+/**
+ * El prompt del negocio partido en dos bloques para el caché: lo estable
+ * (reglas, catálogo, horarios) y el contexto de ESTA llamada (fecha, citas de
+ * quien llama). El primero se reutiliza entre llamadas del mismo negocio.
+ * Las reglas de voz van AL FINAL, después del contexto: es lo último que lee el
+ * modelo antes de hablar y donde más pesan (son cortas; no importa que no se
+ * reutilicen entre llamadas).
+ */
+export declare function bloquesSistema(prompt: string): Anthropic.TextBlockParam[];
+export declare class MotorRelayTelnyx implements MotorVoz {
+    private ws;
+    private cliente;
+    private sistema;
+    private herramientas;
+    private mensajes;
+    private cadena;
+    private contador;
+    private turnoVivo;
+    private cerrado;
+    private saludoPedido;
+    private errores;
+    private colgarPedido;
+    /** Telnyx acepta `token: ""` para cerrar el turno; si algún día no, se manda " ". */
+    private tokenVacioOk;
+    /** Cuándo termina (aprox.) de hablar la voz lo que ya le mandamos. */
+    private finHablaMs;
+    private horaExplicita;
+    private teclas;
+    private teclasTimer;
+    private uso;
+    private latencias;
+    private aprovechados;
+    private descartados;
+    private onTranscript;
+    private onItemCreated;
+    private onInterrupcion;
+    private onFunctionCall;
+    private onCaida;
+    private onErrorModelo;
+    /** `cliente` solo se inyecta en pruebas (un Claude falso que no cuesta). */
+    constructor(ws: WebSocket, opciones?: {
+        cliente?: Anthropic;
+    });
+    setOnAudioDelta(): void;
+    setOnEspera(): void;
+    setOnTranscript(cb: (texto: string, role: "user" | "assistant", itemId?: string) => void): void;
+    setOnItemCreated(cb: (itemId: string) => void): void;
+    setOnInterrupcion(cb: () => void): void;
+    setOnFunctionCall(cb: (name: string, args: any, callId: string) => Promise<any>): void;
+    setOnCaida(cb: (motivo: string) => void): void;
+    setOnErrorOpenAI(cb: (detalle: string) => void): void;
+    abrirConexion(): Promise<void>;
+    configurarSesion(prompt: string, tools?: HerramientaVoz[]): void;
+    enviarAudio(): void;
+    cancelarRespuesta(): void;
+    cerrar(): void;
+    resumenUso(): UsoMotor;
+    resumenLatencia(): ResumenLatencia;
+    /** Cuánto le falta (aprox.) a la voz para terminar lo que ya se le mandó. */
+    msHablaPendiente(): number;
+    /** Decir un texto fijo (despedida) fuera de la conversación del modelo. */
+    decir(texto: string): void;
+    /** El modelo pidió colgar: no se encadena otra respuesta después. */
+    marcarColgado(): void;
+    /** Un frame del WebSocket de Telnyx (el `setup` ya lo consumió index.ts). */
+    recibirFrame(msg: any): void;
+    private alFinTemprano;
+    private alReanudar;
+    private alTextoFinal;
+    private alInterrumpir;
+    private alTecla;
+    private iniciarTurno;
+    /** El texto final confirmó lo que ya estábamos preparando: se suelta. */
+    private confirmar;
+    private descartar;
+    private abortar;
+    /** Mete al historial lo que dijo el cliente (una sola vez por turno). */
+    private comprometerUsuario;
+    /** Agrega al historial; dos del mismo rol seguidos se funden en uno. */
+    private agregarMensaje;
+    private recortarUltimaRespuesta;
+    private correrTurno;
+    private ejecutar;
+    private alFallarModelo;
+    /** Abortado a media respuesta: el historial guarda lo que sí se alcanzó a decir. */
+    private cerrarAbortado;
+    private escribir;
+    private enviarTexto;
+    private cerrarTexto;
+    private registrarLatencia;
+    private contarUso;
+    /** Una respuesta abortada también se cobra: lo que alcanzó a leer y escribir. */
+    private contarUsoParcial;
+}
+//# sourceMappingURL=relay.d.ts.map

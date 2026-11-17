@@ -83,3 +83,42 @@ export function tokenStreamValido(
   const recibido = Buffer.from(token);
   return esperado.length === recibido.length && crypto.timingSafeEqual(esperado, recibido);
 }
+
+// ── Llamada SALIENTE (la de prueba desde el panel) ──────────────────────────
+// Al marcar todavía no existe el call_control_id, así que el token no puede
+// firmarlo. Firmamos lo que el pipeline necesita (número del negocio y a quién
+// se llama) con caducidad: nadie puede abrir un agente contra otro número ni
+// reusar la URL después.
+
+export type DatosSaliente = { n: string; c: string };
+
+const VIDA_SALIENTE_MS = 10 * 60_000;
+
+export function firmarSaliente(
+  datos: DatosSaliente,
+  ahoraMs = Date.now(),
+  secreto = secretoStream(),
+): { pr: string; t: string } {
+  const pr = Buffer.from(
+    JSON.stringify({ n: datos.n, c: datos.c, e: ahoraMs + VIDA_SALIENTE_MS, x: crypto.randomBytes(6).toString("hex") }),
+    "utf8",
+  ).toString("base64url");
+  return { pr, t: tokenStream(`pr:${pr}`, secreto) };
+}
+
+export function leerSaliente(
+  pr: string | null | undefined,
+  t: string | null | undefined,
+  ahoraMs = Date.now(),
+  secreto = secretoStream(),
+): DatosSaliente | null {
+  if (!pr || !tokenStreamValido(`pr:${pr}`, t, secreto)) return null;
+  try {
+    const d = JSON.parse(Buffer.from(pr, "base64url").toString("utf8"));
+    if (typeof d?.n !== "string" || typeof d?.c !== "string" || typeof d?.e !== "number") return null;
+    if (d.e < ahoraMs) return null;
+    return { n: d.n, c: d.c };
+  } catch {
+    return null;
+  }
+}

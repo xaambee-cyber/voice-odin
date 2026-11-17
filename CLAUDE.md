@@ -84,6 +84,64 @@ nativa (Call Control), no TeXML:
 - Env nuevas: `TELNYX_API_KEY`, `TELNYX_PUBLIC_KEY`. Guía completa (portal,
   documentos, LADAs): `docs/GUIA-TELNYX-VOZ.md` en el repo de Odin.
 
+## Dos motores de voz: OpenAI Realtime y el de Telnyx (nov-2026)
+
+El **motor** es quien escucha, piensa y habla (`src/voz/motor.ts`, interfaz
+`MotorVoz`). El `PipelineLlamada` no sabe cuál tiene: las herramientas las
+ejecuta SIEMPRE `manejarFuncion`, así que agendar, cancelar, reagendar,
+reservas, pedidos, cobros, motores, operaciones del cliente, ubicación,
+escalar/transferir y colgar son **el mismo código** en los dos.
+
+- **OpenAI Realtime** (`src/openai/realtime.ts`): voz a voz con gpt-realtime.
+  Twilio siempre; Telnyx cuando la voz elegida es de OpenAI.
+- **Telnyx** (`src/telnyx/relay.ts`, `MotorRelayTelnyx`): Conversation Relay.
+  Telnyx transcribe (Deepgram **Flux multilenguaje** en español) y habla con sus
+  voces (Ultra); por `/relay-telnyx` llega TEXTO y sale texto en fragmentos.
+  Piensa **Claude** (`VOZ_RELAY_MODELO`, default `claude-haiku-5-5`: el de
+  menor tiempo al primer texto; medido 350–650 ms con el prompt real).
+- **Quién decide**: la voz. El webhook pregunta `config-llamada?soloGate=1`,
+  que ahora devuelve `voz`; si es de Telnyx (`Telnyx.Ultra.…`, `esVozTelnyx`)
+  contesta con `conversation_relay_config`, si no con el stream de siempre. Si
+  Telnyx rechaza el relay, se contesta con OpenAI (la llamada no se pierde). Una
+  voz de Telnyx en una línea de Twilio suena con Marin (`vozParaOpenAI`).
+- **Respuesta anticipada**: Flux manda `eagerEndOfTurn` antes del texto final.
+  Ahí ya se le pide la respuesta a Claude y se GUARDA; si el `prompt` final
+  coincide (`mismoTurno`) se suelta de golpe, si llega `turnResumed` o dice otra
+  cosa se tira. Las herramientas de una respuesta anticipada **no corren**
+  hasta confirmarla (agendaría algo que el cliente no terminó de pedir).
+- **Orden del historial**: el texto de un turno nuevo entra DESPUÉS de los
+  `tool_result` del turno anterior (la API exige tool_result justo tras el
+  tool_use). Por eso los turnos van en una cola (`cadena`) y una respuesta
+  anticipada solo se compromete cuando la cola llegó a ella.
+- **Diferencias que importan**: no hay tecleo ni room tone (no mandamos audio);
+  la espera la cubre `fraseEspera` hablada. Colgar espera lo que le falta a la
+  voz (`msHablaPendiente`); transferir espera 5 s (la frase se genera después
+  del resultado) y luego `conversation_relay_stop`. Despedirse sin agente:
+  cerrar el WS (termina el relay) y `speak` + colgar.
+- **Prompt**: `bloquesSistema` lo parte en lo estable (caché entre llamadas) y
+  el contexto + `REGLAS_TEXTO_A_VOZ` al FINAL (sin eso Haiku narraba sus
+  deducciones: "hoy es lunes, así que mañana es…").
+- **Costos**: IA = tokens de Claude (`costoClaudeUsd`); telefonía = Telnyx sin
+  streaming + Relay $0.05/min + STT + voz Ultra por carácter (`costoRelayUsd`,
+  conservador hasta ver una factura). Viajan en los campos de siempre, más
+  `motorVoz`, `modeloIa` y `caracteresTts`.
+- Env: `ANTHROPIC_API_KEY` (obligatoria para este motor), opcionales
+  `VOZ_RELAY_MODELO`, `VOZ_RELAY_STT` (`deepgram/nova-3` = plan B),
+  `VOZ_RELAY_EOT`, `VOZ_RELAY_EOT_TEMPRANO`, `VOZ_RELAY_PENSAR=1` (razonamiento
+  oculto, ~+400 ms), `VOZ_RELAY_IDIOMA`.
+- Pruebas: `tests/relay.test.ts` (con un Claude falso, sin red).
+
+## Llamada de prueba (`POST /api/llamada-prueba`, solo Odin)
+
+"Llamarme para probar" del panel: el agente le MARCA al dueño y corre la misma
+llamada que con un cliente (misma config, herramientas, cobro y la conversación
+entra a Odin; su número hace de "quien llama"). Telnyx: `POST /v2/calls` con el
+relay o el stream embebidos; como al marcar no hay call_control_id, el token
+firma número + destino con caducidad (`firmarSaliente`). Twilio: `calls.create`
+con el mismo `<Stream>` (+ `prueba=1`). Tope de 5 min por llamada. Quién puede
+recibirla y cuántas por hora lo decide Odin. Env: `TELNYX_VOZ_CONNECTION_ID`
+(o Odin lo manda en el body).
+
 ## El prompt se paga en cada turno
 
 La Realtime API vuelve a leer el prompt Y el esquema de las tools en cada

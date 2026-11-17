@@ -2,7 +2,8 @@ import type { Request, Response } from "express";
 import { config, urlPublicaHttps } from "../utils/config";
 import { tomarTransferencia, type TransferenciaActiva } from "../api/transferencias";
 import * as telnyx from "./api";
-import { verificarFirmaTelnyx, tokenStream } from "./firma";
+import { verificarFirmaTelnyx, tokenStream, type DatosSaliente } from "./firma";
+import { configRelay, esVozTelnyx } from "./relay-config";
 import {
   codificarEstado,
   decodificarEstado,
@@ -43,6 +44,29 @@ export function urlStreamTelnyx(callControlId: string): string {
   const base = urlPublicaHttps().replace(/^https:/, "wss:");
   const q = new URLSearchParams({ ccid: callControlId, t: tokenStream(callControlId) });
   return `${base}/ws-telnyx?${q.toString()}`;
+}
+
+/** Ruta del WebSocket del motor de Telnyx (Conversation Relay), con el mismo token. */
+export function urlRelayTelnyx(callControlId: string): string {
+  const base = urlPublicaHttps().replace(/^https:/, "wss:");
+  const q = new URLSearchParams({ ccid: callControlId, t: tokenStream(callControlId) });
+  return `${base}/relay-telnyx?${q.toString()}`;
+}
+
+/** Igual, para una llamada saliente (de prueba): firma número y destino en vez del ccid. */
+export function urlSalienteTelnyx(ruta: "ws-telnyx" | "relay-telnyx", firmado: { pr: string; t: string }): string {
+  const base = urlPublicaHttps().replace(/^https:/, "wss:");
+  return `${base}/${ruta}?${new URLSearchParams(firmado).toString()}`;
+}
+
+/** Lo que el pipeline necesita saber de la llamada, en `custom_parameters` del relay. */
+export function parametrosRelay(datos: DatosSaliente & { f?: string; prueba?: boolean }): Record<string, string> {
+  return {
+    n: datos.n,
+    c: datos.c,
+    f: datos.f || "",
+    ...(datos.prueba ? { prueba: "1" } : {}),
+  };
 }
 
 const DESPEDIDA =
@@ -97,10 +121,30 @@ async function atenderEntrante(p: any): Promise<void> {
     return;
   }
 
-  const r = await telnyx.contestar(ccid, {
-    streamUrl: urlStreamTelnyx(ccid),
-    clientState: codificarEstado({ k: "in", n: numero, c: caller, f: forwardedFrom }),
-  });
+  const clientState = codificarEstado({ k: "in", n: numero, c: caller, f: forwardedFrom });
+
+  // Voz de Telnyx elegida en el panel → motor de Telnyx (sus voces premium y su
+  // reconocimiento; Claude piensa). Cualquier otra → el motor de OpenAI de
+  // siempre. Si Odin no contestó el gate, también el de siempre: es el que
+  // sabe arreglárselas sin saber nada de antemano.
+  if (esVozTelnyx(gate?.voz)) {
+    const relay = configRelay({
+      url: urlRelayTelnyx(ccid),
+      voz: gate!.voz!,
+      velocidad: gate?.velocidadVoz,
+      parametros: parametrosRelay({ n: numero, c: caller, f: forwardedFrom }),
+    });
+    const r = await telnyx.contestarConRelay(ccid, { relay, clientState });
+    if (r.ok) {
+      console.log(`[TELNYX] ${numero}: contestada con el motor de Telnyx (voz ${gate!.voz})`);
+      return;
+    }
+    // Si Telnyx rechaza la configuración del relay (voz que ya no existe, etc.)
+    // la llamada NO se pierde: se contesta con el motor de siempre.
+    console.error(`[TELNYX] Relay rechazado para ${ccid} (${r.error}) — se contesta con el motor de OpenAI`);
+  }
+
+  const r = await telnyx.contestar(ccid, { streamUrl: urlStreamTelnyx(ccid), clientState });
   if (!r.ok) console.error(`[TELNYX] No se pudo contestar ${ccid}: ${r.error}`);
 }
 
@@ -159,6 +203,12 @@ async function procesarEvento(evento: any, alTerminarTransferencia: AlTerminarTr
     }
     case "call.speak.ended": {
       if (estado?.k === "colgar") await telnyx.colgar(ccid);
+      return;
+    }
+    case "call.conversation.ended": {
+      // Fin del motor de Telnyx. Si fue porque NOSOTROS cerramos (fin normal,
+      // transferencia, despedida), no hay nada que hacer: el pipeline ya cerró.
+      console.log(`[TELNYX] Relay terminado en ${ccid}: ${String(p?.reason || "?")}`);
       return;
     }
     case "streaming.failed": {

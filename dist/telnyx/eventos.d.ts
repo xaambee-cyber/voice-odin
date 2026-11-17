@@ -51,7 +51,9 @@ export declare const TARIFA_TELNYX_MX_USD: {
     readonly voiceApi: 0.002;
     readonly streaming: 0.0035;
 };
-export declare function costoTelefoniaTelnyxUsd(segundos: number, tipo?: "local" | "movil"): number;
+export declare function costoTelefoniaTelnyxUsd(segundos: number, tipo?: "local" | "movil", 
+/** false con el motor de Telnyx (Conversation Relay): no hay stream de audio nuestro. */
+conStreaming?: boolean): number;
 /**
  * Lo que responde `config-llamada?soloGate=1` y qué hacemos ANTES de contestar.
  * Twilio lograba "cero consumo" cambiando el webhook del número a un <Reject/>
@@ -63,6 +65,9 @@ export declare function costoTelefoniaTelnyxUsd(segundos: number, tipo?: "local"
 export type GateLlamada = {
     bloqueado?: boolean;
     motivo?: string;
+    /** Voz elegida en el panel. Si es de Telnyx ("Telnyx.Ultra.…"), se contesta con su motor. */
+    voz?: string;
+    velocidadVoz?: number | null;
 } | null;
 export declare function debeRechazarSinContestar(gate: GateLlamada): boolean;
 /** Milisegundos de una fecha ISO de Telnyx, o null. */

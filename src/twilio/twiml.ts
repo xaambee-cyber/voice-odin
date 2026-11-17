@@ -67,6 +67,28 @@ export function handleIncomingCall(req: Request, res: Response) {
   console.log(`[TWILIO] Llamada entrante → numeroTwilio: ${numeroTwilio || "?"}, negocioId(query): ${negocioId || "(ninguno, lookup por número)"}, caller: ${callerNumber || "desconocido"}${forwardedFrom ? `, forwardedFrom: ${forwardedFrom}` : ""}`);
 }
 
+/**
+ * TwiML de una llamada SALIENTE de prueba (la crea `/api/llamada-prueba` con
+ * `calls.create`). Es el mismo <Stream> de una entrante, con dos cambios: la
+ * URL de respaldo va completa (no hay webhook del cual colgar una relativa) y
+ * el parámetro `prueba` le dice al pipeline que es de prueba.
+ */
+export function twimlLlamadaSaliente(opts: { numeroTwilio: string; callerNumber: string; base: string }): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect action="${escapeXml(opts.base)}/twiml-fallback" method="POST">
+    <Stream url="${urlMediaStream()}">
+      <Parameter name="negocioId" value="" />
+      <Parameter name="numeroTwilio" value="${escapeXml(opts.numeroTwilio)}" />
+      <Parameter name="callerNumber" value="${escapeXml(opts.callerNumber)}" />
+      <Parameter name="forwardedFrom" value="" />
+      <Parameter name="prueba" value="1" />
+    </Stream>
+  </Connect>
+  <Hangup/>
+</Response>`;
+}
+
 // TwiML de fallback cuando el server no está disponible
 export function handleFallback(req: Request, res: Response) {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>

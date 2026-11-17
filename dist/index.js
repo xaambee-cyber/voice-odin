@@ -16,6 +16,7 @@ const transferencias_1 = require("./api/transferencias");
 const llamada_1 = require("./pipeline/llamada");
 const webhook_1 = require("./telnyx/webhook");
 const firma_1 = require("./telnyx/firma");
+const llamada_prueba_1 = require("./api/llamada-prueba");
 const eventos_1 = require("./telnyx/eventos");
 const app = (0, express_1.default)();
 // `rawBody` lo necesita la firma ed25519 de Telnyx (se firma el cuerpo EXACTO
@@ -171,6 +172,8 @@ app.post("/api/configurar", requireSecret, configurar_1.configurarNegocio);
 app.get("/api/estado/:negocioId", requireSecret, configurar_1.obtenerEstado);
 app.get("/api/negocios", requireSecret, configurar_1.listarNegocios);
 app.post("/api/set-voz", requireSecret, registro_voz_1.setVozHandler);
+// "Llamarme para probar" del panel: el agente le marca al dueño.
+app.post("/api/llamada-prueba", requireSecret, llamada_prueba_1.iniciarLlamadaPrueba);
 // preview-voz lo llama el browser del panel (no puede portar el secreto);
 // se protege con allowlist de voces + cache (costo acotado).
 app.get("/api/preview-voz", preview_voz_1.previewVoz);
@@ -178,19 +181,33 @@ app.get("/api/preview-voz", preview_voz_1.previewVoz);
 const server = (0, http_1.createServer)(app);
 const wss = new ws_1.WebSocketServer({ noServer: true });
 const wssTelnyx = new ws_1.WebSocketServer({ noServer: true });
+const wssRelay = new ws_1.WebSocketServer({ noServer: true });
+/**
+ * Valida el token de /ws-telnyx y /relay-telnyx. Entrantes: HMAC del
+ * call_control_id (lo pusimos nosotros al contestar). Salientes de prueba:
+ * número y destino firmados con caducidad (al marcar aún no hay ccid).
+ */
+function accesoTelnyx(url) {
+    const q = new URL(url, "http://local").searchParams;
+    const ccid = q.get("ccid") || "";
+    if (ccid)
+        return (0, firma_1.tokenStreamValido)(ccid, q.get("t")) ? { ccid } : null;
+    const saliente = (0, firma_1.leerSaliente)(q.get("pr"), q.get("t"));
+    return saliente ? { saliente } : null;
+}
 server.on("upgrade", (req, socket, head) => {
-    // Audio de Telnyx: /ws-telnyx?ccid=…&t=…  El token es un HMAC del
-    // call_control_id con nuestro secreto (lo pusimos nosotros en la URL al
-    // contestar), así que nadie más puede abrir un stream contra OpenAI.
-    if ((req.url || "").startsWith("/ws-telnyx")) {
-        const q = new URL(req.url || "", "http://local").searchParams;
-        const ccid = q.get("ccid") || "";
-        if (!(0, firma_1.tokenStreamValido)(ccid, q.get("t"))) {
+    // Audio de Telnyx (/ws-telnyx) y motor de Telnyx (/relay-telnyx). Nadie más
+    // puede abrir una sesión contra OpenAI o Claude: el token lo firmamos nosotros.
+    const pedida = req.url || "";
+    const ruta = pedida.startsWith("/ws-telnyx") ? wssTelnyx : pedida.startsWith("/relay-telnyx") ? wssRelay : null;
+    if (ruta) {
+        const acceso = accesoTelnyx(pedida);
+        if (!acceso) {
             socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
             return;
         }
-        req.ccidTelnyx = ccid;
-        wssTelnyx.handleUpgrade(req, socket, head, (ws) => wssTelnyx.emit("connection", ws, req));
+        req.accesoTelnyx = acceso;
+        ruta.handleUpgrade(req, socket, head, (ws) => ruta.emit("connection", ws, req));
         return;
     }
     if (req.url !== "/ws") {
@@ -226,9 +243,10 @@ wss.on("connection", (ws) => {
                 const numeroTwilio = String(params.numeroTwilio || "");
                 const callerNumber = String(params.callerNumber || "");
                 const forwardedFrom = String(params.forwardedFrom || "");
+                const prueba = String(params.prueba || "") === "1";
                 const configNegocio = (0, configurar_1.obtenerConfig)(negocioId || "default");
                 console.log(`[WS] Llamada ${callSid} → negocioId: ${negocioId || "(lookup)"}, numeroTwilio: ${numeroTwilio || "?"}, caller: ${callerNumber || "desconocido"}${forwardedFrom ? `, forwardedFrom: ${forwardedFrom}` : ""}`);
-                pipeline = new llamada_1.PipelineLlamada(ws, negocioId, configNegocio, callerNumber, numeroTwilio, callSid, forwardedFrom);
+                pipeline = new llamada_1.PipelineLlamada(ws, negocioId, configNegocio, callerNumber, numeroTwilio, callSid, forwardedFrom, "twilio", { prueba });
                 // Registrar el streamSid ANTES de conectar a OpenAI para que el saludo no se descarte
                 pipeline.recibirMensajeTwilio(mensaje);
                 await pipeline.iniciar();
@@ -260,7 +278,8 @@ wss.on("connection", (ws) => {
 // llamante, sucursal de desvío) viene en el client_state que pusimos al contestar.
 wssTelnyx.on("connection", (ws, req) => {
     console.log("[WS-TELNYX] Nueva conexión de audio de Telnyx");
-    const ccidUrl = req.ccidTelnyx || "";
+    const acceso = req.accesoTelnyx || {};
+    const ccidUrl = acceso.ccid || "";
     let pipeline = null;
     let ccid = "";
     ws.on("message", async (data) => {
@@ -274,18 +293,21 @@ wssTelnyx.on("connection", (ws, req) => {
                 const st = mensaje.start || {};
                 ccid = String(st.call_control_id || "");
                 // El token se firmó para UNA llamada: el stream debe ser de esa misma.
-                if (!ccid || ccid !== ccidUrl) {
+                // (Una saliente de prueba se firmó por número y destino: no hay ccid que comparar.)
+                if (!ccid || (!acceso.saliente && ccid !== ccidUrl)) {
                     console.error(`[WS-TELNYX] call_control_id del stream (${ccid || "?"}) no coincide con el token — se cierra`);
                     ws.close();
                     return;
                 }
                 const estado = (0, eventos_1.decodificarEstado)(st.client_state);
-                const datos = estado?.k === "in" ? estado : null;
+                const datos = acceso.saliente
+                    ? { n: acceso.saliente.n, c: acceso.saliente.c, f: "" }
+                    : estado?.k === "in" ? estado : null;
                 const numero = datos?.n || (0, eventos_1.normalizarE164)(st.to);
                 const callerNumber = datos ? datos.c : (0, eventos_1.numeroLlamante)(st.from);
                 const forwardedFrom = datos?.f || "";
                 console.log(`[WS-TELNYX] Llamada ${ccid} → numero: ${numero || "?"}, caller: ${callerNumber || "desconocido"}${forwardedFrom ? `, forwardedFrom: ${forwardedFrom}` : ""}`);
-                pipeline = new llamada_1.PipelineLlamada(ws, "", (0, configurar_1.obtenerConfig)("default"), callerNumber, numero, ccid, forwardedFrom, "telnyx");
+                pipeline = new llamada_1.PipelineLlamada(ws, "", (0, configurar_1.obtenerConfig)("default"), callerNumber, numero, ccid, forwardedFrom, "telnyx", { prueba: !!acceso.saliente });
                 pipeline.recibirMensajeTelnyx(mensaje);
                 await pipeline.iniciar();
                 return;
@@ -307,7 +329,54 @@ wssTelnyx.on("connection", (ws, req) => {
     });
     ws.on("error", (err) => console.error("[WS-TELNYX] Error:", err));
 });
+// ═══ Motor de voz de Telnyx (Conversation Relay) ═══
+// Telnyx contesta, transcribe y habla con sus voces; por aquí llega TEXTO. El
+// primer frame es `setup` (ids de la llamada y los custom_parameters que
+// pusimos al contestar: número, quién llama, sucursal de desvío). Después:
+// prompt / eagerEndOfTurn / turnResumed / interrupt / dtmf / error, que van al
+// motor. Mismo PipelineLlamada: mismas herramientas, mismo cobro, mismo cierre.
+wssRelay.on("connection", (ws, req) => {
+    console.log("[RELAY] Nueva sesión de Conversation Relay");
+    const acceso = req.accesoTelnyx || {};
+    let pipeline = null;
+    let ccid = "";
+    ws.on("message", async (data) => {
+        try {
+            const mensaje = JSON.parse(data.toString());
+            if (mensaje?.type === "setup") {
+                if (pipeline)
+                    return;
+                ccid = String(mensaje.callControlId || mensaje.callSid || "");
+                if (!ccid || (acceso.ccid && ccid !== acceso.ccid)) {
+                    console.error(`[RELAY] call_control_id del setup (${ccid || "?"}) no coincide con el token — se cierra`);
+                    ws.close();
+                    return;
+                }
+                const p = (mensaje.customParameters || {});
+                const numero = acceso.saliente?.n || (0, eventos_1.normalizarE164)(p.n || mensaje.to);
+                const callerNumber = acceso.saliente?.c ?? (typeof p.c === "string" ? p.c : (0, eventos_1.numeroLlamante)(mensaje.from));
+                const forwardedFrom = acceso.saliente ? "" : String(p.f || "");
+                console.log(`[RELAY] Llamada ${ccid} → numero: ${numero || "?"}, caller: ${callerNumber || "desconocido"}${forwardedFrom ? `, forwardedFrom: ${forwardedFrom}` : ""}${acceso.saliente ? " (PRUEBA)" : ""}`);
+                pipeline = new llamada_1.PipelineLlamada(ws, "", (0, configurar_1.obtenerConfig)("default"), callerNumber, numero, ccid, forwardedFrom, "telnyx", { motor: "relay", prueba: !!acceso.saliente });
+                await pipeline.iniciar();
+                return;
+            }
+            pipeline?.recibirFrameRelay(mensaje);
+        }
+        catch (err) {
+            console.error("[RELAY] Error procesando frame:", err);
+        }
+    });
+    ws.on("close", () => {
+        console.log(`[RELAY] Sesión cerrada — ${ccid || "sin llamada"}`);
+        pipeline?.finalizarPorCierreDeSocket();
+    });
+    ws.on("error", (err) => console.error("[RELAY] Error:", err));
+});
 setInterval(webhook_1.purgarContestosViejos, 60 * 60 * 1000);
+if (config_1.config.telnyxApiKey && !config_1.config.anthropicApiKey) {
+    console.error("⚠️  [CONFIG] Hay TELNYX_API_KEY pero falta ANTHROPIC_API_KEY — las líneas con voz de Telnyx no podrán pensar (se despedirán)");
+}
 if (config_1.config.telnyxApiKey && !config_1.config.telnyxPublicKey) {
     console.error("⚠️  [CONFIG] Hay TELNYX_API_KEY pero falta TELNYX_PUBLIC_KEY — las llamadas de Telnyx se rechazarán (no se puede verificar la firma)");
 }

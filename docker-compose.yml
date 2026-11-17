@@ -20,6 +20,11 @@ services:
       - VOICE_SERVER_SECRET=${VOICE_SERVER_SECRET}
       - TELNYX_API_KEY=${TELNYX_API_KEY}
       - TELNYX_PUBLIC_KEY=${TELNYX_PUBLIC_KEY}
+      # Motor de voz de Telnyx (Conversation Relay + Claude). Todas opcionales.
+      - TELNYX_VOZ_CONNECTION_ID=${TELNYX_VOZ_CONNECTION_ID:-}
+      - VOZ_RELAY_MODELO=${VOZ_RELAY_MODELO:-}
+      - VOZ_RELAY_STT=${VOZ_RELAY_STT:-}
+      - VOZ_RELAY_PENSAR=${VOZ_RELAY_PENSAR:-}
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=dokploy-network"
