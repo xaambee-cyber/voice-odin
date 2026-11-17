@@ -15,13 +15,27 @@ export declare function esVozTelnyx(voz: unknown): voz is string;
 export declare function vozParaOpenAI(voz: unknown): string;
 /** Velocidad válida para las voces Ultra (0.6–1.5). null = la de la voz. */
 export declare function velocidadTelnyx(v: unknown): number | null;
+export type AjustesRelay = {
+    velocidad: number;
+    idioma: "es" | "en" | "auto";
+    finDeTurno: "rapido" | "normal" | "paciente";
+    interrupciones: boolean;
+    reconocimiento: "flux" | "nova3";
+    cerebro: "rapido" | "listo";
+    pensar: boolean;
+    teclado: boolean;
+    palabrasClave: string[];
+};
+export declare const AJUSTES_RELAY_DEFAULT: AjustesRelay;
+export declare function normalizarAjustesRelay(raw: unknown): AjustesRelay;
 /**
- * Reconocimiento de voz. Default: Deepgram **Flux multilenguaje** en español,
- * que trae su propio detector de fin de turno y avisa ANTES del texto final
+ * Reconocimiento de voz. Default: Deepgram **Flux multilenguaje**, que trae su
+ * propio detector de fin de turno y avisa ANTES del texto final
  * ("eagerEndOfTurn") — con eso empezamos a pensar la respuesta mientras el
- * cliente termina la frase. Nova-3 queda como plan B por env (VOZ_RELAY_STT).
+ * cliente termina la frase. Nova-3 es el plan B (ajuste "reconocimiento").
+ * Las palabras clave (nombres del negocio, productos) van como `keyterms`.
  */
-export declare function configTranscripcion(modelo?: string): {
+export declare function configTranscripcion(ajustes?: AjustesRelay): {
     transcription_engine: "Deepgram";
     transcription_engine_config: Record<string, unknown>;
 };
@@ -37,6 +51,8 @@ export declare function configRelay(opts: {
     voz: string;
     velocidad?: unknown;
     parametros: ParametrosRelay;
+    /** Ajustes del panel (ya normalizados o crudos: aquí se acotan). */
+    ajustes?: unknown;
 }): Record<string, unknown>;
 export declare const TARIFA_RELAY_USD: {
     readonly relayPorMinuto: 0.05;

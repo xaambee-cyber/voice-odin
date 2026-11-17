@@ -68,6 +68,8 @@ export type GateLlamada = {
     /** Voz elegida en el panel. Si es de Telnyx ("Telnyx.Ultra.…"), se contesta con su motor. */
     voz?: string;
     velocidadVoz?: number | null;
+    /** Ajustes de la voz del panel (Empleado). Se acotan en `configRelay`. */
+    ajustes?: unknown;
 } | null;
 export declare function debeRechazarSinContestar(gate: GateLlamada): boolean;
 /** Milisegundos de una fecha ISO de Telnyx, o null. */

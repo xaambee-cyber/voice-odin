@@ -58,6 +58,7 @@ export async function iniciarLlamadaPrueba(req: Request, res: Response) {
               url: urlSalienteTelnyx("relay-telnyx", firmado),
               voz,
               velocidad: req.body?.velocidadVoz,
+              ajustes: req.body?.ajustes,
               parametros: parametrosRelay({ n: numero, c: caller, prueba: true }),
             }),
           }

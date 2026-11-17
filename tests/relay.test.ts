@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   configRelay,
   costoRelayUsd,
+  normalizarAjustesRelay,
   esVozTelnyx,
   mismoTurno,
   textoParaVoz,
@@ -13,6 +14,7 @@ import {
   bloquesSistema,
   costoClaudeUsd,
   herramientasClaude,
+  MODELO_RELAY_LISTO,
   MotorRelayTelnyx,
   parametrosRazonamiento,
 } from "../src/telnyx/relay";
@@ -326,4 +328,55 @@ test("consumo: se cobra lo que habló el agente y avisa si hubo contacto", async
   assert.equal(u.caracteresTts, "Hola, buenas tardes.".length);
   assert.ok(u.costoUsd > 0);
   assert.equal(u.cachedTextIn, 100);
+});
+
+// ── Ajustes del panel (Empleado → "Ajustes de la voz") ──────────────────────
+
+test("ajustes del panel → relay: velocidad, idioma, fin de turno, interrupciones, teclado y palabras clave", () => {
+  const c = configRelay({
+    url: "wss://x/relay-telnyx?ccid=a&t=b",
+    voz: "Telnyx.Ultra.abc",
+    parametros: { n: "+1", c: "52", f: "" },
+    ajustes: { velocidad: 1.1, idioma: "en", finDeTurno: "rapido", interrupciones: false, teclado: false, palabrasClave: ["UTEC", "Gaspar Almanza"] },
+  });
+  assert.deepEqual(c.voice_settings, { type: "telnyx", voice_speed: 1.1 });
+  assert.equal(c.language, "en");
+  assert.equal(c.interruptible, "none");
+  assert.equal(c.dtmf_detection, false);
+  const stt = c.transcription_engine_config as Record<string, unknown>;
+  assert.equal(stt.language, "en");
+  assert.equal(stt.eot_threshold, 0.6);
+  assert.equal(stt.eager_eot_threshold, 0.4);
+  assert.deepEqual(stt.keyterms, ["UTEC", "Gaspar Almanza"]);
+});
+
+test("reconocimiento Nova-3 y detección automática de idioma", () => {
+  const c = configRelay({ url: "wss://x", voz: "Telnyx.Ultra.abc", parametros: {}, ajustes: { reconocimiento: "nova3", idioma: "auto", finDeTurno: "paciente" } });
+  const stt = c.transcription_engine_config as Record<string, unknown>;
+  assert.equal(stt.transcription_model, "deepgram/nova-3");
+  assert.equal(stt.language, "auto_detect");
+  assert.equal(stt.utterance_end_ms, 1000);
+  assert.equal(c.language, "es"); // la voz habla español; el modelo contesta en el idioma del cliente
+});
+
+test("ajustes basura no rompen la llamada: todo cae a lo de fábrica", () => {
+  const a = normalizarAjustesRelay({ velocidad: 9, idioma: "fr", finDeTurno: "ya", interrupciones: "si", cerebro: "gpt", palabrasClave: ["<script>", "x", "Ok Ok"] });
+  assert.equal(a.velocidad, 1.25);
+  assert.equal(a.idioma, "es");
+  assert.equal(a.finDeTurno, "normal");
+  assert.equal(a.interrupciones, true);
+  assert.equal(a.cerebro, "rapido");
+  assert.deepEqual(a.palabrasClave, ["script", "Ok Ok"]);
+});
+
+test("cerebro 'más listo' y 'pensar' cambian el modelo y el razonamiento de la llamada", async () => {
+  const m = await motorListo([{ deltas: ["Hello!"] }]);
+  m.motor.aplicarAjustes({ cerebro: "listo", pensar: true, idioma: "en" });
+  m.motor.configurarSesion("PROMPT\n=== CONTEXTO DE ESTA LLAMADA ===\nHoy", []);
+  await esperar(30);
+  assert.equal(m.pedidos[0].model, MODELO_RELAY_LISTO);
+  assert.equal(m.pedidos[0].thinking, undefined); // pensando: adaptive (no se apaga)
+  assert.ok(JSON.stringify(m.pedidos[0].system).includes("habla SIEMPRE en inglés"));
+  assert.ok(m.pedidos[0].messages[0].content.includes("en inglés"));
+  assert.equal(m.motor.resumenUso().modelo, MODELO_RELAY_LISTO);
 });

@@ -8,10 +8,11 @@
 // mandamos texto de vuelta. Quien piensa es Claude (src/telnyx/relay.ts).
 // ═══════════════════════════════════════════════════════════════════════════
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.TARIFA_RELAY_USD = exports.VOCES_OPENAI = void 0;
+exports.TARIFA_RELAY_USD = exports.AJUSTES_RELAY_DEFAULT = exports.VOCES_OPENAI = void 0;
 exports.esVozTelnyx = esVozTelnyx;
 exports.vozParaOpenAI = vozParaOpenAI;
 exports.velocidadTelnyx = velocidadTelnyx;
+exports.normalizarAjustesRelay = normalizarAjustesRelay;
 exports.configTranscripcion = configTranscripcion;
 exports.configRelay = configRelay;
 exports.costoRelayUsd = costoRelayUsd;
@@ -46,34 +47,76 @@ function velocidadTelnyx(v) {
     const acotada = Math.min(1.5, Math.max(0.6, n));
     return Math.abs(acotada - 1) < 0.01 ? null : Number(acotada.toFixed(2));
 }
+exports.AJUSTES_RELAY_DEFAULT = {
+    velocidad: 1,
+    idioma: "es",
+    finDeTurno: "normal",
+    interrupciones: true,
+    reconocimiento: process.env.VOZ_RELAY_STT === "deepgram/nova-3" ? "nova3" : "flux",
+    cerebro: "rapido",
+    pensar: process.env.VOZ_RELAY_PENSAR === "1",
+    teclado: true,
+    palabrasClave: [],
+};
+const unoDe = (v, ok, def) => typeof v === "string" && ok.includes(v) ? v : def;
+function normalizarAjustesRelay(raw) {
+    const r = (raw && typeof raw === "object" ? raw : {});
+    const d = exports.AJUSTES_RELAY_DEFAULT;
+    const vel = Number(r.velocidad);
+    return {
+        velocidad: Number.isFinite(vel) && vel > 0 ? Math.min(1.25, Math.max(0.8, vel)) : d.velocidad,
+        idioma: unoDe(r.idioma, ["es", "en", "auto"], d.idioma),
+        finDeTurno: unoDe(r.finDeTurno, ["rapido", "normal", "paciente"], d.finDeTurno),
+        interrupciones: typeof r.interrupciones === "boolean" ? r.interrupciones : d.interrupciones,
+        reconocimiento: unoDe(r.reconocimiento, ["flux", "nova3"], d.reconocimiento),
+        cerebro: unoDe(r.cerebro, ["rapido", "listo"], d.cerebro),
+        pensar: typeof r.pensar === "boolean" ? r.pensar : d.pensar,
+        teclado: typeof r.teclado === "boolean" ? r.teclado : d.teclado,
+        palabrasClave: (Array.isArray(r.palabrasClave) ? r.palabrasClave : [])
+            .map((p) => String(p ?? "").replace(/[^\p{L}\p{N} .&'-]/gu, "").trim().slice(0, 40))
+            .filter((p) => p.length >= 2)
+            .slice(0, 20),
+    };
+}
+/** Umbrales de fin de turno de Flux: confianza para cerrar y para avisar temprano. */
+const FIN_DE_TURNO = {
+    rapido: { eot: 0.6, eager: 0.4, finMs: 450 },
+    normal: { eot: 0.7, eager: 0.5, finMs: 600 },
+    paciente: { eot: 0.8, eager: 0.6, finMs: 1000 },
+};
 /**
- * Reconocimiento de voz. Default: Deepgram **Flux multilenguaje** en español,
- * que trae su propio detector de fin de turno y avisa ANTES del texto final
+ * Reconocimiento de voz. Default: Deepgram **Flux multilenguaje**, que trae su
+ * propio detector de fin de turno y avisa ANTES del texto final
  * ("eagerEndOfTurn") — con eso empezamos a pensar la respuesta mientras el
- * cliente termina la frase. Nova-3 queda como plan B por env (VOZ_RELAY_STT).
+ * cliente termina la frase. Nova-3 es el plan B (ajuste "reconocimiento").
+ * Las palabras clave (nombres del negocio, productos) van como `keyterms`.
  */
-function configTranscripcion(modelo = process.env.VOZ_RELAY_STT || "deepgram/flux-multi") {
-    if (modelo === "deepgram/nova-3") {
+function configTranscripcion(ajustes = exports.AJUSTES_RELAY_DEFAULT) {
+    const umbral = FIN_DE_TURNO[ajustes.finDeTurno];
+    const keyterms = ajustes.palabrasClave.length ? { keyterms: ajustes.palabrasClave } : {};
+    if (ajustes.reconocimiento === "nova3") {
         return {
             transcription_engine: "Deepgram",
             transcription_engine_config: {
                 transcription_model: "deepgram/nova-3",
-                language: "es",
+                language: ajustes.idioma === "auto" ? "auto_detect" : ajustes.idioma,
                 // Nova-3 cierra el enunciado tras 1 s de silencio por default: es
-                // latencia pura que el cliente oye. 600 ms sigue sin cortar a nadie.
-                utterance_end_ms: Number(process.env.VOZ_RELAY_FIN_MS) || 600,
+                // latencia pura que el cliente oye.
+                utterance_end_ms: Number(process.env.VOZ_RELAY_FIN_MS) || umbral.finMs,
+                ...keyterms,
             },
         };
     }
-    const eot = Math.min(0.9, Math.max(0.5, Number(process.env.VOZ_RELAY_EOT) || 0.7));
-    const eager = Math.min(0.7, Math.max(0.3, Number(process.env.VOZ_RELAY_EOT_TEMPRANO) || 0.5));
+    const eot = Math.min(0.9, Math.max(0.5, Number(process.env.VOZ_RELAY_EOT) || umbral.eot));
+    const eager = Math.min(0.7, Math.max(0.3, Number(process.env.VOZ_RELAY_EOT_TEMPRANO) || umbral.eager));
     return {
         transcription_engine: "Deepgram",
         transcription_engine_config: {
             transcription_model: "deepgram/flux-multi",
-            language: "es",
+            language: ajustes.idioma,
             eot_threshold: eot,
             eager_eot_threshold: Math.min(eager, eot),
+            ...keyterms,
         },
     };
 }
@@ -84,19 +127,25 @@ function configTranscripcion(modelo = process.env.VOZ_RELAY_STT || "deepgram/flu
  * sucursal de desvío, igual que el client_state del motor de OpenAI.
  */
 function configRelay(opts) {
-    const velocidad = velocidadTelnyx(opts.velocidad);
-    const stt = configTranscripcion();
+    const ajustes = normalizarAjustesRelay(opts.ajustes);
+    const velocidad = velocidadTelnyx(opts.ajustes ? ajustes.velocidad : opts.velocidad);
+    const stt = configTranscripcion(ajustes);
+    // La voz habla en el idioma del agente; con "auto" sigue en español (el
+    // reconocimiento sí detecta y el modelo contesta en el idioma del cliente).
+    const idiomaVoz = process.env.VOZ_RELAY_IDIOMA || (ajustes.idioma === "en" ? "en" : "es");
+    // Solo la VOZ del cliente corta al agente (un tono del teclado no); con las
+    // interrupciones apagadas, el agente termina su frase siempre.
+    const interrumpe = ajustes.interrupciones ? "speech" : "none";
     return {
         url: opts.url,
         voice: opts.voz,
         tts_provider: "telnyx",
         ...(velocidad != null ? { voice_settings: { type: "telnyx", voice_speed: velocidad } } : {}),
-        language: process.env.VOZ_RELAY_IDIOMA || "es",
+        language: idiomaVoz,
         ...stt,
-        // Solo la VOZ del cliente corta al agente (un tono del teclado no).
-        interruptible: "speech",
-        interruptible_greeting: "speech",
-        dtmf_detection: true,
+        interruptible: interrumpe,
+        interruptible_greeting: interrumpe,
+        dtmf_detection: ajustes.teclado,
         custom_parameters: opts.parametros,
     };
 }

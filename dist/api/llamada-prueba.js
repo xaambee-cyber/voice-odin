@@ -92,6 +92,7 @@ async function iniciarLlamadaPrueba(req, res) {
                         url: (0, webhook_1.urlSalienteTelnyx)("relay-telnyx", firmado),
                         voz,
                         velocidad: req.body?.velocidadVoz,
+                        ajustes: req.body?.ajustes,
                         parametros: (0, webhook_1.parametrosRelay)({ n: numero, c: caller, prueba: true }),
                     }),
                 }

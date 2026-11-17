@@ -101,6 +101,8 @@ export interface ConfigNegocio {
     ubicacionUrl?: string;
     bloqueado?: boolean;
     velocidadVoz?: number;
+    /** Ajustes de la voz del panel (Empleado). Los acota `normalizarAjustesRelay`. */
+    ajustesVoz?: unknown;
     nichoActivo?: boolean;
     /** Bloque de prompt del giro (vocabulario, reglas, catálogo con IDs). */
     nichoPromptBloque?: string;
@@ -208,6 +210,8 @@ export declare function buildSystemPrompt(cfg: ConfigNegocio, contextoExtra?: {
     esRebote?: boolean;
 }): string;
 export declare function esSinCreditoOpenAI(texto: unknown): boolean;
+/** Anthropic sin crédito (motor de Telnyx: piensa Claude). */
+export declare function esSinCreditoClaude(texto: unknown): boolean;
 /** Opciones de la llamada que no vienen del proveedor. */
 export interface OpcionesLlamada {
     /** "relay" = motor de Telnyx (sus voces + Claude). Default: OpenAI Realtime. */

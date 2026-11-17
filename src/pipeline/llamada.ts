@@ -179,6 +179,8 @@ export interface ConfigNegocio {
   // Velocidad de reproducción de la voz (0.25–1.5, 1.0 default). Opcional:
   // si Odin algún día la manda en config-llamada, aquí ya se respeta.
   velocidadVoz?: number;
+  /** Ajustes de la voz del panel (Empleado). Los acota `normalizarAjustesRelay`. */
+  ajustesVoz?: unknown;
   // ── MOTOR DE NICHOS ───────────────────────────────────────────────────────
   // Odin manda estas tres desde config-llamada desde hace tiempo y este server
   // las ignoraba por completo. Consecuencia: por teléfono NO EXISTÍAN las
@@ -1247,16 +1249,22 @@ export function esSinCreditoOpenAI(texto: unknown): boolean {
 const MIN_ENTRE_REPORTES_MS = 10 * 60_000;
 let ultimoReporteSinCredito = 0;
 
+/** Anthropic sin crédito (motor de Telnyx: piensa Claude). */
+export function esSinCreditoClaude(texto: unknown): boolean {
+  return /credit balance is too low|billing_error/i.test(String(texto ?? ""));
+}
+
 function reportarSiSinCredito(detalle: string): void {
-  if (!esSinCreditoOpenAI(detalle)) return;
+  const proveedor = esSinCreditoOpenAI(detalle) ? "openai" : esSinCreditoClaude(detalle) ? "claude" : null;
+  if (!proveedor) return;
   const ahora = Date.now();
   if (ahora - ultimoReporteSinCredito < MIN_ENTRE_REPORTES_MS) return;
   ultimoReporteSinCredito = ahora;
-  console.error(`[PIPELINE] OpenAI SIN CRÉDITO — avisando al equipo: ${detalle.slice(0, 200)}`);
+  console.error(`[PIPELINE] ${proveedor === "claude" ? "Claude" : "OpenAI"} SIN CRÉDITO — avisando al equipo: ${detalle.slice(0, 200)}`);
   fetch(`${config.odinAppUrl}/api/voice/alerta-proveedor`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...odinAuth() },
-    body: JSON.stringify({ proveedor: "openai", detalle: detalle.slice(0, 1000) }),
+    body: JSON.stringify({ proveedor, detalle: detalle.slice(0, 1000) }),
     signal: AbortSignal.timeout(8000),
   }).catch((e) => {
     // Si no llegó, que el siguiente fallo lo vuelva a intentar.
@@ -2727,6 +2735,8 @@ export class PipelineLlamada {
     }
 
     if (this.finalizada || this.ws.readyState !== WebSocket.OPEN) return;
+    // Ajustes del panel (cerebro, pensar, idioma) para el motor de Telnyx.
+    if (this.realtime instanceof MotorRelayTelnyx) this.realtime.aplicarAjustes(this.configNegocio.ajustesVoz);
     // La voz del motor de Telnyx ya quedó puesta al contestar (va en el relay);
     // el de OpenAI solo entiende sus propias voces.
     const voz = this.motor === "relay" ? String(this.configNegocio.voz || "") : vozParaOpenAI(this.configNegocio.voz);

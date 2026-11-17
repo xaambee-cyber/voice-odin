@@ -151,6 +151,7 @@ async function atenderEntrante(p) {
             url: urlRelayTelnyx(ccid),
             voz: gate.voz,
             velocidad: gate?.velocidadVoz,
+            ajustes: gate?.ajustes,
             parametros: parametrosRelay({ n: numero, c: caller, f: forwardedFrom }),
         });
         const r = await telnyx.contestarConRelay(ccid, { relay, clientState });

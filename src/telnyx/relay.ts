@@ -9,7 +9,7 @@ import {
   type HoraExplicita,
 } from "../utils/normalizar-hora";
 import { mediana, type MotorVoz, type ResumenLatencia, type UsoMotor } from "../voz/motor";
-import { configTranscripcion, mismoTurno, msParaDecir, textoParaVoz } from "./relay-config";
+import { configTranscripcion, mismoTurno, msParaDecir, normalizarAjustesRelay, textoParaVoz, type AjustesRelay } from "./relay-config";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MOTOR DE VOZ DE TELNYX (Conversation Relay + Claude)
@@ -40,6 +40,9 @@ import { configTranscripcion, mismoTurno, msParaDecir, textoParaVoz } from "./re
  * Para probar otro sin tocar código: VOZ_RELAY_MODELO=claude-sonnet-5-5.
  */
 export const MODELO_RELAY = process.env.VOZ_RELAY_MODELO || "claude-haiku-5-5";
+
+/** Cerebro "más listo" del panel: mejor razonamiento, ~+0.3–0.5 s por turno. */
+export const MODELO_RELAY_LISTO = process.env.VOZ_RELAY_MODELO_LISTO || "claude-sonnet-5-5";
 
 /** USD por 1M de tokens (hoja de Anthropic, nov-2026). */
 const PRECIOS_CLAUDE: Record<string, { in: number; out: number; cacheRead: number; cacheWrite: number }> = {
@@ -124,10 +127,17 @@ Escribes texto y una voz lo dice tal cual por teléfono.
  * modelo antes de hablar y donde más pesan (son cortas; no importa que no se
  * reutilicen entre llamadas).
  */
-export function bloquesSistema(prompt: string): Anthropic.TextBlockParam[] {
+/** Regla de idioma según el ajuste del panel (las instrucciones siguen en español). */
+export function reglaIdioma(idioma: AjustesRelay["idioma"]): string {
+  if (idioma === "en") return "\n- IDIOMA: habla SIEMPRE en inglés con el cliente, aunque estas instrucciones estén en español.";
+  if (idioma === "auto") return "\n- IDIOMA: contesta en el idioma en que te hable el cliente (español o inglés) y no lo cambies sin motivo.";
+  return "";
+}
+
+export function bloquesSistema(prompt: string, idioma: AjustesRelay["idioma"] = "es"): Anthropic.TextBlockParam[] {
   const i = prompt.indexOf(MARCA_CONTEXTO);
   const estable = i >= 0 ? prompt.slice(0, i) : prompt;
-  const volatil = `${i >= 0 ? prompt.slice(i).trim() : ""}\n${REGLAS_TEXTO_A_VOZ}`.trim();
+  const volatil = `${i >= 0 ? prompt.slice(i).trim() : ""}\n${REGLAS_TEXTO_A_VOZ}${reglaIdioma(idioma)}`.trim();
   return [
     { type: "text", text: estable, cache_control: { type: "ephemeral" } },
     { type: "text", text: volatil, cache_control: { type: "ephemeral" } },
@@ -177,6 +187,10 @@ export class MotorRelayTelnyx implements MotorVoz {
   private turnoVivo: Turno | null = null;
   private cerrado = false;
   private saludoPedido = false;
+  /** Ajustes del panel para ESTA llamada (cerebro, pensar, idioma, reconocimiento). */
+  private modelo = MODELO_RELAY;
+  private pensar = process.env.VOZ_RELAY_PENSAR === "1";
+  private ajustes: AjustesRelay = normalizarAjustesRelay(null);
   private errores = 0;
   private colgarPedido = false;
   /** Telnyx acepta `token: ""` para cerrar el turno; si algún día no, se manda " ". */
@@ -225,16 +239,19 @@ export class MotorRelayTelnyx implements MotorVoz {
   }
 
   configurarSesion(prompt: string, tools: HerramientaVoz[] = []): void {
-    this.sistema = bloquesSistema(prompt);
+    this.sistema = bloquesSistema(prompt, this.ajustes.idioma);
     this.herramientas = herramientasClaude(tools);
     if (this.saludoPedido) return;
     this.saludoPedido = true;
     const estilo = ESTILOS_SALUDO[Math.floor(Math.random() * ESTILOS_SALUDO.length)];
     this.iniciarTurno(
-      `[La llamada acaba de conectarse. Saluda al cliente en español mexicano, ${estilo}. Si tus instrucciones traen un SALUDO INICIAL, transmítelo con tus palabras; si no, algo breve tipo "Hola, ¿en qué te puedo ayudar?". UNA sola oración corta y natural.]`,
+      `[La llamada acaba de conectarse. Saluda al cliente ${this.ajustes.idioma === "en" ? "en inglés" : "en español mexicano"}, ${estilo}. Si tus instrucciones traen un SALUDO INICIAL, transmítelo con tus palabras; si no, algo breve tipo "Hola, ¿en qué te puedo ayudar?". UNA sola oración corta y natural.]`,
       { interno: true },
     );
-    console.log(`[RELAY] Sesión lista — modelo ${MODELO_RELAY}, ${tools.length} herramientas, STT ${String(configTranscripcion().transcription_engine_config.transcription_model)}`);
+    console.log(
+      `[RELAY] Sesión lista — modelo ${this.modelo}${this.pensar ? " (pensando)" : ""}, ${tools.length} herramientas, ` +
+        `STT ${this.etiquetaStt()}, idioma ${this.ajustes.idioma}`,
+    );
   }
 
   enviarAudio(): void { /* El audio lo maneja Telnyx. */ }
@@ -267,8 +284,8 @@ export class MotorRelayTelnyx implements MotorVoz {
       textOut: this.uso.salida,
       cacheWrite: this.uso.cacheEscrito,
       caracteresTts: this.uso.caracteres,
-      modelo: MODELO_RELAY,
-      costoUsd: costoClaudeUsd(MODELO_RELAY, this.uso),
+      modelo: this.modelo,
+      costoUsd: costoClaudeUsd(this.modelo, this.uso),
       huboContacto: this.uso.caracteres > 0,
     };
   }
@@ -285,11 +302,27 @@ export class MotorRelayTelnyx implements MotorVoz {
       maximaMs: total.length ? Math.max(...total) : null,
       esperaMedianaMs: mediana(this.latencias.map((l) => l.esperaMs)),
       modeloMedianaMs: mediana(this.latencias.map((l) => l.modeloMs)),
-      modeloTranscripcion: `telnyx/${String(configTranscripcion().transcription_engine_config.transcription_model)}+${MODELO_RELAY}`,
+      modeloTranscripcion: `telnyx/${this.etiquetaStt()}+${this.modelo}`,
     };
   }
 
   // ── Extras del relay (los usa el pipeline) ───────────────────────────────
+
+  /**
+   * Ajustes del panel (Empleado → "Ajustes de la voz") para esta llamada. Lo
+   * llama el pipeline con la config de Odin ANTES de configurarSesion. Lo que
+   * toca a Telnyx (voz, velocidad, reconocimiento, interrupciones) ya se fijó
+   * al contestar; aquí va lo que decide el que piensa.
+   */
+  aplicarAjustes(raw: unknown): void {
+    this.ajustes = normalizarAjustesRelay(raw);
+    this.modelo = this.ajustes.cerebro === "listo" ? MODELO_RELAY_LISTO : MODELO_RELAY;
+    this.pensar = this.ajustes.pensar;
+  }
+
+  private etiquetaStt(): string {
+    return String(configTranscripcion(this.ajustes).transcription_engine_config.transcription_model);
+  }
 
   /** Cuánto le falta (aprox.) a la voz para terminar lo que ya se le mandó. */
   msHablaPendiente(): number {
@@ -521,14 +554,14 @@ export class MotorRelayTelnyx implements MotorVoz {
       try {
         const stream = this.cliente.messages.stream(
           {
-            model: MODELO_RELAY,
+            model: this.modelo,
             max_tokens: 1024,
             system: this.sistema,
             tools: this.herramientas,
             messages: mensajes,
             // Caché automático del historial: cada turno relee lo anterior del caché.
             cache_control: { type: "ephemeral" },
-            ...parametrosRazonamiento(MODELO_RELAY),
+            ...parametrosRazonamiento(this.modelo, this.pensar),
           } as unknown as Anthropic.MessageStreamParams,
           { signal: turno.abort.signal },
         );

@@ -46,6 +46,7 @@ exports.calendarioVoz = calendarioVoz;
 exports.construirHerramientas = construirHerramientas;
 exports.buildSystemPrompt = buildSystemPrompt;
 exports.esSinCreditoOpenAI = esSinCreditoOpenAI;
+exports.esSinCreditoClaude = esSinCreditoClaude;
 const ws_1 = __importDefault(require("ws"));
 const twilio_1 = __importDefault(require("twilio"));
 const realtime_1 = require("../openai/realtime");
@@ -965,18 +966,23 @@ function esSinCreditoOpenAI(texto) {
 }
 const MIN_ENTRE_REPORTES_MS = 10 * 60_000;
 let ultimoReporteSinCredito = 0;
+/** Anthropic sin crédito (motor de Telnyx: piensa Claude). */
+function esSinCreditoClaude(texto) {
+    return /credit balance is too low|billing_error/i.test(String(texto ?? ""));
+}
 function reportarSiSinCredito(detalle) {
-    if (!esSinCreditoOpenAI(detalle))
+    const proveedor = esSinCreditoOpenAI(detalle) ? "openai" : esSinCreditoClaude(detalle) ? "claude" : null;
+    if (!proveedor)
         return;
     const ahora = Date.now();
     if (ahora - ultimoReporteSinCredito < MIN_ENTRE_REPORTES_MS)
         return;
     ultimoReporteSinCredito = ahora;
-    console.error(`[PIPELINE] OpenAI SIN CRÉDITO — avisando al equipo: ${detalle.slice(0, 200)}`);
+    console.error(`[PIPELINE] ${proveedor === "claude" ? "Claude" : "OpenAI"} SIN CRÉDITO — avisando al equipo: ${detalle.slice(0, 200)}`);
     fetch(`${config_1.config.odinAppUrl}/api/voice/alerta-proveedor`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...odinAuth() },
-        body: JSON.stringify({ proveedor: "openai", detalle: detalle.slice(0, 1000) }),
+        body: JSON.stringify({ proveedor, detalle: detalle.slice(0, 1000) }),
         signal: AbortSignal.timeout(8000),
     }).catch((e) => {
         // Si no llegó, que el siguiente fallo lo vuelva a intentar.
@@ -2360,6 +2366,9 @@ class PipelineLlamada {
         }
         if (this.finalizada || this.ws.readyState !== ws_1.default.OPEN)
             return;
+        // Ajustes del panel (cerebro, pensar, idioma) para el motor de Telnyx.
+        if (this.realtime instanceof relay_1.MotorRelayTelnyx)
+            this.realtime.aplicarAjustes(this.configNegocio.ajustesVoz);
         // La voz del motor de Telnyx ya quedó puesta al contestar (va en el relay);
         // el de OpenAI solo entiende sus propias voces.
         const voz = this.motor === "relay" ? String(this.configNegocio.voz || "") : (0, relay_config_1.vozParaOpenAI)(this.configNegocio.voz);

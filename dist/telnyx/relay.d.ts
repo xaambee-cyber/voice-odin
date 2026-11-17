@@ -2,12 +2,15 @@ import Anthropic from "@anthropic-ai/sdk";
 import WebSocket from "ws";
 import { type HerramientaVoz } from "../openai/realtime";
 import { type MotorVoz, type ResumenLatencia, type UsoMotor } from "../voz/motor";
+import { type AjustesRelay } from "./relay-config";
 /**
  * Modelo que piensa. Haiku 5.5 por la meta de ~1 s por turno: es el de menor
  * tiempo al primer token y en una llamada cada décima de segundo se oye.
  * Para probar otro sin tocar código: VOZ_RELAY_MODELO=claude-sonnet-5-5.
  */
 export declare const MODELO_RELAY: string;
+/** Cerebro "más listo" del panel: mejor razonamiento, ~+0.3–0.5 s por turno. */
+export declare const MODELO_RELAY_LISTO: string;
 export declare function costoClaudeUsd(modelo: string, uso: {
     entrada: number;
     salida: number;
@@ -34,7 +37,9 @@ export declare function herramientasClaude(tools: HerramientaVoz[]): Anthropic.T
  * modelo antes de hablar y donde más pesan (son cortas; no importa que no se
  * reutilicen entre llamadas).
  */
-export declare function bloquesSistema(prompt: string): Anthropic.TextBlockParam[];
+/** Regla de idioma según el ajuste del panel (las instrucciones siguen en español). */
+export declare function reglaIdioma(idioma: AjustesRelay["idioma"]): string;
+export declare function bloquesSistema(prompt: string, idioma?: AjustesRelay["idioma"]): Anthropic.TextBlockParam[];
 export declare class MotorRelayTelnyx implements MotorVoz {
     private ws;
     private cliente;
@@ -46,6 +51,10 @@ export declare class MotorRelayTelnyx implements MotorVoz {
     private turnoVivo;
     private cerrado;
     private saludoPedido;
+    /** Ajustes del panel para ESTA llamada (cerebro, pensar, idioma, reconocimiento). */
+    private modelo;
+    private pensar;
+    private ajustes;
     private errores;
     private colgarPedido;
     /** Telnyx acepta `token: ""` para cerrar el turno; si algún día no, se manda " ". */
@@ -84,6 +93,14 @@ export declare class MotorRelayTelnyx implements MotorVoz {
     cerrar(): void;
     resumenUso(): UsoMotor;
     resumenLatencia(): ResumenLatencia;
+    /**
+     * Ajustes del panel (Empleado → "Ajustes de la voz") para esta llamada. Lo
+     * llama el pipeline con la config de Odin ANTES de configurarSesion. Lo que
+     * toca a Telnyx (voz, velocidad, reconocimiento, interrupciones) ya se fijó
+     * al contestar; aquí va lo que decide el que piensa.
+     */
+    aplicarAjustes(raw: unknown): void;
+    private etiquetaStt;
     /** Cuánto le falta (aprox.) a la voz para terminar lo que ya se le mandó. */
     msHablaPendiente(): number;
     /** Decir un texto fijo (despedida) fuera de la conversación del modelo. */
