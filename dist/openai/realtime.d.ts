@@ -37,6 +37,7 @@ export declare class OpenAIRealtime {
     private esperaInterrumpida;
     private respuestaTimer;
     private finHablaMs;
+    private respondioAlTurno;
     private transcripcionMs;
     private pedidoMs;
     private latencias;

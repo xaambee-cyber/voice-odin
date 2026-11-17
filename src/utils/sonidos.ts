@@ -140,3 +140,7 @@ export const MS_POR_FRAME = 20;
 /** Flag del room tone: apagado por default hasta validarlo con el oído.
  *  Activar con AMBIENTE_LLAMADA=on en el env del voice server. */
 export const AMBIENTE_ACTIVO = (process.env.AMBIENTE_LLAMADA || "").toLowerCase() === "on";
+
+/** Flag del tecleo de espera: prendido por default (como siempre). Apagar con
+ *  TECLEO_LLAMADA=off si en alguna ruta telefónica suena a "golpes". */
+export const TECLEO_ACTIVO = (process.env.TECLEO_LLAMADA || "on").toLowerCase() !== "off";

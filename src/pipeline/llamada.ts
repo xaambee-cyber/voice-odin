@@ -4,7 +4,7 @@ import { OpenAIRealtime, HerramientaVoz } from "../openai/realtime";
 import { config, urlPublicaHttps } from "../utils/config";
 import { registrarTransferencia, tomarTransferencia } from "../api/transferencias";
 import { obtenerVozPorNumero } from "../api/registro-voz";
-import { FRAMES_TECLEO, FRAMES_AMBIENTE, MS_POR_FRAME, AMBIENTE_ACTIVO } from "../utils/sonidos";
+import { FRAMES_TECLEO, FRAMES_AMBIENTE, MS_POR_FRAME, AMBIENTE_ACTIVO, TECLEO_ACTIVO } from "../utils/sonidos";
 import { REGLA_NORMALIZACION_HORARIA } from "../utils/normalizar-hora";
 import * as telnyxApi from "../telnyx/api";
 import { despedirYColgar } from "../telnyx/webhook";
@@ -2494,12 +2494,33 @@ export class PipelineLlamada {
 
   // ── Tecleo de espera ──────────────────────────────────────────────────────
   private iniciarTecleo() {
-    if (this.tecleoTimer) return;
+    if (this.tecleoTimer || !TECLEO_ACTIVO) return;
     // Arranca en un punto aleatorio del loop para que dos esperas seguidas
     // no suenen idénticas.
     this.tecleoIdx = Math.floor(Math.random() * FRAMES_TECLEO.length);
     this.tecleoDesde = Date.now();
     this.tecleoFramesEnviados = 0;
+    if (this.proveedor === "telnyx") {
+      // Telnyx reproduce los paquetes casi en cuanto llegan: un frame de 20 ms
+      // cada 20 ms dependía del reloj del servidor y cualquier retraso sonaba a
+      // "golpe". Aquí van lotes de 100 ms (5 frames) cada 100 ms, en un solo
+      // mensaje: Telnyx los encola y los toca parejos.
+      const LOTE = 5;
+      this.tecleoTimer = setInterval(() => {
+        if (Date.now() - this.tecleoDesde > PipelineLlamada.TECLEO_MAX_MS) {
+          this.detenerTecleo();
+          return;
+        }
+        const frames: Buffer[] = [];
+        for (let i = 0; i < LOTE; i++) {
+          frames.push(Buffer.from(FRAMES_TECLEO[this.tecleoIdx++ % FRAMES_TECLEO.length], "base64"));
+        }
+        this.tecleoFramesEnviados += LOTE;
+        this.enviarAudioTelnyx(Buffer.concat(frames).toString("base64"));
+      }, MS_POR_FRAME * LOTE);
+      console.log("[SONIDO] Tecleo de espera ON (Telnyx, lotes de 100 ms)");
+      return;
+    }
     this.tecleoTimer = setInterval(() => {
       if (Date.now() - this.tecleoDesde > PipelineLlamada.TECLEO_MAX_MS) {
         this.detenerTecleo();
@@ -2701,10 +2722,46 @@ export class PipelineLlamada {
     }
   }
 
+  // ── Audio hacia Telnyx en bloques EXACTOS de 20 ms ───────────────────────
+  // OpenAI entrega la voz en pedazos de tamaño irregular. Twilio los junta en
+  // su búfer y no se nota; Telnyx (modo RTP) arma paquetes con cada mensaje,
+  // así que un pedazo que no es múltiplo de 20 ms deja un paquete incompleto
+  // y la voz "se mueve" o truena. Aquí se mandan solo múltiplos de 160 bytes
+  // (20 ms de μ-law a 8 kHz) y el sobrante espera al siguiente pedazo; si no
+  // llega nada en 60 ms, se completa con silencio y sale.
+  private static readonly BYTES_FRAME_TELNYX = 160;
+  private colaTelnyx: Buffer = Buffer.alloc(0);
+  private vaciadoTelnyx: ReturnType<typeof setTimeout> | null = null;
+
   private enviarAudioTelnyx(base64Audio: string) {
-    if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
-      this.ws.send(JSON.stringify({ event: "media", media: { payload: base64Audio } }));
+    if (this.ws.readyState !== WebSocket.OPEN || !this.streamSid) return;
+    const datos = this.colaTelnyx.length
+      ? Buffer.concat([this.colaTelnyx, Buffer.from(base64Audio, "base64")])
+      : Buffer.from(base64Audio, "base64");
+    const completos = datos.length - (datos.length % PipelineLlamada.BYTES_FRAME_TELNYX);
+    if (completos > 0) {
+      this.ws.send(JSON.stringify({ event: "media", media: { payload: datos.subarray(0, completos).toString("base64") } }));
     }
+    this.colaTelnyx = datos.subarray(completos);
+    if (this.vaciadoTelnyx) clearTimeout(this.vaciadoTelnyx);
+    this.vaciadoTelnyx = this.colaTelnyx.length ? setTimeout(() => this.vaciarColaTelnyx(), 60) : null;
+  }
+
+  private vaciarColaTelnyx() {
+    this.vaciadoTelnyx = null;
+    if (!this.colaTelnyx.length) return;
+    const silencio = Buffer.alloc(PipelineLlamada.BYTES_FRAME_TELNYX - this.colaTelnyx.length, 0xff); // 0xFF = silencio μ-law
+    const frame = Buffer.concat([this.colaTelnyx, silencio]);
+    this.colaTelnyx = Buffer.alloc(0);
+    if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
+      this.ws.send(JSON.stringify({ event: "media", media: { payload: frame.toString("base64") } }));
+    }
+  }
+
+  private descartarColaTelnyx() {
+    if (this.vaciadoTelnyx) clearTimeout(this.vaciadoTelnyx);
+    this.vaciadoTelnyx = null;
+    this.colaTelnyx = Buffer.alloc(0);
   }
 
   private enviarAudioTwilio(base64Audio: string) {
@@ -2723,6 +2780,7 @@ export class PipelineLlamada {
 
   private limpiarAudioTwilio() {
     if (this.proveedor === "telnyx") {
+      this.descartarColaTelnyx();
       if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
         this.ws.send(JSON.stringify({ event: "clear" }));
         console.log("[TELNYX] Buffer limpiado (interrupción)");

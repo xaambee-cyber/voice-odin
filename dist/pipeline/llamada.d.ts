@@ -257,7 +257,12 @@ export declare class PipelineLlamada {
      * agente se oiría a sí mismo y se interrumpiría.
      */
     recibirMensajeTelnyx(mensaje: any): void;
+    private static readonly BYTES_FRAME_TELNYX;
+    private colaTelnyx;
+    private vaciadoTelnyx;
     private enviarAudioTelnyx;
+    private vaciarColaTelnyx;
+    private descartarColaTelnyx;
     private enviarAudioTwilio;
     private limpiarAudioTwilio;
     interrumpir(): void;

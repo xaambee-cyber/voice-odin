@@ -76,9 +76,19 @@ const PROTEGER_FRASE_MS = 4000;
 // agente responda. Sirve para AGRUPAR varios fragmentos cortos ("ok"… "ok"…) en
 // una sola respuesta en vez de contestar a cada uno. Cada vez que el cliente
 // (re)empieza a hablar, este temporizador se reinicia.
-// 450ms (antes 600): el VAD semántico YA decide fin-de-turno por contenido;
-// este debounce es solo el colchón anti-fragmentos. Override: VOZ_DEBOUNCE_MS.
-const DEBOUNCE_RESPUESTA_MS = Number(process.env.VOZ_DEBOUNCE_MS) || 450;
+// 250ms (antes 450, y antes 600): el VAD semántico YA decide fin-de-turno por
+// contenido; este debounce es solo el colchón anti-fragmentos y cada ms de aquí
+// es latencia pura que el cliente oye (nov-2026: la meta es ~1 s por turno).
+// Override: VOZ_DEBOUNCE_MS.
+const DEBOUNCE_RESPUESTA_MS = Number(process.env.VOZ_DEBOUNCE_MS) || 250;
+// Cuánto esperamos COMO MÁXIMO la transcripción del cliente antes de pedir la
+// respuesta. Se espera para insertar la anotación de horas AM/PM (fix de
+// ago-2026), pero antes eran 1,200 ms fijos de techo: con whisper-1 casi
+// siempre se iban enteros. Con un modelo de transcripción rápido llega antes;
+// si no llega a tiempo, se responde igual y la anotación entra en cuanto
+// llegue (sirve para la confirmación, que es cuando se agenda).
+// Override: VOZ_ESPERA_TRANSCRIPCION_MS.
+const ESPERA_TRANSCRIPCION_MS = Number(process.env.VOZ_ESPERA_TRANSCRIPCION_MS) || 500;
 // Eagerness del VAD semántico: qué tan rápido decide que el cliente terminó.
 // "low" era MUY conservador → esperas variables de 1-3s según cómo sonara la
 // frase (la causa #1 de la latencia inconsistente). "medium" responde bastante
@@ -91,9 +101,9 @@ const VAD_EAGERNESS = (["low", "medium", "high", "auto"].includes(process.env.VO
 // agente espera esa transcripción (hasta 1.2 s, ver speech_stopped) para poder
 // insertar la anotación de horas AM/PM antes de responder. whisper-1 entrega el
 // texto de golpe al final; "gpt-4o-mini-transcribe" suele terminar antes y
-// cuesta la mitad. Se deja por env para probarlo sin tocar código: el default
-// sigue siendo el de siempre.
-const MODELO_TRANSCRIPCION = process.env.VOZ_TRANSCRIPCION_MODELO || "whisper-1";
+// cuesta la mitad. Default desde nov-2026: el rápido. Para volver al de antes,
+// VOZ_TRANSCRIPCION_MODELO=whisper-1.
+const MODELO_TRANSCRIPCION = process.env.VOZ_TRANSCRIPCION_MODELO || "gpt-4o-mini-transcribe";
 // Auto-sanación anti-mudez: si `respondiendo` se queda atorado en true (un
 // response.done perdido tras una cancelación), el agente quedaría CALLADO para
 // siempre. Si al ir a responder llevamos más de este tiempo sin actividad real
@@ -150,6 +160,11 @@ class OpenAIRealtime {
     // pedir la respuesta (debounce + transcripción) y cuánto tarda el MODELO.
     // Sin esto no se puede comparar proveedor, VAD o modelo con números.
     finHablaMs = null;
+    // ¿Ya se pidió la respuesta a ESTE turno del cliente? Con el techo de espera
+    // corto, la transcripción puede llegar después de que el agente empezó a
+    // contestar; sin esta marca, su llegada pediría OTRA respuesta y el agente
+    // hablaría dos veces.
+    respondioAlTurno = false;
     transcripcionMs = null;
     pedidoMs = null;
     latencias = [];
@@ -405,7 +420,10 @@ class OpenAIRealtime {
                     console.log(`[REALTIME] Usuario: "${msg.transcript}"`);
                 }
                 // Reinicia la respuesta después de insertar la equivalencia, no antes.
-                this.programarRespuestaUsuario(25);
+                // Si la respuesta a este turno ya salió (la transcripción llegó tarde),
+                // la anotación queda en contexto para el siguiente y NO se responde dos veces.
+                if (!this.respondioAlTurno)
+                    this.programarRespuestaUsuario(25);
                 break;
             case "input_audio_buffer.speech_started":
                 // El cliente (vuelve a) hablar → reinicia el debounce para AGRUPAR todo lo
@@ -432,8 +450,9 @@ class OpenAIRealtime {
             case "input_audio_buffer.speech_stopped":
                 // El cliente terminó (por ahora). Espera un poco por si sigue hablando y
                 // recién entonces responde UNA sola vez con todo lo que dijo.
-                this.esperandoTranscripcionHasta = Date.now() + 1200;
+                this.esperandoTranscripcionHasta = Date.now() + ESPERA_TRANSCRIPCION_MS;
                 // Si el cliente habló en varios fragmentos, cuenta desde el ÚLTIMO.
+                this.respondioAlTurno = false;
                 this.finHablaMs = Date.now();
                 this.transcripcionMs = null;
                 this.pedidoMs = null;
@@ -628,6 +647,7 @@ class OpenAIRealtime {
         // Va a hablar: la espera silenciosa (tecleo) termina aquí SIEMPRE.
         this.onEspera?.(false);
         this.respondiendo = true;
+        this.respondioAlTurno = true;
         if (this.finHablaMs != null && this.pedidoMs == null)
             this.pedidoMs = Date.now();
         this.ws.send(JSON.stringify({ type: "response.create" }));

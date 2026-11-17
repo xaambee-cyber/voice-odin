@@ -17,7 +17,7 @@
 // arreglo de frames base64 (0 CPU en caliente).
 // ═══════════════════════════════════════════════════════════════════════════
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.AMBIENTE_ACTIVO = exports.MS_POR_FRAME = exports.FRAMES_AMBIENTE = exports.FRAMES_TECLEO = void 0;
+exports.TECLEO_ACTIVO = exports.AMBIENTE_ACTIVO = exports.MS_POR_FRAME = exports.FRAMES_AMBIENTE = exports.FRAMES_TECLEO = void 0;
 const SAMPLE_RATE = 8000;
 const FRAME_SAMPLES = 160; // 20 ms por frame (el estándar de Twilio Media Streams)
 // ── G.711 μ-law ─────────────────────────────────────────────────────────────
@@ -136,4 +136,7 @@ exports.MS_POR_FRAME = 20;
 /** Flag del room tone: apagado por default hasta validarlo con el oído.
  *  Activar con AMBIENTE_LLAMADA=on en el env del voice server. */
 exports.AMBIENTE_ACTIVO = (process.env.AMBIENTE_LLAMADA || "").toLowerCase() === "on";
+/** Flag del tecleo de espera: prendido por default (como siempre). Apagar con
+ *  TECLEO_LLAMADA=off si en alguna ruta telefónica suena a "golpes". */
+exports.TECLEO_ACTIVO = (process.env.TECLEO_LLAMADA || "on").toLowerCase() !== "off";
 //# sourceMappingURL=sonidos.js.map
