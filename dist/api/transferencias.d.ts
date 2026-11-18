@@ -11,5 +11,7 @@ export declare function registrarTransferencia(t: TransferenciaActiva): void;
  */
 export declare function tomarTransferencia(callSid: string): TransferenciaActiva | null;
 export declare function purgarTransferenciasViejas(): void;
+/** ¿Esta llamada está pasando a un humano? (No la saca del mapa.) */
+export declare function hayTransferencia(callSid: string): boolean;
 export declare function transferenciasActivas(): number;
 //# sourceMappingURL=transferencias.d.ts.map

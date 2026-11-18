@@ -11,6 +11,12 @@ import { type AjustesRelay } from "./relay-config";
 export declare const MODELO_RELAY: string;
 /** Cerebro "más listo" del panel: mejor razonamiento, ~+0.3–0.5 s por turno. */
 export declare const MODELO_RELAY_LISTO: string;
+export declare function relayDisponible(ahora?: number): boolean;
+export declare function motivoRelayNoDisponible(): string;
+/** Claude no puede pensar (llave/crédito): las siguientes llamadas van por OpenAI un rato. */
+export declare function marcarRelayCaido(motivo: string, ahora?: number): void;
+/** Solo pruebas. */
+export declare function _reiniciarRelayCaido(): void;
 export declare function costoClaudeUsd(modelo: string, uso: {
     entrada: number;
     salida: number;

@@ -9,7 +9,7 @@ import { REGLA_NORMALIZACION_HORARIA } from "../utils/normalizar-hora";
 import * as telnyxApi from "../telnyx/api";
 import { despedirYColgar } from "../telnyx/webhook";
 import { codificarEstado, costoTelefoniaTelnyxUsd } from "../telnyx/eventos";
-import { MotorRelayTelnyx } from "../telnyx/relay";
+import { MotorRelayTelnyx, marcarRelayCaido } from "../telnyx/relay";
 import { costoRelayUsd, vozParaOpenAI } from "../telnyx/relay-config";
 import type { MotorVoz, TipoMotor } from "../voz/motor";
 
@@ -1708,6 +1708,18 @@ export class PipelineLlamada {
     this.detenerTecleo();
     this.detenerAmbiente();
     console.warn(`[PIPELINE] Agente no disponible (${motivo}) — despidiendo la llamada ${this.callSid}`);
+    // Motor de Telnyx: la despedida se dice POR EL RELAY, con la misma voz, y
+    // luego se cuelga. Antes se cerraba el relay y se pedía un `speak` aparte:
+    // Telnyx lo cortaba al desmontar el relay y el cliente se quedaba en
+    // silencio hasta colgar (visto el 17-nov-2026).
+    if (this.realtime instanceof MotorRelayTelnyx && this.callSid && this.ws.readyState === WebSocket.OPEN) {
+      if (/Claude no conectó|ANTHROPIC_API_KEY/i.test(motivo)) marcarRelayCaido(motivo);
+      const relay = this.realtime;
+      relay.decir("Lo sentimos, en este momento no podemos atender su llamada. Por favor intente de nuevo en unos minutos o escríbanos por WhatsApp.");
+      const esperaMs = Math.min(10_000, relay.msHablaPendiente() + 1200);
+      setTimeout(() => { this.colgarTwilioCall().catch(() => {}); }, esperaMs);
+      return;
+    }
     try { this.realtime.cerrar(); } catch {}
     if (!this.callSid) {
       try { this.ws.close(); } catch {}

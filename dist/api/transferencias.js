@@ -19,6 +19,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.registrarTransferencia = registrarTransferencia;
 exports.tomarTransferencia = tomarTransferencia;
 exports.purgarTransferenciasViejas = purgarTransferenciasViejas;
+exports.hayTransferencia = hayTransferencia;
 exports.transferenciasActivas = transferenciasActivas;
 const activas = new Map();
 // Una transferencia que nunca recibió su callback (Twilio no pegó, la llamada
@@ -47,6 +48,10 @@ function purgarTransferenciasViejas() {
             activas.delete(callSid);
         }
     }
+}
+/** ¿Esta llamada está pasando a un humano? (No la saca del mapa.) */
+function hayTransferencia(callSid) {
+    return activas.has(callSid);
 }
 function transferenciasActivas() {
     return activas.size;

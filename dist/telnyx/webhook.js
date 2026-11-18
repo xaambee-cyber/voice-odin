@@ -42,6 +42,7 @@ exports.purgarContestosViejos = purgarContestosViejos;
 exports.crearWebhookTelnyx = crearWebhookTelnyx;
 const config_1 = require("../utils/config");
 const transferencias_1 = require("../api/transferencias");
+const relay_1 = require("./relay");
 const telnyx = __importStar(require("./api"));
 const firma_1 = require("./firma");
 const relay_config_1 = require("./relay-config");
@@ -146,7 +147,10 @@ async function atenderEntrante(p) {
     // reconocimiento; Claude piensa). Cualquier otra → el motor de OpenAI de
     // siempre. Si Odin no contestó el gate, también el de siempre: es el que
     // sabe arreglárselas sin saber nada de antemano.
-    if ((0, relay_config_1.esVozTelnyx)(gate?.voz)) {
+    if ((0, relay_config_1.esVozTelnyx)(gate?.voz) && !(0, relay_1.relayDisponible)()) {
+        console.error(`[TELNYX] ${numero} tiene voz premium pero el motor de Telnyx no puede contestar (${(0, relay_1.motivoRelayNoDisponible)()}) — se contesta con OpenAI`);
+    }
+    if ((0, relay_config_1.esVozTelnyx)(gate?.voz) && (0, relay_1.relayDisponible)()) {
         const relay = (0, relay_config_1.configRelay)({
             url: urlRelayTelnyx(ccid),
             voz: gate.voz,
@@ -221,10 +225,21 @@ async function procesarEvento(evento, alTerminarTransferencia) {
                 await telnyx.colgar(ccid);
             return;
         }
+        // Telnyx manda `call.conversation_relay.ended` (la documentación dice
+        // `call.conversation.ended`; se aceptan los dos).
+        case "call.conversation_relay.ended":
         case "call.conversation.ended": {
-            // Fin del motor de Telnyx. Si fue porque NOSOTROS cerramos (fin normal,
-            // transferencia, despedida), no hay nada que hacer: el pipeline ya cerró.
             console.log(`[TELNYX] Relay terminado en ${ccid}: ${String(p?.reason || "?")}`);
+            // Pasando a un humano: el relay se detuvo a propósito, la llamada sigue.
+            if ((0, transferencias_1.hayTransferencia)(ccid))
+                return;
+            // En cualquier otro caso, una llamada viva sin motor es una llamada MUDA:
+            // el cliente oye silencio hasta que cuelga. Se despide y se cuelga. Si la
+            // llamada ya terminó (colgó el cliente, colgar_llamada), Telnyx rechaza
+            // el `speak` y `despedirYColgar` solo intenta colgar: inofensivo.
+            setTimeout(() => {
+                despedirYColgar(ccid).catch(() => { });
+            }, 300);
             return;
         }
         case "streaming.failed": {

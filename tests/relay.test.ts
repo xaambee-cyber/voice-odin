@@ -16,8 +16,12 @@ import {
   herramientasClaude,
   MODELO_RELAY_LISTO,
   MotorRelayTelnyx,
+  _reiniciarRelayCaido,
+  motivoRelayNoDisponible,
   parametrosRazonamiento,
+  relayDisponible,
 } from "../src/telnyx/relay";
+import { config } from "../src/utils/config";
 import { costoTelefoniaTelnyxUsd } from "../src/telnyx/eventos";
 import { firmarSaliente, leerSaliente } from "../src/telnyx/firma";
 import { urlRelayTelnyx, urlSalienteTelnyx } from "../src/telnyx/webhook";
@@ -379,4 +383,50 @@ test("cerebro 'más listo' y 'pensar' cambian el modelo y el razonamiento de la 
   assert.ok(JSON.stringify(m.pedidos[0].system).includes("habla SIEMPRE en inglés"));
   assert.ok(m.pedidos[0].messages[0].content.includes("en inglés"));
   assert.equal(m.motor.resumenUso().modelo, MODELO_RELAY_LISTO);
+});
+
+// ── Llamadas mudas (17-nov-2026): sin Claude, contesta OpenAI ───────────────
+
+test("sin llave de Claude el motor de Telnyx no se usa (contesta OpenAI, no una llamada muda)", () => {
+  const antes = config.anthropicApiKey;
+  try {
+    _reiniciarRelayCaido();
+    config.anthropicApiKey = "";
+    assert.equal(relayDisponible(), false);
+    assert.match(motivoRelayNoDisponible(), /ANTHROPIC_API_KEY/);
+    config.anthropicApiKey = "sk-ant-prueba";
+    assert.equal(relayDisponible(), true);
+  } finally {
+    config.anthropicApiKey = antes;
+    _reiniciarRelayCaido();
+  }
+});
+
+test("Claude con llave inválida pausa el motor de Telnyx 10 minutos y avisa la caída", async () => {
+  const antes = config.anthropicApiKey;
+  config.anthropicApiKey = "sk-ant-prueba";
+  _reiniciarRelayCaido();
+  try {
+    const cliente = {
+      messages: {
+        stream() {
+          const err = Object.assign(new Error('401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}'), { name: "AuthenticationError" });
+          return { on() { return this; }, finalMessage: () => Promise.reject(err), abort() {}, currentMessage: undefined };
+        },
+      },
+    };
+    const { ws } = wsFalso();
+    const motor = new MotorRelayTelnyx(ws, { cliente: cliente as any });
+    let caida = "";
+    motor.setOnCaida((m) => { caida = m; });
+    await motor.abrirConexion();
+    motor.configurarSesion("PROMPT", []);
+    await esperar(30);
+    assert.match(caida, /Claude no responde/);
+    assert.equal(relayDisponible(), false);
+    assert.equal(relayDisponible(Date.now() + 11 * 60_000), true);
+  } finally {
+    config.anthropicApiKey = antes;
+    _reiniciarRelayCaido();
+  }
 });

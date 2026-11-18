@@ -54,6 +54,11 @@ export function purgarTransferenciasViejas(): void {
   }
 }
 
+/** ¿Esta llamada está pasando a un humano? (No la saca del mapa.) */
+export function hayTransferencia(callSid: string): boolean {
+  return activas.has(callSid);
+}
+
 export function transferenciasActivas(): number {
   return activas.size;
 }

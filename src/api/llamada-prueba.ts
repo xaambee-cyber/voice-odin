@@ -6,6 +6,7 @@ import * as telnyx from "../telnyx/api";
 import { firmarSaliente } from "../telnyx/firma";
 import { configRelay, esVozTelnyx } from "../telnyx/relay-config";
 import { parametrosRelay, urlSalienteTelnyx } from "../telnyx/webhook";
+import { relayDisponible } from "../telnyx/relay";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // POST /api/llamada-prueba  (solo Odin, con VOICE_SERVER_SECRET)
@@ -46,7 +47,8 @@ export async function iniciarLlamadaPrueba(req: Request, res: Response) {
     const connectionId = String(req.body?.connectionId || process.env.TELNYX_VOZ_CONNECTION_ID || "");
     if (!connectionId) return res.status(400).json({ ok: false, error: "Falta la Call Control App de Telnyx" });
     const firmado = firmarSaliente({ n: numero, c: caller });
-    const usarRelay = esVozTelnyx(voz);
+    // Sin Claude disponible, la prueba sale con el motor de OpenAI (no muda).
+    const usarRelay = esVozTelnyx(voz) && relayDisponible();
     const r = await telnyx.marcar({
       connectionId,
       to: destino,

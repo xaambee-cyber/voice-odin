@@ -44,6 +44,40 @@ export const MODELO_RELAY = process.env.VOZ_RELAY_MODELO || "claude-haiku-5-5";
 /** Cerebro "más listo" del panel: mejor razonamiento, ~+0.3–0.5 s por turno. */
 export const MODELO_RELAY_LISTO = process.env.VOZ_RELAY_MODELO_LISTO || "claude-sonnet-5-5";
 
+// ── ¿Puede contestar el motor de Telnyx? ────────────────────────────────────
+// El 17-nov-2026 las primeras llamadas con voz premium se quedaron MUDAS: el
+// motor arrancaba y se apagaba al segundo porque Claude no podía pensar (llave
+// faltante o inválida en el voice server). El motor de OpenAI nunca la había
+// necesitado, así que nadie lo notó hasta que la línea contestó en silencio.
+// Ahora: sin llave, o con Claude fallando por llave/crédito, las llamadas
+// contestan con el motor de OpenAI (voz clásica) durante 10 min y se reintenta.
+// Peor que una voz menos bonita es una llamada en silencio.
+let relayCaidoHasta = 0;
+let motivoRelayCaido = "";
+const PAUSA_RELAY_CAIDO_MS = 10 * 60_000;
+
+export function relayDisponible(ahora = Date.now()): boolean {
+  return !!config.anthropicApiKey && ahora >= relayCaidoHasta;
+}
+
+export function motivoRelayNoDisponible(): string {
+  if (!config.anthropicApiKey) return "falta ANTHROPIC_API_KEY en el voice server";
+  return motivoRelayCaido;
+}
+
+/** Claude no puede pensar (llave/crédito): las siguientes llamadas van por OpenAI un rato. */
+export function marcarRelayCaido(motivo: string, ahora = Date.now()): void {
+  relayCaidoHasta = ahora + PAUSA_RELAY_CAIDO_MS;
+  motivoRelayCaido = motivo.slice(0, 200);
+  console.error(`[RELAY] Motor de Telnyx en pausa 10 min (se usará OpenAI): ${motivoRelayCaido}`);
+}
+
+/** Solo pruebas. */
+export function _reiniciarRelayCaido(): void {
+  relayCaidoHasta = 0;
+  motivoRelayCaido = "";
+}
+
 /** USD por 1M de tokens (hoja de Anthropic, nov-2026). */
 const PRECIOS_CLAUDE: Record<string, { in: number; out: number; cacheRead: number; cacheWrite: number }> = {
   "claude-haiku-5-5": { in: 0.1, out: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
@@ -672,7 +706,9 @@ export class MotorRelayTelnyx implements MotorVoz {
       this.descartar(turno);
       return;
     }
-    if (this.errores >= 3 || /credit balance|insufficient|authentication|invalid x-api-key/i.test(detalle)) {
+    if (this.errores >= 3 || /credit balance|insufficient|authentication|invalid x-api-key|permission/i.test(detalle)) {
+      // Llave o crédito: no se arregla solo en esta llamada ni en la siguiente.
+      if (/credit balance|insufficient|authentication|invalid x-api-key|permission/i.test(detalle)) marcarRelayCaido(detalle);
       this.onCaida?.(`Claude no responde: ${detalle.slice(0, 200)}`);
       return;
     }

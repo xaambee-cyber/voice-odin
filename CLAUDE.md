@@ -129,6 +129,15 @@ escalar/transferir y colgar son **el mismo código** en los dos.
   `VOZ_RELAY_MODELO`, `VOZ_RELAY_STT` (`deepgram/nova-3` = plan B),
   `VOZ_RELAY_EOT`, `VOZ_RELAY_EOT_TEMPRANO`, `VOZ_RELAY_PENSAR=1` (razonamiento
   oculto, ~+400 ms), `VOZ_RELAY_IDIOMA`.
+- **Nunca una llamada muda** (17-nov-2026: las primeras llamadas con voz premium
+  se quedaron en silencio porque Claude no podía pensar — llave faltante o
+  inválida en el voice server — y la despedida por `speak` la cortaba Telnyx al
+  desmontar el relay). Ahora: (1) `relayDisponible()` — sin `ANTHROPIC_API_KEY`, o
+  10 min después de un error de llave/crédito (`marcarRelayCaido`), la línea
+  contesta con el motor de OpenAI; (2) `atenderSinAgente` con relay se despide
+  POR EL RELAY (misma voz) y luego cuelga; (3) `call.conversation_relay.ended` (el
+  nombre real del evento; la doc dice `call.conversation.ended`) sin
+  transferencia en curso → despedir y colgar.
 - Pruebas: `tests/relay.test.ts` (con un Claude falso, sin red).
 
 ## Llamada de prueba (`POST /api/llamada-prueba`, solo Odin)
