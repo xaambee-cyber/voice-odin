@@ -138,6 +138,22 @@ escalar/transferir y colgar son **el mismo código** en los dos.
   POR EL RELAY (misma voz) y luego cuelga; (3) `call.conversation_relay.ended` (el
   nombre real del evento; la doc dice `call.conversation.ended`) sin
   transferencia en curso → despedir y colgar.
+- **Eco y voz baja** (17-nov-2026: el agente se oía a sí mismo —"Buenas noches,
+  habla Sofía" regresó como "Ya, buenas noches. Habla Sophie"— y se contestaba;
+  y a quien habla bajito no lo entendía). Dos capas:
+  1. `limpiarAudio` (`suppression_start` de Telnyx) al iniciar cada llamada del
+     relay: ai-coustics "voice focus" + `voice_gain` sobre la voz del CLIENTE,
+     antes de transcribir. `intentosSupresion` arma planes B (sin config → otro
+     motor) porque Telnyx valida el id de llamada antes que los parámetros y la
+     combinación solo se confirma en vivo: busca en el log "Limpieza de voz
+     encendida (…)". Env: `VOZ_SUPRESION` (motor, `0` apaga),
+     `VOZ_SUPRESION_GANANCIA`, `VOZ_SUPRESION_INTENSIDAD`, `VOZ_SUPRESION_DIRECCION`.
+  2. `pareceEco` en el motor: un texto que repite al agente EN ORDEN mientras
+     habla (o ≤1.5 s después) se descarta. En la "cola" exige 3+ palabras, para
+     no comerse "El martes" como respuesta a "¿martes o jueves?", y una palabra
+     de respuesta ("sí", "no", "claro") que el agente no dijo lo descarta como
+     eco siempre. Si el eco cortó al agente a media frase, termina la idea.
+  El saludo va con `interruptible_greeting: "none"`.
 - Pruebas: `tests/relay.test.ts` (con un Claude falso, sin red).
 
 ## Llamada de prueba (`POST /api/llamada-prueba`, solo Odin)
