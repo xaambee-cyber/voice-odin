@@ -92,6 +92,30 @@ export function contestarConRelay(
   });
 }
 
+/**
+ * Enciende la limpieza de la voz del cliente (eco y voz baja; ver
+ * `intentosSupresion`). Prueba cada combinación hasta que Telnyx acepte una.
+ * Devuelve el motor que quedó, o null. Nunca lanza: sin limpieza la llamada
+ * sigue igual que antes.
+ */
+export async function limpiarAudio(
+  callControlId: string,
+  intentos: Record<string, unknown>[],
+): Promise<{ motor: string | null; error?: string }> {
+  let ultimoError = "";
+  for (let i = 0; i < intentos.length; i++) {
+    const r = await comando(callControlId, "suppression_start", {
+      ...intentos[i],
+      command_id: `supresion-${i}-${callControlId}`,
+    });
+    if (r.ok) return { motor: String(intentos[i].noise_suppression_engine) };
+    ultimoError = r.error || `HTTP ${r.status}`;
+    // La llamada ya no existe o no hay llave: no tiene caso seguir probando.
+    if (r.status === 0 || r.status === 404 || r.status === 401) break;
+  }
+  return { motor: null, error: ultimoError };
+}
+
 /** Termina Conversation Relay en la llamada (Telnyx cierra nuestro WebSocket). */
 export function detenerRelay(callControlId: string): Promise<ResultadoComando> {
   return comando(callControlId, "conversation_relay_stop", { command_id: `relay-stop-${callControlId}` });

@@ -9,7 +9,18 @@ import {
   type HoraExplicita,
 } from "../utils/normalizar-hora";
 import { mediana, type MotorVoz, type ResumenLatencia, type UsoMotor } from "../voz/motor";
-import { configTranscripcion, mismoTurno, msParaDecir, normalizarAjustesRelay, textoParaVoz, type AjustesRelay } from "./relay-config";
+import {
+  configTranscripcion,
+  mismoTurno,
+  msParaDecir,
+  normalizarAjustesRelay,
+  pareceEco,
+  textoParaVoz,
+  type AjustesRelay,
+} from "./relay-config";
+
+/** Tras callarse, cuánto tiempo un texto que repite al agente aún puede ser su eco. */
+const COLA_ECO_MS = 1500;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MOTOR DE VOZ DE TELNYX (Conversation Relay + Claude)
@@ -232,6 +243,12 @@ export class MotorRelayTelnyx implements MotorVoz {
   private tokenVacioOk = true;
   /** Cuándo termina (aprox.) de hablar la voz lo que ya le mandamos. */
   private finHablaMs = 0;
+  /** Lo que el agente dijo en el tramo actual (para reconocer su propio eco). */
+  private dichoReciente = "";
+  private fraseCerrada = true;
+  /** Telnyx calló al agente porque "oyó" al cliente: cuándo, y si estaba a media frase. */
+  private corte: { en: number; aMediaFrase: boolean } | null = null;
+  private ecosDescartados = 0;
   private horaExplicita: { hora: HoraExplicita; detectadaEl: number } | null = null;
   private teclas = "";
   private teclasTimer: ReturnType<typeof setTimeout> | null = null;
@@ -330,6 +347,7 @@ export class MotorRelayTelnyx implements MotorVoz {
     if (this.latencias.length > 0) {
       console.log(`[RELAY] Respuestas anticipadas aprovechadas: ${this.aprovechados} · descartadas: ${this.descartados}`);
     }
+    if (this.ecosDescartados > 0) console.log(`[RELAY] Ecos descartados en la llamada: ${this.ecosDescartados}`);
     return {
       turnos: this.latencias.length,
       medianaMs: mediana(total),
@@ -408,8 +426,41 @@ export class MotorRelayTelnyx implements MotorVoz {
 
   // ── Turnos del cliente ───────────────────────────────────────────────────
 
+  /**
+   * ¿Este "texto del cliente" es la voz del agente regresando por la línea?
+   * Solo se pregunta mientras el agente habla o en el instante en que acaba de
+   * callarse: pasado eso, todo lo que llega es del cliente.
+   */
+  private esEco(texto: string): boolean {
+    if (!this.dichoReciente) return false;
+    const ahora = Date.now();
+    const recienCortado = this.corte != null && ahora - this.corte.en <= COLA_ECO_MS;
+    const hablando = ahora <= this.finHablaMs + 400 || recienCortado;
+    if (!hablando && ahora > this.finHablaMs + COLA_ECO_MS) return false;
+    return pareceEco(texto, this.dichoReciente, hablando ? "hablando" : "cola");
+  }
+
+  /**
+   * Fue eco. Si ese eco además hizo que Telnyx callara al agente a media frase,
+   * el cliente se quedó con una idea cortada y en silencio: el agente la termina.
+   */
+  private alDescartarEco(texto: string) {
+    this.ecosDescartados++;
+    console.log(`[RELAY] Eco descartado (el agente se oyó a sí mismo): "${texto.slice(0, 80)}"`);
+    const corte = this.corte;
+    this.corte = null;
+    const vivo = this.turnoVivo;
+    const respondiendo = vivo != null && vivo.confirmado && !vivo.abort.signal.aborted;
+    if (!corte?.aMediaFrase || respondiendo || this.colgarPedido) return;
+    this.iniciarTurno(
+      "[Ruido en la línea cortó lo que estabas diciendo; el cliente NO dijo nada. Termina tu idea en una sola frase corta, sin repetir lo que ya dijiste ni disculparte.]",
+      { interno: true },
+    );
+  }
+
   private alFinTemprano(texto: string) {
     if (!texto.trim() || this.colgarPedido) return;
+    if (this.esEco(texto)) return; // el texto final decide si hay que retomar
     const vivo = this.turnoVivo;
     if (vivo?.especulativo && !vivo.confirmado) {
       if (mismoTurno(vivo.texto, texto)) return; // mismo aviso repetido
@@ -426,6 +477,13 @@ export class MotorRelayTelnyx implements MotorVoz {
   private alTextoFinal(texto: string) {
     // Tras pedir colgar, un "gracias" del cliente no debe abrir otra respuesta.
     if (!texto.trim() || this.colgarPedido) return;
+    if (this.esEco(texto)) {
+      const vivoEco = this.turnoVivo;
+      if (vivoEco?.especulativo && !vivoEco.confirmado) this.descartar(vivoEco);
+      this.alDescartarEco(texto);
+      return;
+    }
+    this.corte = null;
     const vivo = this.turnoVivo;
     if (vivo?.especulativo && !vivo.confirmado) {
       if (mismoTurno(vivo.texto, texto)) {
@@ -439,7 +497,9 @@ export class MotorRelayTelnyx implements MotorVoz {
 
   private alInterrumpir(dicho: string) {
     this.onInterrupcion?.();
-    this.finHablaMs = Date.now();
+    const ahora = Date.now();
+    this.corte = { en: ahora, aMediaFrase: this.finHablaMs - ahora > 300 };
+    this.finHablaMs = ahora;
     const vivo = this.turnoVivo;
     if (vivo && !vivo.especulativo && vivo.stream) {
       // Telnyx ya calló la voz: no tiene caso seguir escribiendo encima del cliente.
@@ -750,7 +810,13 @@ export class MotorRelayTelnyx implements MotorVoz {
       return;
     }
     this.uso.caracteres += token.length;
-    this.finHablaMs = Math.max(this.finHablaMs, Date.now()) + msParaDecir(token);
+    const ahora = Date.now();
+    // Un tramo nuevo de voz (tras un silencio) empieza su propio registro de eco.
+    if (ahora > this.finHablaMs + COLA_ECO_MS) this.dichoReciente = "";
+    const separador = this.fraseCerrada && this.dichoReciente ? " " : "";
+    this.dichoReciente = (this.dichoReciente + separador + token).slice(-600);
+    this.fraseCerrada = last;
+    this.finHablaMs = Math.max(this.finHablaMs, ahora) + msParaDecir(token);
     if (!turno) return;
     turno.textoEnviado += token;
     turno.textoAbierto = !last;

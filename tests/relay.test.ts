@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import {
   configRelay,
   costoRelayUsd,
+  intentosSupresion,
   normalizarAjustesRelay,
+  pareceEco,
   esVozTelnyx,
   mismoTurno,
   textoParaVoz,
@@ -22,6 +24,7 @@ import {
   relayDisponible,
 } from "../src/telnyx/relay";
 import { config } from "../src/utils/config";
+import { limpiarAudio } from "../src/telnyx/api";
 import { costoTelefoniaTelnyxUsd } from "../src/telnyx/eventos";
 import { firmarSaliente, leerSaliente } from "../src/telnyx/firma";
 import { urlRelayTelnyx, urlSalienteTelnyx } from "../src/telnyx/webhook";
@@ -434,4 +437,122 @@ test("Claude con llave inválida pausa el motor de Telnyx 10 minutos y avisa la 
 test("no vuelve a saludar cuando el cliente solo responde el saludo (doble saludo, 17-nov-2026)", () => {
   const texto = bloquesSistema("REGLAS\n=== CONTEXTO DE ESTA LLAMADA ===\nHoy")[1].text;
   assert.ok(texto.includes("NUNCA vuelvas a saludar"));
+});
+
+// ── Eco y voz baja (17-nov-2026) ────────────────────────────────────────────
+// Primera llamada real al número de México: el agente dijo "Buenas noches,
+// habla Sofía", su propia voz regresó por el teléfono como "Ya, buenas noches.
+// Habla Sophie" y se contestó "Hola Sophie, mucho gusto".
+
+test("eco: reconoce la voz del agente aunque la transcripción la deforme", () => {
+  const saludo = "Buenas noches, habla Sofía de la clínica, ¿en qué te puedo ayudar?";
+  assert.equal(pareceEco("Ya, buenas noches. Habla Sophie.", saludo, "hablando"), true);
+  assert.equal(pareceEco("Ya, buenas noches. Habla Sophie.", saludo, "cola"), true);
+  // El principio de lo que dijo, mientras sigue hablando.
+  assert.equal(pareceEco("Buenas noches", saludo, "hablando"), true);
+  assert.equal(pareceEco("Buenas noches", saludo, "cola"), false);
+});
+
+test("eco: NO se come las respuestas del cliente que repiten palabras del agente", () => {
+  const pregunta = "¿Lo quieres el martes o el jueves?";
+  assert.equal(pareceEco("El martes", pregunta, "cola"), false);
+  assert.equal(pareceEco("El martes", pregunta, "hablando"), false);
+  assert.equal(pareceEco("Sí, el martes a las cuatro", "¿Te queda el martes a las cuatro?", "hablando"), false);
+  assert.equal(pareceEco("No, mejor el jueves", pregunta, "cola"), false);
+  assert.equal(pareceEco("Quiero agendar una limpieza", "Buenas noches, habla Sofía", "hablando"), false);
+  assert.equal(pareceEco("Ya", "Ya quedó tu cita", "hablando"), false);
+  assert.equal(pareceEco("", "Hola", "hablando"), false);
+});
+
+test("motor: el eco del saludo no abre un turno ni hace que el agente se conteste", async () => {
+  const m = await motorListo([{ deltas: ["Buenas noches, ", "habla Sofía de la clínica, ", "¿en qué te puedo ayudar?"] }]);
+  m.motor.configurarSesion("PROMPT", []);
+  await esperar(40);
+  m.motor.recibirFrame({ type: "eagerEndOfTurn", voicePrompt: "Ya, buenas noches. Habla Sophie." });
+  m.motor.recibirFrame({ type: "prompt", voicePrompt: "Ya, buenas noches. Habla Sophie.", last: true });
+  await esperar(40);
+  assert.equal(m.pedidos.length, 1, "no debió pedirle otra respuesta a Claude");
+  assert.equal(m.transcripcion.some(([r]) => r === "user"), false);
+});
+
+test("motor: lo que de verdad dice el cliente mientras el agente habla sí pasa", async () => {
+  const m = await motorListo([{ deltas: ["Buenas noches, habla Sofía de la clínica."] }, { deltas: ["Claro, te ayudo."] }]);
+  m.motor.configurarSesion("PROMPT", []);
+  await esperar(30);
+  m.motor.recibirFrame({ type: "prompt", voicePrompt: "Quiero agendar una limpieza", last: true });
+  await esperar(40);
+  assert.equal(m.pedidos.length, 2);
+  assert.ok(textoDicho(m.enviados).includes("Claro, te ayudo."));
+});
+
+test("motor: si el eco cortó al agente a media frase, termina la idea (no se queda callado)", async () => {
+  const m = await motorListo([
+    { deltas: ["Hola"] },
+    { deltas: ["Tenemos limpieza, ", "valoración y ", "ortodoncia; ", "la limpieza cuesta quinientos pesos."], pausaMs: 15 },
+    { deltas: ["La limpieza cuesta quinientos pesos."] },
+  ]);
+  m.motor.configurarSesion("PROMPT", []);
+  await esperar(30);
+  m.motor.recibirFrame({ type: "prompt", voicePrompt: "¿Qué servicios tienen?", last: true });
+  await esperar(40);
+  m.motor.recibirFrame({ type: "interrupt", utteranceUntilInterrupt: "Tenemos limpieza, valoración", durationUntilInterruptMs: 1500 });
+  await esperar(5);
+  m.motor.recibirFrame({ type: "prompt", voicePrompt: "Tenemos limpieza, valoración", last: true });
+  await esperar(40);
+  assert.equal(m.pedidos.length, 3);
+  const ultimo = JSON.stringify(m.pedidos[2].messages);
+  assert.ok(ultimo.includes("Ruido en la línea"), ultimo);
+  assert.equal(ultimo.includes('"Tenemos limpieza, valoración"}'), false, "el eco no entra como si lo hubiera dicho el cliente");
+});
+
+test("limpieza de voz: voice focus con ganancia, y planes B si Telnyx rechaza la combinación", () => {
+  const d = intentosSupresion({});
+  assert.deepEqual(d[0], {
+    direction: "inbound",
+    noise_suppression_engine: "quail_voice_focus_s",
+    noise_suppression_engine_config: { voice_gain: 1.6, enhancement_level: 0.8 },
+  });
+  assert.deepEqual(d[1], { direction: "inbound", noise_suppression_engine: "quail_voice_focus_s" });
+  assert.equal(d[2].noise_suppression_engine, "AiCoustics");
+  assert.equal(d[d.length - 1].noise_suppression_engine, "AiCoustics");
+  assert.deepEqual(intentosSupresion({ VOZ_SUPRESION: "0" }), []);
+  const k = intentosSupresion({ VOZ_SUPRESION: "Krisp", VOZ_SUPRESION_DIRECCION: "both" });
+  assert.equal(k[0].direction, "both");
+  assert.deepEqual(k[0].noise_suppression_engine_config, { model: "krisp-viva-tel-v2.kef", suppression_level: 90 });
+  // Ganancia fuera de rango se acota al máximo de Telnyx (4×).
+  const g = intentosSupresion({ VOZ_SUPRESION_GANANCIA: "9", VOZ_SUPRESION_DIRECCION: "x" });
+  assert.equal((g[0].noise_suppression_engine_config as any).voice_gain, 4);
+  assert.equal(g[0].direction, "inbound");
+});
+
+test("limpieza de voz: prueba la siguiente combinación si Telnyx rechaza una, y nunca lanza", async () => {
+  const llaveAntes = config.telnyxApiKey;
+  const fetchAntes = globalThis.fetch;
+  (config as any).telnyxApiKey = "llave-de-prueba";
+  const cuerpos: any[] = [];
+  try {
+    globalThis.fetch = (async (_url: string, init: any) => {
+      cuerpos.push(JSON.parse(init.body));
+      return cuerpos.length === 1
+        ? new Response(JSON.stringify({ errors: [{ code: "90015", title: "Invalid parameter" }] }), { status: 422 })
+        : new Response("{}", { status: 200 });
+    }) as any;
+    const r = await limpiarAudio("v3:abc", intentosSupresion({}));
+    assert.equal(r.motor, "quail_voice_focus_s");
+    assert.equal(cuerpos.length, 2);
+    assert.equal(cuerpos[1].noise_suppression_engine_config, undefined);
+    globalThis.fetch = (async () => { throw new Error("red caída"); }) as any;
+    const caido = await limpiarAudio("v3:abc", intentosSupresion({}));
+    assert.equal(caido.motor, null);
+  } finally {
+    globalThis.fetch = fetchAntes;
+    (config as any).telnyxApiKey = llaveAntes;
+  }
+});
+
+test("costo: la limpieza de voz se suma solo si quedó encendida; el saludo no se corta", () => {
+  assert.equal(Number((costoRelayUsd(61, 0, true) - costoRelayUsd(61, 0)).toFixed(6)), 0.006);
+  const c = configRelay({ url: "wss://x", voz: "Telnyx.Ultra.abc", parametros: {} });
+  assert.equal(c.interruptible_greeting, "none");
+  assert.equal(c.interruptible, "speech");
 });

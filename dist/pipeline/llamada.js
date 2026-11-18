@@ -1212,6 +1212,8 @@ class PipelineLlamada {
     esPrueba;
     streamSid = "";
     callSid;
+    /** El motor de Telnyx encendió la limpieza de voz (se cobra aparte). */
+    supresionActiva = false;
     configNegocio;
     historialOrdenado = [];
     inicioLlamada;
@@ -2333,6 +2335,21 @@ class PipelineLlamada {
         });
     }
     async iniciar() {
+        // Motor de Telnyx: limpiar la voz del cliente desde el primer segundo (el
+        // eco del saludo es justo el que hacía que el agente se contestara solo).
+        // En paralelo: no retrasa el saludo, y si falla la llamada sigue igual.
+        if (this.motor === "relay" && this.proveedor === "telnyx" && this.callSid) {
+            const intentos = (0, relay_config_1.intentosSupresion)();
+            if (intentos.length > 0) {
+                telnyxApi.limpiarAudio(this.callSid, intentos).then((r) => {
+                    this.supresionActiva = !!r.motor;
+                    if (r.motor)
+                        console.log(`[RELAY] Limpieza de voz encendida (${r.motor}) — ${this.callSid}`);
+                    else
+                        console.warn(`[RELAY] Telnyx no encendió la limpieza de voz: ${r.error}`);
+                });
+            }
+        }
         const params = new URLSearchParams();
         if (this.negocioId)
             params.set("negocioId", this.negocioId);
@@ -2561,7 +2578,7 @@ class PipelineLlamada {
         // reconocimiento y la voz Ultra por carácter) y no hay stream de audio.
         const costoTwilioAprox = this.proveedor === "telnyx"
             ? Number(((0, eventos_1.costoTelefoniaTelnyxUsd)(duracionSegundos, "local", !esRelay) +
-                (esRelay ? (0, relay_config_1.costoRelayUsd)(duracionSegundos, usoVoz.caracteresTts || 0) : 0)).toFixed(6))
+                (esRelay ? (0, relay_config_1.costoRelayUsd)(duracionSegundos, usoVoz.caracteresTts || 0, this.supresionActiva) : 0)).toFixed(6))
             : Number((Math.ceil(minutos) * 0.01).toFixed(6));
         // ¿El agente alcanzó a hablar? Si generó voz, hubo servicio. Si no (sesión
         // murió antes del saludo, TwiML de fallback), Odin no cobra.

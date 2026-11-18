@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.contestar = contestar;
 exports.contestarConRelay = contestarConRelay;
+exports.limpiarAudio = limpiarAudio;
 exports.detenerRelay = detenerRelay;
 exports.marcar = marcar;
 exports.rechazar = rechazar;
@@ -87,6 +88,28 @@ function contestarConRelay(callControlId, opts) {
         // (contestar con el stream de OpenAI) no puede chocar con este command_id.
         command_id: `answer-relay-${callControlId}`,
     });
+}
+/**
+ * Enciende la limpieza de la voz del cliente (eco y voz baja; ver
+ * `intentosSupresion`). Prueba cada combinación hasta que Telnyx acepte una.
+ * Devuelve el motor que quedó, o null. Nunca lanza: sin limpieza la llamada
+ * sigue igual que antes.
+ */
+async function limpiarAudio(callControlId, intentos) {
+    let ultimoError = "";
+    for (let i = 0; i < intentos.length; i++) {
+        const r = await comando(callControlId, "suppression_start", {
+            ...intentos[i],
+            command_id: `supresion-${i}-${callControlId}`,
+        });
+        if (r.ok)
+            return { motor: String(intentos[i].noise_suppression_engine) };
+        ultimoError = r.error || `HTTP ${r.status}`;
+        // La llamada ya no existe o no hay llave: no tiene caso seguir probando.
+        if (r.status === 0 || r.status === 404 || r.status === 401)
+            break;
+    }
+    return { motor: null, error: ultimoError };
 }
 /** Termina Conversation Relay en la llamada (Telnyx cierra nuestro WebSocket). */
 function detenerRelay(callControlId) {

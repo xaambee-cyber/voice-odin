@@ -54,12 +54,15 @@ export declare function configRelay(opts: {
     /** Ajustes del panel (ya normalizados o crudos: aquí se acotan). */
     ajustes?: unknown;
 }): Record<string, unknown>;
+export declare function intentosSupresion(env?: Record<string, string | undefined>): Record<string, unknown>[];
 export declare const TARIFA_RELAY_USD: {
     readonly relayPorMinuto: 0.05;
     readonly ttsUltraPorCaracter: 0.000032;
     readonly sttPorMinuto: 0.0074;
+    /** Limpieza de la voz del cliente (ai-coustics), si quedó encendida. */
+    readonly supresionPorMinuto: 0.003;
 };
-export declare function costoRelayUsd(segundos: number, caracteresTts: number): number;
+export declare function costoRelayUsd(segundos: number, caracteresTts: number, supresion?: boolean): number;
 /**
  * Limpia lo que el modelo escribe antes de mandarlo al TTS: markdown, emojis y
  * acotaciones entre corchetes se leerían en voz alta ("asterisco asterisco").
@@ -70,6 +73,21 @@ export declare function textoParaVoz(fragmento: string): string;
 export declare function normalizarParaComparar(texto: string): string;
 /** ¿El final dice lo mismo que el temprano? Entonces la respuesta que ya preparamos sirve. */
 export declare function mismoTurno(temprano: string, final: string): boolean;
+/**
+ * ¿Lo que "dijo el cliente" es la voz del propio agente regresando por la
+ * línea? El eco repite las palabras del agente EN ORDEN y llega mientras habla
+ * o justo al terminar.
+ *  - `hablando`: el agente seguía hablando (o Telnyx lo acababa de callar).
+ *    Basta con 3 palabras suyas en orden, o con 1–2 si son el PRINCIPIO de lo
+ *    que dijo (el eco de "Buenas noches" llega mientras suena el resto).
+ *  - `cola`: ya había terminado hace un instante. Ahí el cliente ya puede estar
+ *    contestando, y contestar una pregunta de opciones repite sus palabras
+ *    ("¿martes o jueves?" → "El martes"), así que se exige más: 3+ palabras y
+ *    casi todas en orden.
+ * Si el cliente dice una palabra de respuesta ("sí", "no", "claro") que el
+ * agente no dijo, nunca es eco.
+ */
+export declare function pareceEco(cliente: string, agente: string, modo?: "hablando" | "cola"): boolean;
 /** Milisegundos aproximados que tarda en decirse un texto (≈14 caracteres por segundo). */
 export declare function msParaDecir(texto: string): number;
 //# sourceMappingURL=relay-config.d.ts.map

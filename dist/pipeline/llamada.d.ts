@@ -227,6 +227,8 @@ export declare class PipelineLlamada {
     private esPrueba;
     private streamSid;
     private callSid;
+    /** El motor de Telnyx encendió la limpieza de voz (se cobra aparte). */
+    private supresionActiva;
     private configNegocio;
     private historialOrdenado;
     private inicioLlamada;

@@ -67,6 +67,12 @@ export declare class MotorRelayTelnyx implements MotorVoz {
     private tokenVacioOk;
     /** Cuándo termina (aprox.) de hablar la voz lo que ya le mandamos. */
     private finHablaMs;
+    /** Lo que el agente dijo en el tramo actual (para reconocer su propio eco). */
+    private dichoReciente;
+    private fraseCerrada;
+    /** Telnyx calló al agente porque "oyó" al cliente: cuándo, y si estaba a media frase. */
+    private corte;
+    private ecosDescartados;
     private horaExplicita;
     private teclas;
     private teclasTimer;
@@ -115,6 +121,17 @@ export declare class MotorRelayTelnyx implements MotorVoz {
     marcarColgado(): void;
     /** Un frame del WebSocket de Telnyx (el `setup` ya lo consumió index.ts). */
     recibirFrame(msg: any): void;
+    /**
+     * ¿Este "texto del cliente" es la voz del agente regresando por la línea?
+     * Solo se pregunta mientras el agente habla o en el instante en que acaba de
+     * callarse: pasado eso, todo lo que llega es del cliente.
+     */
+    private esEco;
+    /**
+     * Fue eco. Si ese eco además hizo que Telnyx callara al agente a media frase,
+     * el cliente se quedó con una idea cortada y en silencio: el agente la termina.
+     */
+    private alDescartarEco;
     private alFinTemprano;
     private alReanudar;
     private alTextoFinal;

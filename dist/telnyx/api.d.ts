@@ -26,6 +26,16 @@ export declare function contestarConRelay(callControlId: string, opts: {
     relay: Record<string, unknown>;
     clientState: string;
 }): Promise<ResultadoComando>;
+/**
+ * Enciende la limpieza de la voz del cliente (eco y voz baja; ver
+ * `intentosSupresion`). Prueba cada combinación hasta que Telnyx acepte una.
+ * Devuelve el motor que quedó, o null. Nunca lanza: sin limpieza la llamada
+ * sigue igual que antes.
+ */
+export declare function limpiarAudio(callControlId: string, intentos: Record<string, unknown>[]): Promise<{
+    motor: string | null;
+    error?: string;
+}>;
 /** Termina Conversation Relay en la llamada (Telnyx cierra nuestro WebSocket). */
 export declare function detenerRelay(callControlId: string): Promise<ResultadoComando>;
 /**
