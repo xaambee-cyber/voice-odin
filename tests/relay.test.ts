@@ -430,3 +430,8 @@ test("Claude con llave inválida pausa el motor de Telnyx 10 minutos y avisa la 
     _reiniciarRelayCaido();
   }
 });
+
+test("no vuelve a saludar cuando el cliente solo responde el saludo (doble saludo, 17-nov-2026)", () => {
+  const texto = bloquesSistema("REGLAS\n=== CONTEXTO DE ESTA LLAMADA ===\nHoy")[1].text;
+  assert.ok(texto.includes("NUNCA vuelvas a saludar"));
+});
